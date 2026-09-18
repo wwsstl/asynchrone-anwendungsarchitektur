@@ -1,0 +1,69 @@
+flowchart TB
+
+    subgraph Extern["Externe Steuerungsebene"]
+        UserA["Benutzer A"]
+        UserB["Benutzer B / Überwachungssystem"]
+    end
+
+    subgraph App["Spring Boot Anwendung — Einzelserver (Java 21, Spring Boot 4, Jackson 3)"]
+        API["REST-Controller (Spring MVC)<br/>Start / Abbruch / Status"]
+        TM["Task Manager<br/>baut Sandbox je Benutzer vollständig auf"]
+        Reg[("TaskRegistry<br/>ConcurrentHashMap<br/>hinter Cache-Abstraktion")]
+
+        subgraph SandboxA["Sandbox Benutzer A (laufzeit-dynamisch, isoliert)"]
+            CtxA[("TaskContext A<br/>AtomicBoolean cancelled<br/>AtomicInteger errorCount<br/>Startzeit / Timeout")]
+            PoolA[("Status-Pool A<br/>ConcurrentHashMap<br/>TaskId → PollEntry")]
+            ProdA["Producer-Thread A<br/>(Virtual Thread)<br/>NIO.2-Scan → Jackson-JSON → Submit"]
+            ConsA["Consumer-Thread A<br/>(Virtual Thread)<br/>periodischer Sweep → Bulk-Status → Routing"]
+        end
+
+        subgraph SandboxB["Sandbox Benutzer B (laufzeit-dynamisch, isoliert)"]
+            NoteB["Strukturell identisch zu Sandbox A:<br/>eigener TaskContext, eigener Status-Pool,<br/>eigener Producer- &amp; Consumer-Thread —<br/>vollständig unabhängig von Sandbox A"]
+        end
+    end
+
+    subgraph Cloud["Cloud-Dienste"]
+        CloudSubmit["Cloud-API 1<br/>Erstellungsauftrag übermitteln"]
+        CloudQuery["Cloud-API 2<br/>Bulk-Statusabfrage (mehrere TaskIds)"]
+    end
+
+    subgraph FilesA["Exklusiver lokaler Ordner Benutzer A"]
+        InboxA[("inbox (A)")]
+        DoneA[("donebox (A)")]
+        ErrorA[("errorbox (A)")]
+    end
+
+    UserA -->|"Aufgabe A starten / abbrechen"| API
+    UserB -->|"Aufgabe B starten / abbrechen"| API
+
+    API --> TM
+    TM -->|"Sandbox-Referenz eintragen"| Reg
+
+    TM -->|"1. initialisieren"| CtxA
+    TM -->|"2. anlegen"| PoolA
+    TM -->|"3. starten"| ProdA
+    TM -->|"4. starten"| ConsA
+
+    ProdA -->|"Dateien lesen (Vorabprüfung Abbruchsignal)"| InboxA
+    ProdA ==>|"nicht-blockierend, Batch"| CloudSubmit
+    CloudSubmit -.->|"TaskId sofort zurück"| ProdA
+    ProdA -->|"TaskId einfügen"| PoolA
+
+    ConsA -->|"fällige Einträge sammeln"| PoolA
+    ConsA ==>|"Bulk-Aufruf: alle fälligen TaskIds"| CloudQuery
+    CloudQuery -.->|"SUCCESS / ERROR / PENDING je TaskId"| ConsA
+
+    ConsA -->|"SUCCESS: Datei verschieben"| DoneA
+    ConsA -->|"ERROR / Timeout: Datei verschieben"| ErrorA
+    ConsA -.->|"PENDING: Eintrag im Pool belassen"| PoolA
+    ConsA -.->|"ERROR: errorCount++ / Timeout prüfen"| CtxA
+
+    classDef thread fill:#e8f0fe,stroke:#4472c4,stroke-width:1px;
+    classDef store fill:#fef6e0,stroke:#c99a2e,stroke-width:1px;
+    classDef external fill:#eaf7ea,stroke:#3c8a3c,stroke-width:1px;
+    classDef note fill:#f5f5f5,stroke:#999999,stroke-dasharray: 4 3;
+
+    class ProdA,ConsA thread;
+    class Reg,CtxA,PoolA,InboxA,DoneA,ErrorA store;
+    class CloudSubmit,CloudQuery external;
+    class NoteB note;
