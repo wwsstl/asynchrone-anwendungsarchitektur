@@ -110,10 +110,15 @@ Finaler Ablauf beim Start einer Aufgabe:
    ablegen (für Status-Abfragen/Abbruch von außen).
 
 Beim Abbruch/Abschluss einer Aufgabe werden Producer- und Consumer-Thread der
-Sandbox beendet. Der Task **verbleibt mit seinem Endzustand in der Registry**
-(Task Manager und TaskRegistry sind Singletons über die gesamte Laufzeit; nach *n*
-Starts enthält die Registry *n* Tasks). Pro Benutzer läuft höchstens ein Task
-gleichzeitig, da es nur eine `inbox` gibt (zweiter Start → HTTP 409).
+Sandbox beendet. Ein abgeschlossener Task **verbleibt mit seinem Endzustand in der
+Registry** (Task Manager und TaskRegistry sind Singletons über die gesamte Laufzeit;
+nach *n* Starts enthält die Registry *n* Tasks). Ein Task wird nur durch den **externen
+Abbruch** (`POST /api/users/{userId}/tasks/{taskId}/cancel`) aus der Registry gelöscht:
+Der Abbruch setzt das Abbruchsignal (Producer und Consumer beenden sich) und entfernt die
+`taskId` aus der Registry; danach liefern Status und weiterer Abbruch HTTP 404. Auch ein
+bereits beendeter Task lässt sich so löschen.
+Pro Benutzer läuft höchstens ein Task gleichzeitig, da es nur eine `inbox` gibt
+(zweiter Start → HTTP 409).
 
 **Bewertung:** Ein dedizierter Consumer-Thread pro Benutzer wäre bei klassischen
 Thread-Pools (Plattform-Threads) potenziell teuer gewesen (viele gleichzeitig

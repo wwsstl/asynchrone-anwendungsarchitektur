@@ -6,7 +6,6 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import de.wwsstl.asynchrone.files.InvalidUserIdException;
-import de.wwsstl.asynchrone.taskmanager.TaskAlreadyFinishedException;
 import de.wwsstl.asynchrone.taskmanager.TaskAlreadyRunningException;
 import de.wwsstl.asynchrone.taskmanager.TaskNotFoundException;
 
@@ -23,8 +22,8 @@ public class ApiExceptionHandler {
         return ProblemDetail.forStatusAndDetail(HttpStatus.NOT_FOUND, e.getMessage());
     }
 
-    @ExceptionHandler({TaskAlreadyFinishedException.class, TaskAlreadyRunningException.class})
-    ProblemDetail conflict(RuntimeException e) {
+    @ExceptionHandler(TaskAlreadyRunningException.class)
+    ProblemDetail conflict(TaskAlreadyRunningException e) {
         return ProblemDetail.forStatusAndDetail(HttpStatus.CONFLICT, e.getMessage());
     }
 }

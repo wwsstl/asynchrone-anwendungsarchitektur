@@ -29,7 +29,8 @@ import jakarta.annotation.PreDestroy;
  *
  * <p><b>Singleton über die gesamte Laufzeit:</b> Der Task Manager ist eine einzige Spring-Bean und hält keinen
  * eigenen Task-Bestand — jeder Start legt genau einen Task samt vollständiger Sandbox an und trägt ihn in das
- * (ebenfalls einzige) {@link TaskRegistry} ein. Nach {@code n} Starts enthält das Register {@code n} Tasks.
+ * (ebenfalls einzige) {@link TaskRegistry} ein. Nach {@code n} Starts enthält das Register {@code n} Tasks; ein
+ * Task verlässt es nur durch den externen Abbruch ({@link #cancel}).
  *
  * <p>Je Task baut er eine eigene Sandbox: {@link TaskContext}, exklusiver {@link StatusPool}, Producer-Thread
  * und Consumer-Thread (beide Virtual Threads). Nichts davon wird zwischen Tasks geteilt.
@@ -79,13 +80,23 @@ public class TaskManager {
         return sandbox.snapshot();
     }
 
+    /**
+     * Externer Abbruch: beendet den Task (Abbruchsignal an Producer und Consumer) und <b>löscht ihn aus dem
+     * Register</b>; danach ist die Task-ID unbekannt. Ist der Task bereits beendet, wird er nur noch gelöscht.
+     *
+     * @return den Zustand des Tasks zum Zeitpunkt des Abbruchs
+     * @throws TaskNotFoundException wenn es den Task nicht (mehr) gibt oder er einem anderen Benutzer gehört
+     */
     public TaskSnapshot cancel(String userId, UUID taskId) {
         Sandbox sandbox = find(userId, taskId);
-        TaskContext context = sandbox.context();
-        if (!context.cancel(CancelReason.USER_REQUEST)) {
-            throw new TaskAlreadyFinishedException(taskId, context.state());
+        boolean signalled = sandbox.context().cancel(CancelReason.USER_REQUEST);
+        // Wer den Eintrag löscht, hat den Abbruch "gewonnen": bei zwei gleichzeitigen Abbrüchen erhält der zweite 404.
+        if (registry.remove(taskId).isEmpty()) {
+            throw new TaskNotFoundException(userId, taskId);
         }
-        log.info("[{}] Abbruch von Task {} angefordert", userId, taskId);
+        latestByUser.remove(userId, sandbox);
+        log.info("[{}] Task {} {} und aus dem Register gelöscht ({} Tasks im Register)", userId, taskId,
+                signalled ? "abgebrochen" : "war bereits beendet", registry.size());
         return sandbox.snapshot();
     }
 

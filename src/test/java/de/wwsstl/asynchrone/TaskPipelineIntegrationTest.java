@@ -209,24 +209,67 @@ class TaskPipelineIntegrationTest {
         TaskSnapshot neighbor = api.start("cancel-neighbor");
         Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> api.status("cancel-me", mine.taskId())
                 .pending() == 4);
+        Sandbox sandbox = registry.find(mine.taskId()).orElseThrow();
+        int before = registry.size();
 
         TaskSnapshot cancelled = api.cancel("cancel-me", mine.taskId());
 
         assertThat(cancelled.state()).isEqualTo(TaskState.CANCELLED);
         assertThat(cancelled.cancelReason()).isEqualTo(CancelReason.USER_REQUEST);
-        assertThat(api.cancelStatus("cancel-me", mine.taskId())).as("zweiter Abbruch").isEqualTo(409);
 
-        Sandbox sandbox = registry.find(mine.taskId()).orElseThrow();
+        // Der Abbruch löscht die übergebene taskId aus der TaskRegistry ...
+        assertThat(registry.find(mine.taskId())).isEmpty();
+        assertThat(registry.all()).doesNotContain(sandbox);
+        assertThat(registry.size()).isEqualTo(before - 1);
+        assertThat(api.statusCode("cancel-me", mine.taskId().toString())).as("Status nach Abbruch").isEqualTo(404);
+        assertThat(api.cancelStatus("cancel-me", mine.taskId())).as("zweiter Abbruch").isEqualTo(404);
+
+        // ... und beendet die Threads der Sandbox.
         Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> !sandbox.producerThread().isAlive()
                 && !sandbox.consumerThread().isAlive());
-        TaskSnapshot after = api.status("cancel-me", mine.taskId());
+        TaskSnapshot after = sandbox.snapshot();
         assertThat(after.pending()).isZero();
         assertThat(after.abandoned()).isEqualTo(4);
         assertThat(api.names("cancel-me", "inbox")).hasSize(4);
 
-        // der Nachbar-Task ist davon unberührt
+        // der Nachbar-Task ist davon unberührt und bleibt im Register
         assertThat(api.awaitFinished("cancel-neighbor", neighbor.taskId()).state()).isEqualTo(TaskState.COMPLETED);
-        assertThat(registry.find(mine.taskId())).isPresent();
+        assertThat(registry.find(neighbor.taskId())).isPresent();
+    }
+
+    @Test
+    void abbruchLoeschtAuchBereitsBeendeteTasksAusDemRegister() {
+        TaskSnapshot task = api.start("cancel-finished");
+        api.awaitFinished("cancel-finished", task.taskId());
+        int before = registry.size();
+
+        TaskSnapshot result = api.cancel("cancel-finished", task.taskId());
+
+        assertThat(result.state()).as("Endzustand bleibt erhalten").isEqualTo(TaskState.COMPLETED);
+        assertThat(registry.find(task.taskId())).isEmpty();
+        assertThat(registry.size()).isEqualTo(before - 1);
+    }
+
+    @Test
+    void gleichzeitigeAbbruecheLoeschenDenTaskGenauEinmal() throws Exception {
+        api.dropFiles("cancel-race", 2, "SLOW");
+        TaskSnapshot task = api.start("cancel-race");
+        int attempts = 10;
+
+        List<Integer> codes = new ArrayList<>();
+        try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
+            List<java.util.concurrent.Future<Integer>> futures = new ArrayList<>();
+            for (int i = 0; i < attempts; i++) {
+                futures.add(executor.submit(() -> api.cancelStatus("cancel-race", task.taskId())));
+            }
+            for (var future : futures) {
+                codes.add(future.get());
+            }
+        }
+
+        assertThat(codes).filteredOn(code -> code == 200).hasSize(1);
+        assertThat(codes).filteredOn(code -> code == 404).hasSize(attempts - 1);
+        assertThat(registry.find(task.taskId())).isEmpty();
     }
 
     @Test
@@ -238,12 +281,15 @@ class TaskPipelineIntegrationTest {
         assertThat(api.startStatus("dup")).isEqualTo(409);
         assertThat(registry.size()).isEqualTo(before + 1);
 
+        // Nach dem Abbruch ist der erste Task aus dem Register gelöscht; der Benutzer kann neu starten.
         api.cancel("dup", first.taskId());
+        assertThat(registry.size()).isEqualTo(before);
         TaskSnapshot second = api.start("dup");
 
         assertThat(second.taskId()).isNotEqualTo(first.taskId());
-        assertThat(registry.size()).as("beide Tasks bleiben im Register").isEqualTo(before + 2);
-        assertThat(api.status("dup", first.taskId()).state()).isEqualTo(TaskState.CANCELLED);
+        assertThat(registry.size()).isEqualTo(before + 1);
+        assertThat(registry.find(first.taskId())).isEmpty();
+        assertThat(registry.find(second.taskId())).isPresent();
         api.cancel("dup", second.taskId());
     }
 
@@ -275,7 +321,9 @@ class TaskPipelineIntegrationTest {
         assertThat(api.statusCode("other-user", task.taskId().toString())).as("fremder Benutzer").isEqualTo(404);
         assertThat(api.statusCode("contract", "keine-uuid")).isEqualTo(400);
         assertThat(api.startStatus("bad user")).as("ungültige Benutzerkennung").isEqualTo(400);
-        assertThat(api.cancelStatus("contract", task.taskId())).as("Abbruch eines beendeten Tasks").isEqualTo(409);
+        assertThat(api.cancelStatus("other-user", task.taskId())).as("fremder Benutzer darf nicht abbrechen")
+                .isEqualTo(404);
+        assertThat(registry.find(task.taskId())).as("fremder Abbruch löscht nichts").isPresent();
     }
 
     private static <T> Set<T> distinct(List<T> items) {

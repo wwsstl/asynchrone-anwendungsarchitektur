@@ -11,9 +11,10 @@ import de.wwsstl.asynchrone.context.Sandbox;
  * Anwendung und enthält je Task genau einen Eintrag: Nach {@code n} gestarteten Tasks liefert {@link #size()}
  * {@code n}.
  *
- * <p>Die Schnittstelle kennt bewusst <b>keine</b> Lösch-Operation. Beendete Tasks (abgeschlossen oder abgebrochen)
- * bleiben mit ihrem Endzustand abfragbar; nur ihre Threads sind dann beendet. Hinter dieser Abstraktion kann
- * später ein verteilter Cache (Redis) stehen.
+ * <p>Tasks verschwinden nie von selbst: Ein abgeschlossener oder abgebrochener Task bleibt mit seinem Endzustand
+ * abfragbar (nur seine Threads sind dann beendet), bis er ausdrücklich per {@link #remove(UUID)} gelöscht wird —
+ * das geschieht ausschließlich durch den externen Abbruch. Hinter dieser Abstraktion kann später ein verteilter
+ * Cache (Redis) stehen.
  */
 public interface TaskRegistry {
 
@@ -23,6 +24,13 @@ public interface TaskRegistry {
     void register(Sandbox sandbox);
 
     Optional<Sandbox> find(UUID taskId);
+
+    /**
+     * Löscht den Task aus dem Register. Das Beenden seiner Threads ist nicht Sache des Registers.
+     *
+     * @return den gelöschten Task; leer, wenn er nicht (mehr) registriert war
+     */
+    Optional<Sandbox> remove(UUID taskId);
 
     /** Alle jemals registrierten Tasks. */
     Collection<Sandbox> all();

@@ -14,7 +14,7 @@ import de.wwsstl.asynchrone.context.Sandbox;
  * {@link TaskRegistry} auf Basis einer {@link ConcurrentHashMap} (Phase 1: rein In-Memory).
  *
  * <p>Singleton-Bean: Es gibt genau eine Instanz, die nie ersetzt, geleert oder verkleinert wird. Die Map ist
- * unbegrenzt — es gibt weder Eviction noch TTL —, damit jeder gestartete Task im Register bleibt.
+ * unbegrenzt — es gibt weder Eviction noch TTL —; ein Task verlässt sie nur durch {@link #remove(UUID)}.
  */
 @Component
 public class InMemoryTaskRegistry implements TaskRegistry {
@@ -32,6 +32,11 @@ public class InMemoryTaskRegistry implements TaskRegistry {
     @Override
     public Optional<Sandbox> find(UUID taskId) {
         return Optional.ofNullable(tasks.get(taskId));
+    }
+
+    @Override
+    public Optional<Sandbox> remove(UUID taskId) {
+        return Optional.ofNullable(tasks.remove(taskId));
     }
 
     @Override

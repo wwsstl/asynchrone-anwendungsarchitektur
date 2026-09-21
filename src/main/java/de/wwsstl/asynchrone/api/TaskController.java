@@ -34,6 +34,7 @@ public class TaskController {
         return ResponseEntity.accepted().location(location).body(snapshot);
     }
 
+    /** Externer Abbruch: beendet den Task und löscht ihn aus der TaskRegistry; danach liefert die taskId 404. */
     @PostMapping("/{taskId}/cancel")
     public ResponseEntity<TaskSnapshot> cancel(@PathVariable String userId, @PathVariable UUID taskId) {
         return ResponseEntity.ok(taskManager.cancel(userId, taskId));

@@ -58,6 +58,22 @@ class InMemoryTaskRegistryTest {
     }
 
     @Test
+    void removeLoeschtNurDenAngegebenenTask() {
+        Sandbox alice = sandbox("alice");
+        Sandbox bob = sandbox("bob");
+        registry.register(alice);
+        registry.register(bob);
+
+        assertThat(registry.remove(alice.context().taskId())).containsSame(alice);
+
+        assertThat(registry.find(alice.context().taskId())).isEmpty();
+        assertThat(registry.find(bob.context().taskId())).containsSame(bob);
+        assertThat(registry.size()).isEqualTo(1);
+        assertThat(registry.remove(alice.context().taskId())).as("zweites remove").isEmpty();
+        assertThat(registry.remove(java.util.UUID.randomUUID())).isEmpty();
+    }
+
+    @Test
     void doppelteRegistrierungDesselbenTasksWirdAbgelehnt() {
         Sandbox s = sandbox("alice");
         registry.register(s);
