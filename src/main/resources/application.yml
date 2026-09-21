@@ -1,0 +1,35 @@
+spring:
+  application:
+    name: asynchrone-anwendungsarchitektur
+  threads:
+    virtual:
+      # Virtual Threads durchgängig (loesung_final.md, Abschnitt 1/3)
+      enabled: true
+
+# Pipeline-Einstellungen (PipelineProperties); die Werte entsprechen den Standardwerten.
+pipeline:
+  # Je Benutzer: <base-directory>/<userId>/{inbox,errorbox,donebox}
+  base-directory: ./data/users
+  # Dateien je Batch, den der Producer an Cloud-API 1 übergibt
+  batch-size: 20
+  # Maximal gleichzeitig unbeantwortete Submit-Aufrufe je Sandbox
+  max-in-flight-batches: 4
+  # Wartezeit zwischen zwei Durchläufen des Consumer-Threads
+  sweep-interval: 1s
+  # Wartezeit bis zur nächsten Statusprüfung einer TaskId
+  poll-interval: 5s
+  # Maximale Anzahl TaskIds je Bulk-Aufruf an Cloud-API 2
+  status-bulk-size: 200
+  # Abbruch der Aufgabe, sobald so viele Dateien fehlerhaft waren
+  error-threshold: 10
+  # Maximale Laufzeit einer Aufgabe
+  task-timeout: 30m
+  cloud:
+    base-url: http://localhost:8081
+    submit-path: /tasks
+    status-path: /tasks/status
+    submit-timeout: 30s
+    status-timeout: 30s
+    # Cloud-API 1 legt Aufträge an (nicht idempotent) -> standardmäßig keine Wiederholung
+    submit-retries: 0
+    status-retries: 2
