@@ -105,7 +105,6 @@ class TaskContextTest {
         context.recordSucceeded();
         context.recordError();
         context.recordAbandoned(4);
-        context.batchStarted();
 
         TaskSnapshot snapshot = context.snapshot(7);
 
@@ -116,6 +115,5 @@ class TaskContextTest {
         assertThat(snapshot.failed()).isEqualTo(1);
         assertThat(snapshot.pending()).isEqualTo(7);
         assertThat(snapshot.abandoned()).isEqualTo(4);
-        assertThat(snapshot.inFlightBatches()).isEqualTo(1);
     }
 }

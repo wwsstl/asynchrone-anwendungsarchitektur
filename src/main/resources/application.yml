@@ -12,8 +12,9 @@ pipeline:
   base-directory: ./data/users
   # Dateien je Batch, den der Producer an Cloud-API 1 übergibt
   batch-size: 20
-  # Maximal gleichzeitig unbeantwortete Submit-Aufrufe je Sandbox
-  max-in-flight-batches: 4
+  # Schwellenwert für die Anzahl der Dateien im Status-Pool, ab dem der Producer die nächste Dateicharge liest
+  # (anforderungen_datenverarbeitung.md, Punkte 1 und 3)
+  pool-resume-threshold: 2
   # Wartezeit zwischen zwei Durchläufen des Consumer-Threads
   sweep-interval: 1s
   # Wartezeit bis zur nächsten Statusprüfung einer TaskId

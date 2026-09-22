@@ -96,11 +96,12 @@ public final class StatusConsumer implements Runnable {
     }
 
     /**
-     * Die Reihenfolge ist entscheidend: Der Producer trägt TaskIds in den Pool ein, <em>bevor</em> er den Batch
-     * als beantwortet meldet. Ist also kein Batch mehr offen, sind alle Einträge bereits im Pool sichtbar.
+     * Der Producer übermittelt jeden Batch synchron und trägt dessen TaskIds vollständig in den Pool ein, bevor er
+     * die nächste Dateicharge liest (anforderungen_datenverarbeitung.md, Punkt 1). Ist der Producer also fertig,
+     * sind alle Einträge bereits im Pool sichtbar.
      */
     private boolean isFinished() {
-        return context.isProducerFinished() && context.inFlightBatches() == 0 && pool.isEmpty();
+        return context.isProducerFinished() && pool.isEmpty();
     }
 
     private void sweep() {

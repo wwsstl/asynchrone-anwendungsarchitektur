@@ -11,7 +11,6 @@ import java.util.UUID;
  * @param failed          Dateien, die fehlerhaft waren (nach {@code errorbox} verschoben oder nicht verschiebbar)
  * @param pending         TaskIds, die im Status-Pool noch auf einen Endzustand warten
  * @param abandoned       Dateien, die bei einem Abbruch noch nicht entschieden waren (verbleiben in {@code inbox})
- * @param inFlightBatches Batches, auf deren Antwort von Cloud-API 1 noch gewartet wird
  */
 public record TaskSnapshot(
         String userId,
@@ -24,6 +23,5 @@ public record TaskSnapshot(
         int succeeded,
         int failed,
         int pending,
-        int abandoned,
-        int inFlightBatches) {
+        int abandoned) {
 }

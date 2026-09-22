@@ -36,7 +36,6 @@ public final class TaskContext {
     private final AtomicInteger succeededCount = new AtomicInteger();
     private final AtomicInteger submittedCount = new AtomicInteger();
     private final AtomicInteger abandonedCount = new AtomicInteger();
-    private final AtomicInteger inFlightBatches = new AtomicInteger();
     private final AtomicBoolean producerFinished = new AtomicBoolean();
 
     public TaskContext(String userId, Duration timeout, int errorThreshold, Clock clock) {
@@ -156,18 +155,6 @@ public final class TaskContext {
         abandonedCount.addAndGet(files);
     }
 
-    public void batchStarted() {
-        inFlightBatches.incrementAndGet();
-    }
-
-    public void batchSettled() {
-        inFlightBatches.decrementAndGet();
-    }
-
-    public int inFlightBatches() {
-        return inFlightBatches.get();
-    }
-
     public void producerFinished() {
         producerFinished.set(true);
     }
@@ -179,6 +166,6 @@ public final class TaskContext {
     public TaskSnapshot snapshot(int pending) {
         return new TaskSnapshot(userId, taskId, state.get(), cancelReason.get(), startedAt,
                 producerFinished.get(), submittedCount.get(), succeededCount.get(), errorCount.get(), pending,
-                abandonedCount.get(), inFlightBatches.get());
+                abandonedCount.get());
     }
 }

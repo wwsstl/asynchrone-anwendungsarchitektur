@@ -6,16 +6,12 @@ import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
-import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.TimeUnit;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -31,10 +27,14 @@ import de.wwsstl.asynchrone.pool.StatusPool;
 import de.wwsstl.asynchrone.pool.TaskId;
 
 /**
- * Producer-Thread einer Sandbox (loesung_final.md 4.7): liest die {@code inbox} batchweise, übermittelt jeden
- * Batch nicht-blockierend an Cloud-API 1 und trägt die zurückgelieferten TaskIds in den <b>eigenen</b>
- * Status-Pool ein. Er liest sofort weiter, statt auf die Antwort oder auf die Verarbeitung früherer Batches zu
- * warten; nur die Zahl unbeantworteter Submit-Aufrufe ist begrenzt ({@code max-in-flight-batches}).
+ * Producer-Thread einer Sandbox (anforderungen_datenverarbeitung.md, Punkte 1 und 3): liest je Durchlauf bis zu
+ * {@code batchSize} noch nicht übermittelte Dateien aus der {@code inbox}, übermittelt sie in einem Aufruf über
+ * {@link CloudClient#submit(List)} an Cloud-API 1 und trägt die zurückgelieferten {@link SubmittedTask}-Objekte in
+ * den <b>eigenen</b> Status-Pool ein.
+ *
+ * <p>Danach pausiert der Producer das Einlesen der nächsten Dateicharge, bis der {@code StatusConsumer} den
+ * Status-Pool auf den konfigurierten Schwellenwert ({@code pipeline.pool-resume-threshold}) abgebaut hat. Das
+ * Warten blockiert nur den (virtuellen) Producer-Thread selbst, nicht den nicht-blockierenden HTTP-Aufruf.
  *
  * <p>Der Producer beendet sich, wenn die {@code inbox} keine noch nicht übermittelten Dateien mehr enthält, oder
  * sobald das Abbruchsignal gesetzt ist. Erst danach meldet er {@link TaskContext#producerFinished()}.
@@ -42,7 +42,6 @@ import de.wwsstl.asynchrone.pool.TaskId;
 public final class InboxProducer implements Runnable {
 
     private static final Logger log = LoggerFactory.getLogger(InboxProducer.class);
-    private static final Duration SLOT_POLL = Duration.ofMillis(100);
 
     private final TaskContext context;
     private final StatusPool pool;
@@ -50,7 +49,6 @@ public final class InboxProducer implements Runnable {
     private final CloudClient cloud;
     private final PipelineProperties properties;
     private final Clock clock;
-    private final Semaphore inFlightSlots;
 
     /** Bereits übermittelte Dateien; nur vom Producer-Thread selbst benutzt. */
     private final Set<Path> seen = new HashSet<>();
@@ -63,7 +61,6 @@ public final class InboxProducer implements Runnable {
         this.cloud = cloud;
         this.properties = properties;
         this.clock = clock;
-        this.inFlightSlots = new Semaphore(properties.maxInFlightBatches());
     }
 
     @Override
@@ -80,33 +77,51 @@ public final class InboxProducer implements Runnable {
     }
 
     private void produce() throws IOException {
-        boolean foundNewFiles;
-        do {
-            foundNewFiles = false;
-            List<Path> batch = new ArrayList<>(properties.batchSize());
-            try (DirectoryStream<Path> inbox = folders.openInbox()) {
-                for (Path file : inbox) {
-                    if (context.isCancelled()) {
-                        return;
-                    }
-                    if (!seen.add(file)) {
-                        continue; // liegt noch in der inbox, wurde aber schon übermittelt
-                    }
-                    foundNewFiles = true;
-                    batch.add(file);
-                    if (batch.size() == properties.batchSize()) {
-                        submit(batch);
-                        batch = new ArrayList<>(properties.batchSize());
-                    }
-                }
-            }
-            if (!batch.isEmpty() && !context.isCancelled()) {
-                submit(batch);
-            }
-            // Dateien, die während des Durchlaufs eintrafen, werden im nächsten Durchlauf erfasst.
-        } while (foundNewFiles && !context.isCancelled());
+        List<Path> batch;
+        while (!context.isCancelled() && !(batch = nextBatch()).isEmpty()) {
+            submit(batch);
+            awaitResumeThreshold();
+        }
     }
 
+    /** Liest bis zu {@code batchSize} noch nicht übermittelte Dateien aus der {@code inbox}. */
+    private List<Path> nextBatch() throws IOException {
+        List<Path> batch = new ArrayList<>(properties.batchSize());
+        try (DirectoryStream<Path> inbox = folders.openInbox()) {
+            for (Path file : inbox) {
+                if (context.isCancelled()) {
+                    return List.of();
+                }
+                if (!seen.add(file)) {
+                    continue; // liegt noch in der inbox, wurde aber schon übermittelt
+                }
+                batch.add(file);
+                if (batch.size() == properties.batchSize()) {
+                    break;
+                }
+            }
+        }
+        return batch;
+    }
+
+    /**
+     * Pausiert das Einlesen der nächsten Dateicharge, bis die Anzahl der Dateien im Status-Pool auf
+     * {@code pipeline.pool-resume-threshold} gesunken ist (anforderungen_datenverarbeitung.md, Punkte 1 und 3),
+     * oder bis das Abbruchsignal gesetzt wird.
+     */
+    private void awaitResumeThreshold() {
+        while (pool.size() > properties.poolResumeThreshold()) {
+            if (context.awaitCancel(properties.sweepInterval())) {
+                return;
+            }
+        }
+    }
+
+    /**
+     * Übermittelt einen Batch in einem Aufruf an Cloud-API 1 und trägt die zurückgelieferten TaskIds in den Pool
+     * ein (anforderungen_datenverarbeitung.md, Punkt 1). Der Producer-Thread wartet auf die Antwort; da er ein
+     * virtueller Thread ist, blockiert das keinen Plattform-Thread.
+     */
     private void submit(List<Path> files) {
         Map<String, Path> byName = new HashMap<>();
         List<TestdataItem> items = new ArrayList<>(files.size());
@@ -119,75 +134,33 @@ public final class InboxProducer implements Runnable {
                 fail(file);
             }
         }
-        if (items.isEmpty() || !acquireSlot()) {
-            context.recordAbandoned(byName.size());
+        if (items.isEmpty()) {
             return;
         }
 
-        context.batchStarted();
-        CompletableFuture<List<SubmittedTask>> response;
+        List<SubmittedTask> tasks;
         try {
-            response = cloud.submit(items);
+            tasks = cloud.submit(items).join();
         } catch (RuntimeException e) {
-            response = CompletableFuture.failedFuture(e);
+            log.warn("[{}] Batch mit {} Dateien wurde von Cloud-API 1 abgelehnt: {}", context.userId(),
+                    byName.size(), e.toString());
+            byName.values().forEach(this::fail);
+            return;
         }
-        // Die Antwort wird auf einem eigenen Virtual Thread verarbeitet: Dateioperationen dürfen den
-        // Netzwerk-Thread des HTTP-Clients nicht blockieren, und der Producer liest bereits weiter.
-        response.whenComplete((tasks, error) -> Thread.ofVirtual()
-                .name("submit-result-" + context.taskId())
-                .start(() -> onSubmitted(byName, tasks, error)));
-    }
 
-    /** Wartet auf einen freien In-Flight-Platz; bricht ab, sobald das Abbruchsignal gesetzt ist. */
-    private boolean acquireSlot() {
-        try {
-            while (!inFlightSlots.tryAcquire(SLOT_POLL.toMillis(), TimeUnit.MILLISECONDS)) {
-                if (context.isCancelled()) {
-                    return false;
-                }
+        Map<String, TaskId> ids = new HashMap<>();
+        tasks.forEach(task -> ids.put(task.fileName(), task.taskId()));
+        for (Map.Entry<String, Path> file : byName.entrySet()) {
+            TaskId id = ids.get(file.getKey());
+            if (id == null) {
+                log.warn("[{}] Cloud-API 1 lieferte keine TaskId für {}", context.userId(), file.getKey());
+                fail(file.getValue());
+            } else if (context.isCancelled()) {
+                context.recordAbandoned(1);
+            } else {
+                pool.add(id, file.getValue(), clock.instant());
+                context.recordSubmitted();
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            context.cancel(CancelReason.SHUTDOWN);
-            return false;
-        }
-        if (context.isCancelled()) {
-            inFlightSlots.release();
-            return false;
-        }
-        return true;
-    }
-
-    private void onSubmitted(Map<String, Path> byName, List<SubmittedTask> tasks, Throwable error) {
-        try {
-            if (error != null || tasks == null) {
-                log.warn("[{}] Batch mit {} Dateien wurde von Cloud-API 1 abgelehnt: {}", context.userId(),
-                        byName.size(), error);
-                byName.values().forEach(this::fail);
-                return;
-            }
-            Map<String, TaskId> ids = new HashMap<>();
-            tasks.forEach(task -> ids.put(task.fileName(), task.taskId()));
-            for (Map.Entry<String, Path> file : byName.entrySet()) {
-                TaskId id = ids.get(file.getKey());
-                if (id == null) {
-                    log.warn("[{}] Cloud-API 1 lieferte keine TaskId für {}", context.userId(), file.getKey());
-                    fail(file.getValue());
-                } else if (context.isCancelled()) {
-                    context.recordAbandoned(1);
-                } else {
-                    // Erst in den Pool, dann Batch als beantwortet melden (siehe StatusConsumer#isFinished).
-                    pool.add(id, file.getValue(), clock.instant());
-                    context.recordSubmitted();
-                }
-            }
-        } catch (RuntimeException e) {
-            log.error("[{}] Verarbeitung der Submit-Antwort von Task {} ist fehlgeschlagen", context.userId(),
-                    context.taskId(), e);
-            context.cancel(CancelReason.INTERNAL_ERROR);
-        } finally {
-            context.batchSettled();
-            inFlightSlots.release();
         }
     }
 

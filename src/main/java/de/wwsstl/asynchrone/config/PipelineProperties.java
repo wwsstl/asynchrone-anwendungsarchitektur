@@ -12,7 +12,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  *
  * @param baseDirectory       Basisverzeichnis; je Benutzer {@code <base>/<userId>/{inbox,errorbox,donebox}}
  * @param batchSize           Dateien je Batch, den der Producer an Cloud-API 1 übergibt
- * @param maxInFlightBatches  maximal gleichzeitig unbeantwortete Submit-Aufrufe je Sandbox
+ * @param poolResumeThreshold Schwellenwert für die Anzahl der Dateien im Status-Pool, ab dem der Producer die
+ *                            nächste Dateicharge liest (anforderungen_datenverarbeitung.md, Punkte 1 und 3)
  * @param sweepInterval       Wartezeit zwischen zwei Durchläufen des Consumer-Threads
  * @param pollInterval        Wartezeit bis zur nächsten Statusprüfung einer TaskId
  * @param statusBulkSize      maximale Anzahl TaskIds je Bulk-Aufruf an Cloud-API 2
@@ -23,8 +24,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 @ConfigurationProperties("pipeline")
 public record PipelineProperties(
         @DefaultValue("./data/users") Path baseDirectory,
-        @DefaultValue("20") int batchSize,
-        @DefaultValue("4") int maxInFlightBatches,
+        @DefaultValue("4") int batchSize,
+        @DefaultValue("2") int poolResumeThreshold,
         @DefaultValue("1s") Duration sweepInterval,
         @DefaultValue("5s") Duration pollInterval,
         @DefaultValue("200") int statusBulkSize,
@@ -34,7 +35,15 @@ public record PipelineProperties(
 
     public PipelineProperties {
         requirePositive("batch-size", batchSize);
-        requirePositive("max-in-flight-batches", maxInFlightBatches);
+        if (poolResumeThreshold < 0) {
+            throw new IllegalArgumentException("pipeline.pool-resume-threshold darf nicht negativ sein, ist aber "
+                    + poolResumeThreshold);
+        }
+        if (poolResumeThreshold >= batchSize) {
+            throw new IllegalArgumentException(
+                    "pipeline.pool-resume-threshold muss kleiner als pipeline.batch-size sein, ist aber "
+                            + poolResumeThreshold + " >= " + batchSize);
+        }
         requirePositive("status-bulk-size", statusBulkSize);
         requirePositive("error-threshold", errorThreshold);
         requirePositive("sweep-interval", sweepInterval);
@@ -56,9 +65,9 @@ public record PipelineProperties(
             @DefaultValue("/tasks") String submitPath,
             @DefaultValue("/tasks/status") String statusPath,
             @DefaultValue("30s") Duration submitTimeout,
-            @DefaultValue("30s") Duration statusTimeout,
+            @DefaultValue("120s") Duration statusTimeout,
             @DefaultValue("0") int submitRetries,
-            @DefaultValue("2") int statusRetries) {
+            @DefaultValue("5") int statusRetries) {
 
         public Cloud {
             requirePositive("cloud.submit-timeout", submitTimeout);
