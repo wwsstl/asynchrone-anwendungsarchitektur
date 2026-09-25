@@ -23,7 +23,7 @@ import reactor.util.retry.Retry;
  * <ul>
  *   <li>API 1: {@code POST submit-path} mit {@code {"items":[{"fileName","content"}]}} →
  *       {@code {"tasks":[{"fileName","taskId"}]}}</li>
- *   <li>API 2: {@code POST status-path} mit {@code {"taskIds":["…"]}} →
+ *   <li>API 2: {@code GET status-path?taskIds=…&taskIds=…} →
  *       {@code {"results":[{"taskId","status":"SUCCESS|ERROR|PENDING"}]}}</li>
  * </ul>
  */
@@ -56,9 +56,10 @@ public class WebClientCloudClient implements CloudClient {
 
     @Override
     public CompletableFuture<List<TaskStatusResult>> queryStatus(List<TaskId> taskIds) {
-        Mono<StatusResponse> call = webClient.post()
-                .uri(config.statusPath())
-                .bodyValue(new StatusRequest(taskIds.stream().map(TaskId::value).toList()))
+        Mono<StatusResponse> call = webClient.get()
+                .uri(builder -> builder.path(config.statusPath())
+                        .queryParam("taskIds", taskIds.stream().map(TaskId::value).toArray())
+                        .build())
                 .retrieve()
                 .bodyToMono(StatusResponse.class)
                 .timeout(config.statusTimeout());
@@ -94,9 +95,6 @@ public class WebClientCloudClient implements CloudClient {
     }
 
     record SubmitEntry(String fileName, String taskId) {
-    }
-
-    record StatusRequest(List<String> taskIds) {
     }
 
     record StatusResponse(List<StatusEntry> results) {

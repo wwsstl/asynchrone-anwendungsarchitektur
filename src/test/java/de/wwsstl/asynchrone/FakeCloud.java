@@ -4,6 +4,7 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -86,16 +87,34 @@ public final class FakeCloud implements AutoCloseable {
     }
 
     private void status(HttpExchange exchange) throws IOException {
-        JsonNode ids = mapper.readTree(exchange.getRequestBody().readAllBytes()).get("taskIds");
+        if (!"GET".equals(exchange.getRequestMethod())) {
+            reply(exchange, 405, "{}");
+            return;
+        }
         List<String> fileNames = new ArrayList<>();
         List<Map<String, String>> results = new ArrayList<>();
-        for (JsonNode id : ids) {
-            Job job = jobs.get(id.asString());
+        for (String id : taskIds(exchange)) {
+            Job job = jobs.get(id);
             fileNames.add(job.fileName());
-            results.add(Map.of("taskId", id.asString(), "status", statusOf(job)));
+            results.add(Map.of("taskId", id, "status", statusOf(job)));
         }
         statusCalls.add(new StatusCall(Collections.unmodifiableList(fileNames)));
         reply(exchange, 200, mapper.writeValueAsString(Map.of("results", results)));
+    }
+
+    /** Liest die TaskIds aus {@code ?taskIds=a&taskIds=b}. */
+    private static List<String> taskIds(HttpExchange exchange) {
+        String query = exchange.getRequestURI().getRawQuery();
+        List<String> ids = new ArrayList<>();
+        if (query == null) {
+            return ids;
+        }
+        for (String pair : query.split("&")) {
+            if (pair.startsWith("taskIds=")) {
+                ids.add(URLDecoder.decode(pair.substring("taskIds=".length()), StandardCharsets.UTF_8));
+            }
+        }
+        return ids;
     }
 
     private static String statusOf(Job job) {
