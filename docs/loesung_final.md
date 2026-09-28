@@ -20,8 +20,9 @@ Programmcode; das ist Gegenstand des nächsten Schritts (Paket-/Klassenentwurf).
 | Cloud-API 2 | Unterstützt Sammel-/Bulk-Statusabfrage mehrerer TaskIds pro Aufruf → wird genutzt |
 | Persistenz | Rein In-Memory (Phase 1), keine Datenbank |
 | REST-API-Vertrag | Nur Start / Abbruch / Status (kein SSE-Streaming) |
+| Web-Stack | Spring WebFlux (Netty) für REST-API und Cloud-Client — ein einheitlicher, reaktiver Stack; kein Spring MVC |
 | Framework-Wahl | Ausschließlich eigenes Producer/Consumer/Status-Pool-Modell; **kein** Spring Batch, auch nicht punktuell |
-| Registry | `ConcurrentHashMap`-Registry, gekapselt hinter Cache-Abstraktion (spätere Redis-Fähigkeit erhalten) |
+| Registry | `ConcurrentHashMap`-Registry, gekapselt hinter einem eigenen `TaskRegistry`-Interface (spätere Redis-Fähigkeit erhalten; keine Spring-Cache-Abstraktion, siehe Abschnitt 4.3) |
 | Cloud-Client | `WebClient` (nicht-blockierend) |
 | Dateiverwaltung | Java NIO.2, Ordnerkonvention pro Benutzer |
 
@@ -34,9 +35,9 @@ Gesamtarchitektur.
 
 | # | Schicht im Diagramm | Finale Realisierung |
 |---|---|---|
-| 1 | Externe Steuerungsebene | REST-Controller (Spring MVC, `spring-boot-starter-web`) mit genau drei Operationen: Start, Abbruch, Status |
+| 1 | Externe Steuerungsebene | Reaktiver REST-Controller (Spring WebFlux, `spring-boot-starter-webflux`) mit genau drei Operationen: Start, Abbruch, Status |
 | 2 | Task-Scheduling & Isolationszentrum (Task Manager) | Service, der pro Benutzer eine vollständige Sandbox aufbaut: TaskContext, eigener Status-Pool-Bereich, eigener Producer-Thread **und** eigener Consumer-Thread (Details Abschnitt 4.2) |
-| 3 | TaskRegistry | `ConcurrentHashMap`-basierte Registry-Bean hinter Spring-Cache-Abstraktion |
+| 3 | TaskRegistry | `ConcurrentHashMap`-basierte Registry-Bean hinter dem `TaskRegistry`-Interface |
 | 4 | Sandbox pro Benutzer | TaskContext (Atomic-Felder) + eigener Status-Pool (`ConcurrentHashMap`) + eigener Producer-Thread + eigener Consumer-Thread, alle als Virtual Threads |
 | 5 | Cloud-Dienste / Dateisystem | `WebClient` (inkl. Bulk-Statusabfrage) + Java NIO.2 |
 
@@ -53,18 +54,19 @@ Thread-Topologie.
 
 - **Java 21** — Grundlage für Virtual Threads (`Executors.newVirtualThreadPerTaskExecutor()`
   bzw. Spring Boots eingebaute Unterstützung über `spring.threads.virtual.enabled`).
-- **Spring Boot 4** — löst die bisherige `pom.xml`-Basis (3.3.4) ab; die
-  `pom.xml` muss entsprechend auf die neue Parent-Version gehoben werden
-  (siehe Abschnitt 7, „Nächste Schritte"). Baseline ist weiterhin mit Java 21
-  kompatibel.
-- **Jackson 3** — wird über die Spring-Boot-4-Abhängigkeitsverwaltung bezogen; bei der
-  Umstellung ist zu prüfen, ob sich Package-/Artefaktkoordinaten gegenüber Jackson 2
-  geändert haben (z. B. bei Kernmodulen), damit bestehende Annotationen/Konfiguration
-  beim Implementierungsschritt korrekt migriert werden.
-- **`spring-boot-starter-web`** — für die synchrone REST-Steuerungs-API (Start/Abbruch/Status).
-- **`spring-boot-starter-webflux`** — ausschließlich als Basis für `WebClient`
-  (nicht-blockierender Cloud-Aufruf), **nicht** für reaktive Controller, da der
-  REST-Vertrag laut Entscheidung synchron und schlank bleibt (kein SSE).
+- **Spring Boot 4** — `spring-boot-starter-parent` 4.1.x löst die frühere Basis
+  (3.3.4) ab; Baseline ist weiterhin mit Java 21 kompatibel.
+- **Jackson 3** — über `spring-boot-starter-jackson` aus der
+  Spring-Boot-4-Abhängigkeitsverwaltung. Jackson 3 liegt in den Packages
+  `tools.jackson.*` (Jackson 2: `com.fasterxml.jackson.*`); der Code verwendet
+  ausschließlich die neuen Packages.
+- **`spring-boot-starter-webflux`** — einziger Web-Stack der Anwendung (Netty): für
+  die reaktive REST-Steuerungs-API (Start/Abbruch/Status) und als Basis für
+  `WebClient` (nicht-blockierender Cloud-Aufruf). Spring MVC wird nicht verwendet.
+- **`spring-boot-webclient`** — die `WebClient`-Autokonfiguration
+  (`WebClient.Builder` mit den Jackson-3-Codecs). In Spring Boot 4 ist sie ein
+  eigenes Modul, das `spring-boot-starter-webflux` nicht mitbringt; ohne dieses
+  Modul fehlt der `WebClient.Builder`, und die Anwendung startet nicht.
 - **Kein Spring Batch** — keine entsprechende Abhängigkeit wird aufgenommen.
 - **Keine Datenbank/kein Cache-Server** — Phase 1 bleibt vollständig In-Memory; die
   Registry- und Pool-Abstraktionen werden dennoch so geschnitten, dass ein späterer
@@ -76,7 +78,8 @@ Thread-Topologie.
 
 ### 4.1 REST-API
 
-Drei Endpunkte, synchron über Spring MVC:
+Drei Endpunkte, reaktiv über Spring WebFlux (annotierter Controller, Rückgabe als
+`Mono`):
 
 - Aufgabe für einen Benutzer starten
 - Aufgabe eines Benutzers abbrechen
@@ -84,6 +87,12 @@ Drei Endpunkte, synchron über Spring MVC:
 
 Kein Streaming-Endpunkt (SSE wurde bewusst nicht aufgenommen). Die Endpunkte rufen
 ausschließlich den Task Manager auf und enthalten selbst keine Geschäftslogik.
+
+Der Task Manager arbeitet blockierend (Dateisystem, Sperren, begrenztes Warten auf die
+Threads eines gerade abgebrochenen Tasks). Damit der Netty-Event-Loop nie blockiert,
+verlagert der Controller jeden Aufruf auf einen eigenen Scheduler, der je Aufruf einen
+Virtual Thread startet (`Mono.fromCallable(…).subscribeOn(…)`). Fehler des Task
+Managers erreichen als `Mono.error` die zentrale Fehlerabbildung (400/404/409).
 
 ### 4.2 Task Manager (mit dediziertem Consumer-Thread pro Sandbox)
 
@@ -131,10 +140,21 @@ auch aus Ressourcensicht tragfähig.
 
 ### 4.3 TaskRegistry
 
-`ConcurrentHashMap`-basierte Ablage aktiver Sandbox-Referenzen, gekapselt hinter einer
-schmalen Spring-Cache-Abstraktion. Rein In-Memory in Phase 1 (Entscheidung bestätigt);
-die Abstraktion bleibt bestehen, damit ein späterer Wechsel auf einen verteilten Cache
-keine Änderung an den Aufrufstellen erfordert.
+`ConcurrentHashMap`-basierte Ablage aktiver Sandbox-Referenzen, gekapselt hinter dem
+schmalen, eigenen Interface `TaskRegistry` (`register`, `find`, `remove`, `all`,
+`size`); die Endzustände beendeter Tasks hält analog `TaskHistory`. Rein In-Memory in
+Phase 1 (Entscheidung bestätigt); die Interfaces bleiben bestehen, damit ein späterer
+Wechsel auf einen verteilten Speicher (z. B. Redis) keine Änderung an den
+Aufrufstellen erfordert.
+
+Die ursprünglich vorgesehene Spring-Cache-Abstraktion (`loesung.md`, Abschnitt 4,
+Option B) wird bewusst **nicht** verwendet: Das Register hält lebende Sandboxen mit
+laufenden Threads, die weder serialisierbar sind noch sinnvoll in einem verteilten
+Cache liegen können. Spring Cache ist für wiederherstellbare Werte gedacht, deren
+Verlust nur einen erneuten Aufruf kostet; ein Eintrag im Register ist dagegen die
+einzige Referenz auf einen laufenden Task. Ein fachliches Interface beschreibt die
+benötigten Operationen genauer und lässt sich ebenso gegen eine Redis-Implementierung
+tauschen.
 
 ### 4.4 TaskContext
 
@@ -223,6 +243,10 @@ Phase 1) nicht zu blockieren.
   fester Poolgröße für die Fachlogik nötig — jede Sandbox erhält ihre eigenen zwei
   Virtual Threads (Producer, Consumer), vollständig unabhängig von anderen
   Sandboxen.
+- **REST-Aufrufe:** Der Netty-Event-Loop nimmt die Anfragen entgegen; die
+  blockierenden Aufrufe des Task Managers laufen je Anfrage auf einem eigenen Virtual
+  Thread (Reactor-Scheduler über `Executors.newVirtualThreadPerTaskExecutor()`,
+  siehe 4.1), ebenfalls ohne feste Poolgröße.
 - Die in `loesung.md` (Abschnitt 11) diskutierte Sorge vor „vielen Threads bei
   vielen gleichzeitigen Benutzern" bezog sich auf klassische Plattform-Threads und
   ist mit Virtual Threads nicht mehr relevant — ein zusätzlicher, überwiegend
@@ -241,8 +265,9 @@ verworfenen Optionen mit Kurzbegründung:
 | `DelayQueue` als Status-Pool | Passt schlecht zu „Status unverändert → weiter prüfen" und zu unabhängig eintreffenden Batches; serielle Entnahme durch einen Consumer-Thread limitiert Durchsatz |
 | Zentraler Sweep-Scheduler (statt Consumer-Thread pro Sandbox) | Zunächst erwogen, um Thread-Anzahl zu reduzieren; aus Wartbarkeitsgründen zugunsten eines dedizierten Consumer-Threads je Sandbox verworfen (siehe 4.2) — dank Virtual Threads ohne relevanten Ressourcennachteil |
 | Spring Batch (auch punktuell, z. B. nur `ItemReader`) | Chunk-orientiertes Modell passt nicht zum unabhängig weiterlaufenden Producer; Entscheidung: komplett eigenes Modell |
-| Reaktive Controller (WebFlux) für die Steuerungs-API | REST-Vertrag bleibt auf Start/Abbruch/Status beschränkt, kein SSE-Bedarf |
-| Sofortige DB-/Redis-Anbindung | Phase 1 bleibt In-Memory; Abstraktionen (Cache-Interface, `UserFolderResolver`, Pool-Interface) halten die Tür offen |
+| Spring MVC für die Steuerungs-API | Zunächst gewählt, später zugunsten eines einheitlichen Web-Stacks durch WebFlux ersetzt: Der Cloud-Client (`WebClient`) setzt ohnehin auf WebFlux, zwei Web-Stacks nebeneinander entfallen |
+| Sofortige DB-/Redis-Anbindung | Phase 1 bleibt In-Memory; Abstraktionen (`TaskRegistry`, `UserFolderResolver`, Pool-Interface) halten die Tür offen |
+| Spring-Cache-Abstraktion für die Registry | Ungeeignet für lebende Sandboxen mit Threads; stattdessen eigenes `TaskRegistry`-Interface (siehe 4.3) |
 
 ---
 

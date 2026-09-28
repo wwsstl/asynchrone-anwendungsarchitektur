@@ -1,9 +1,6 @@
 # Build-Ausgabe (Maven)
 target/
 
-# Laufzeitdaten der Benutzer (pipeline.base-directory, Standard ./data/users)
-data/
-
 # IDEs
 .idea/
 *.iml

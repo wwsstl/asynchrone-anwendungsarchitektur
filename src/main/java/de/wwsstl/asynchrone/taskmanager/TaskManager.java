@@ -139,7 +139,7 @@ public class TaskManager {
     /** Laufender Task: aktueller Zustand aus der Sandbox; beendeter Task: Endzustand aus der Historie. */
     public TaskSnapshot status(String userId, UUID taskId) {
         Optional<Sandbox> live = findLive(userId, taskId);
-        return live.isPresent() ? live.get().snapshot() : findFinished(userId, taskId);
+        return live.map(Sandbox::snapshot).orElseGet(() -> findFinished(userId, taskId));
     }
 
     /** Baut die Sandbox auf, trägt den Task ins Register ein und startet dann erst seine Threads. */

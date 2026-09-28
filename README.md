@@ -5,7 +5,7 @@ Cloud-Dienste erzeugen lässt und die Dateien je nach Ergebnis in eine `donebox`
 Benutzer-Task läuft vollständig isoliert in einer eigenen Sandbox aus Producer, Consumer und Status-Pool
 (Producer-Consumer-Muster auf Virtual Threads).
 
-**Technik:** Java 21 · Spring Boot 4.1 (Web MVC, WebClient) · Jackson 3 · Java NIO.2 · rein In-Memory (Phase 1)
+**Technik:** Java 21 · Spring Boot 4.1 (WebFlux für REST-API und WebClient) · Jackson 3 · Java NIO.2 · rein In-Memory (Phase 1)
 
 ## Funktionsweise
 
