@@ -186,6 +186,7 @@ Die Entwurfsdokumente liegen in [`docs/`](docs/); Code-Kommentare verweisen auf 
 | [`abbruch_im_containerbetrieb.md`](docs/abbruch_im_containerbetrieb.md) | Abbruch von Tasks im Containerbetrieb |
 | [`sandbox_und_containerisierung.md`](docs/sandbox_und_containerisierung.md) | Sandbox-Modell und künftige Containerisierung |
 | [`batchauftrag_verwaltung_durch_cloud_api.md`](docs/batchauftrag_verwaltung_durch_cloud_api.md) | Bewertung einer DB-gestützten Batchauftrag-Verwaltung |
+| [`architekturalternative_abgleichsschleife.md`](docs/architekturalternative_abgleichsschleife.md) | Zustand im Dateisystem und Abgleichsschleifen; was davon umgesetzt ist und was offen bleibt |
 | [`prompt.md`](docs/prompt.md) | Verlauf der Arbeitsaufträge |
 
 ## Grenzen der Phase 1
