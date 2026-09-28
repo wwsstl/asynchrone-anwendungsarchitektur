@@ -230,11 +230,54 @@ class TaskPipelineIntegrationTest {
         TaskSnapshot after = sandbox.snapshot();
         assertThat(after.pending()).isZero();
         assertThat(after.abandoned()).isEqualTo(4);
-        assertThat(api.names("cancel-me", "inbox")).hasSize(4);
+        // übermittelte Dateien liegen nicht mehr in der inbox, sondern samt TaskId in der pendingbox
+        assertThat(api.names("cancel-me", "inbox")).isEmpty();
+        assertThat(api.names("cancel-me", "pendingbox")).hasSize(4);
 
         // der Nachbar-Task ist davon unberührt und bleibt im Register
         assertThat(api.awaitFinished("cancel-neighbor", neighbor.taskId()).state()).isEqualTo(TaskState.COMPLETED);
         assertThat(registry.find(neighbor.taskId())).isPresent();
+    }
+
+    @Test
+    void nachAbbruchNimmtDerNaechsteTaskUebermittelteDateienWiederAufOhneSieErneutZuUebermitteln() {
+        api.dropFiles("resume", 3, "SLOW");
+        List<String> files = List.of("resume-0.txt", "resume-1.txt", "resume-2.txt");
+
+        TaskSnapshot first = api.start("resume");
+        Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> api.status("resume", first.taskId())
+                .pending() == 3);
+        api.cancel("resume", first.taskId());
+        assertThat(api.names("resume", "pendingbox")).containsExactlyElementsOf(files);
+
+        // Die Cloud schließt die Aufträge erst ab, nachdem der erste Task abgebrochen wurde.
+        cloud.release(files);
+        // Der Neustart wartet, bis die Threads des abgebrochenen Tasks ausgelaufen sind, statt 409 zu liefern.
+        TaskSnapshot second = api.awaitFinished("resume", api.start("resume").taskId());
+
+        assertThat(second.state()).isEqualTo(TaskState.COMPLETED);
+        assertThat(second.resumed()).isEqualTo(3);
+        assertThat(second.submitted()).isZero();
+        assertThat(second.succeeded()).isEqualTo(3);
+        assertThat(api.names("resume", "donebox")).containsExactlyElementsOf(files);
+        assertThat(api.names("resume", "pendingbox")).isEmpty();
+        assertThat(api.box("resume", "pendingbox").resolve(".taskids")).isEmptyDirectory();
+        assertThat(cloud.submittedFileNames()).filteredOn(name -> name.startsWith("resume-"))
+                .as("jede Datei genau einmal an Cloud-API 1").containsExactlyInAnyOrderElementsOf(files);
+    }
+
+    @Test
+    void dateiOhneTaskIdInDerPendingboxWirdNichtErneutUebermittelt() throws IOException {
+        // Zustand nach einem Absturz zwischen Beanspruchen und Antwort von Cloud-API 1: Datei ohne TaskId-Marker.
+        Files.createDirectories(api.box("orphan", "pendingbox"));
+        Files.writeString(api.box("orphan", "pendingbox").resolve("orphan-0.txt"), "ok");
+
+        TaskSnapshot done = api.awaitFinished("orphan", api.start("orphan").taskId());
+
+        assertThat(done.failed()).isEqualTo(1);
+        assertThat(api.names("orphan", "errorbox")).containsExactly("orphan-0.txt");
+        assertThat(api.names("orphan", "pendingbox")).isEmpty();
+        assertThat(cloud.submittedFileNames()).doesNotContain("orphan-0.txt");
     }
 
     @Test

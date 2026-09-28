@@ -16,6 +16,11 @@ public record Sandbox(TaskContext context, StatusPool pool, Thread producerThrea
         consumerThread.start();
     }
 
+    /** {@code true}, solange Producer- oder Consumer-Thread noch laufen (auch nach einem Abbruchsignal). */
+    public boolean isAlive() {
+        return producerThread.isAlive() || consumerThread.isAlive();
+    }
+
     public TaskSnapshot snapshot() {
         return context.snapshot(pool.size());
     }
