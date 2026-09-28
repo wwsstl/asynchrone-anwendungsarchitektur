@@ -1,0 +1,31 @@
+flowchart LR
+
+    %% Funktionsweise (Überblick aus README.md, Abschnitt „Funktionsweise“)
+
+    API["REST-API (WebFlux)<br/>Start / Abbruch / Status"] --> TM["TaskManager"]
+    TM -->|"baut auf, startet"| Sandbox
+    TM -->|"laufende Tasks"| Reg[("TaskRegistry")]
+    TM -->|"Endzustände<br/>(task-retention)"| Hist[("TaskHistory")]
+
+    subgraph Sandbox["Sandbox je Task"]
+        P["Producer<br/>(Virtual Thread)"] -->|"TaskIds"| Pool[("Status-Pool")]
+        Pool --> C["Consumer<br/>(Virtual Thread)"]
+        Pool -.->|"Rückstau:<br/>pool-resume-threshold"| P
+    end
+
+    Inbox[("inbox")] -->|"Batch lesen"| P
+    P -->|"beanspruchen,<br/>TaskId-Marker"| Pending[("pendingbox")]
+    Pending -.->|"Wiederaufnahme<br/>beim nächsten Start"| P
+    P ==>|"Batch"| API1["Cloud-API 1<br/>Auftrag anlegen"]
+    C ==>|"Bulk-Abfrage"| API2["Cloud-API 2<br/>Status"]
+    C -->|"SUCCESS"| Done[("donebox")]
+    C -->|"ERROR / Timeout"| Error[("errorbox")]
+    Sandbox -.->|"Threads beendet:<br/>Abmeldung"| TM
+
+    classDef thread fill:#e8f0fe,stroke:#4472c4,stroke-width:1px;
+    classDef store fill:#fef6e0,stroke:#c99a2e,stroke-width:1px;
+    classDef external fill:#eaf7ea,stroke:#3c8a3c,stroke-width:1px;
+
+    class P,C thread;
+    class Pool,Reg,Hist,Inbox,Pending,Done,Error store;
+    class API1,API2 external;

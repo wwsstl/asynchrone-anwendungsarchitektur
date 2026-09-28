@@ -181,7 +181,7 @@ Die Entwurfsdokumente liegen in [`docs/`](docs/); Code-Kommentare verweisen auf 
 | [`feedback_loesung.md`](docs/feedback_loesung.md) | Entscheidungen zu den offenen Punkten der Lösungsskizze |
 | [`loesung_final.md`](docs/loesung_final.md) | verbindliche Architekturentscheidungen |
 | [`asynchrone-anwendungsarchitektur_final.mmd`](docs/asynchrone-anwendungsarchitektur_final.mmd) | Architekturdiagramm (Mermaid) |
-| [`fachlicher_kontext.md`](docs/fachlicher_kontext.md) | fachliche Kontextabgrenzung: Nachbarn, Schnittstellen, offene Fragen (Mermaid) |
+| [`fachlicher_kontext.mmd`](docs/fachlicher_kontext.mmd) | fachlicher Kontext (Mermaid) |
 | [`virtuelle_threads_in_java_21.md`](docs/virtuelle_threads_in_java_21.md) | Hintergrund zu Virtual Threads |
 | [`fragestellungen.md`](docs/fragestellungen.md) | Fragen und Antworten zur Thread-Topologie |
 | [`abbruch_im_containerbetrieb.md`](docs/abbruch_im_containerbetrieb.md) | Abbruch von Tasks im Containerbetrieb |
