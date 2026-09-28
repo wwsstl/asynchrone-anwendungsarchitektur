@@ -37,7 +37,8 @@ import de.wwsstl.asynchrone.pool.TaskId;
  *   <li>{@code PENDING} → Eintrag bleibt im Pool, nächster Prüfzeitpunkt wird gesetzt</li>
  * </ul>
  * Ist der Producer fertig, alle Submit-Antworten sind eingegangen und der Pool ist leer, gilt der Task als
- * abgeschlossen. Bei einem Abbruch endet die Schleife; noch offene Dateien bleiben in der {@code inbox}. Nur bei
+ * abgeschlossen. Bei einem Abbruch endet die Schleife; noch offene Dateien bleiben samt TaskId in der
+ * {@code pendingbox} und werden vom nächsten Task des Benutzers weiter abgefragt, nicht erneut übermittelt. Nur bei
  * Zeitüberschreitung werden sie wie Fehler behandelt (nach {@code errorbox}).
  */
 public final class StatusConsumer implements Runnable {
@@ -180,13 +181,16 @@ public final class StatusConsumer implements Runnable {
         });
     }
 
-    /** Beim Beenden verbliebene Einträge freigeben; die Dateien bleiben in der {@code inbox}. */
+    /**
+     * Beim Beenden verbliebene Einträge freigeben; die Dateien bleiben mit ihrer TaskId in der {@code pendingbox},
+     * damit der nächste Task die Statusabfrage fortsetzt.
+     */
     private void abandonRemaining() {
         int abandoned = pool.drain().size();
         if (abandoned > 0) {
             context.recordAbandoned(abandoned);
-            log.info("[{}] Task {}: {} Dateien blieben unentschieden in der inbox", context.userId(),
-                    context.taskId(), abandoned);
+            log.info("[{}] Task {}: {} übermittelte Dateien blieben unentschieden in der pendingbox",
+                    context.userId(), context.taskId(), abandoned);
         }
     }
 }

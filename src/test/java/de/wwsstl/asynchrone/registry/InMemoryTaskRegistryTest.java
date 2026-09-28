@@ -43,7 +43,7 @@ class InMemoryTaskRegistryTest {
     }
 
     @Test
-    void beendeteTasksBleibenImRegister() {
+    void dasRegisterEntferntBeendeteTasksNichtVonSelbst() {
         Sandbox finished = sandbox("alice");
         Sandbox cancelled = sandbox("bob");
         registry.register(finished);

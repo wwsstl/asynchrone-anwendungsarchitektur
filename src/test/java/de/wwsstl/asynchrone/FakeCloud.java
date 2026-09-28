@@ -7,9 +7,11 @@ import java.net.InetSocketAddress;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
@@ -26,7 +28,8 @@ import tools.jackson.databind.json.JsonMapper;
  * gesteuert:
  * <ul>
  *   <li>Inhalt enthält {@code FAIL} → Cloud meldet {@code ERROR}</li>
- *   <li>Inhalt enthält {@code SLOW} → Cloud meldet dauerhaft {@code PENDING}</li>
+ *   <li>Inhalt enthält {@code SLOW} → Cloud meldet {@code PENDING}, bis die Datei per {@link #release} freigegeben
+ *       wird; danach {@code SUCCESS}</li>
  *   <li>sonst → {@code PENDING} bei der ersten Abfrage, danach {@code SUCCESS}</li>
  * </ul>
  */
@@ -44,6 +47,8 @@ public final class FakeCloud implements AutoCloseable {
     private final Map<String, Job> jobs = new ConcurrentHashMap<>();
     private final List<Integer> submitBatchSizes = new CopyOnWriteArrayList<>();
     private final List<StatusCall> statusCalls = new CopyOnWriteArrayList<>();
+    private final List<String> submittedFileNames = new CopyOnWriteArrayList<>();
+    private final Set<String> released = ConcurrentHashMap.newKeySet();
 
     public FakeCloud() {
         try {
@@ -69,6 +74,16 @@ public final class FakeCloud implements AutoCloseable {
         return List.copyOf(statusCalls);
     }
 
+    /** Alle je an Cloud-API 1 übermittelten Dateinamen, in Aufrufreihenfolge (Duplikate = Mehrfachübermittlung). */
+    public List<String> submittedFileNames() {
+        return List.copyOf(submittedFileNames);
+    }
+
+    /** Lässt die {@code SLOW}-Aufträge dieser Dateien ab der nächsten Abfrage mit {@code SUCCESS} enden. */
+    public void release(Collection<String> fileNames) {
+        released.addAll(fileNames);
+    }
+
     private void submit(HttpExchange exchange) throws IOException {
         if (!"/tasks".equals(exchange.getRequestURI().getPath())) {
             reply(exchange, 404, "{}");
@@ -80,6 +95,7 @@ public final class FakeCloud implements AutoCloseable {
         for (JsonNode item : items) {
             String taskId = UUID.randomUUID().toString();
             String fileName = item.get("fileName").asString();
+            submittedFileNames.add(fileName);
             jobs.put(taskId, new Job(fileName, item.get("content").asString(), new int[1]));
             tasks.add(Map.of("fileName", fileName, "taskId", taskId));
         }
@@ -96,7 +112,7 @@ public final class FakeCloud implements AutoCloseable {
         for (String id : taskIds(exchange)) {
             Job job = jobs.get(id);
             fileNames.add(job.fileName());
-            results.add(Map.of("taskId", id, "status", statusOf(job)));
+            results.add(Map.of("taskId", id, "status", statusOf(job, released.contains(job.fileName()))));
         }
         statusCalls.add(new StatusCall(Collections.unmodifiableList(fileNames)));
         reply(exchange, 200, mapper.writeValueAsString(Map.of("results", results)));
@@ -117,9 +133,9 @@ public final class FakeCloud implements AutoCloseable {
         return ids;
     }
 
-    private static String statusOf(Job job) {
+    private static String statusOf(Job job, boolean released) {
         if (job.content().contains("SLOW")) {
-            return "PENDING";
+            return released ? "SUCCESS" : "PENDING";
         }
         int poll;
         synchronized (job) {

@@ -16,6 +16,7 @@ import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import de.wwsstl.asynchrone.config.PipelineProperties;
+import de.wwsstl.asynchrone.pool.TaskId;
 
 class NioUserFolderResolverTest {
 
@@ -27,7 +28,7 @@ class NioUserFolderResolverTest {
     @BeforeEach
     void setUp() {
         PipelineProperties properties = new PipelineProperties(base, 20, 4, Duration.ofSeconds(1),
-                Duration.ofSeconds(5), 200, 10, Duration.ofMinutes(30),
+                Duration.ofSeconds(5), 200, 10, Duration.ofMinutes(30), Duration.ofHours(24),
                 new PipelineProperties.Cloud(java.net.URI.create("http://localhost:8081"), "/tasks",
                         "/tasks/status", Duration.ofSeconds(30), Duration.ofSeconds(30), 0, 2));
         resolver = new NioUserFolderResolver(properties);
@@ -40,6 +41,26 @@ class NioUserFolderResolverTest {
         assertThat(folders.inbox()).isEqualTo(base.toAbsolutePath().resolve("alice/inbox")).isDirectory();
         assertThat(folders.errorbox()).isEqualTo(base.toAbsolutePath().resolve("alice/errorbox")).isDirectory();
         assertThat(folders.donebox()).isEqualTo(base.toAbsolutePath().resolve("alice/donebox")).isDirectory();
+        assertThat(folders.pendingbox()).isEqualTo(base.toAbsolutePath().resolve("alice/pendingbox")).isDirectory();
+    }
+
+    @Test
+    void taskIdMarkerBegleitetDieDateiDurchDiePendingbox() throws IOException {
+        UserFolders folders = resolver.resolve("alice");
+        Path pending = folders.moveToPending(Files.writeString(folders.inbox().resolve("a.txt"), "a"));
+
+        assertThat(folders.submittedTaskId(pending)).as("vor der Antwort von Cloud-API 1").isEmpty();
+        folders.recordTaskId(pending, new TaskId("t-1"));
+        assertThat(folders.submittedTaskId(pending)).contains(new TaskId("t-1"));
+        try (var files = folders.openPendingbox()) {
+            assertThat(files).as("Marker-Ordner wird nicht gelistet").containsExactly(pending);
+        }
+
+        folders.moveToDone(pending);
+
+        assertThat(folders.donebox().resolve("a.txt")).hasContent("a");
+        assertThat(folders.submittedTaskId(pending)).as("Marker mit der Datei entfernt").isEmpty();
+        assertThat(folders.pendingbox().resolve(".taskids")).isEmptyDirectory();
     }
 
     @Test

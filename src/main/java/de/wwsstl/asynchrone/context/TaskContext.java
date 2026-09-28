@@ -30,11 +30,14 @@ public final class TaskContext {
     private final AtomicBoolean cancelled = new AtomicBoolean();
     private final AtomicReference<CancelReason> cancelReason = new AtomicReference<>();
     private final AtomicReference<TaskState> state = new AtomicReference<>(TaskState.RUNNING);
+    /** Zeitpunkt des Wechsels in einen Endzustand; wird vor {@link #state} gesetzt, also nie später sichtbar. */
+    private final AtomicReference<Instant> finishedAt = new AtomicReference<>();
     private final CountDownLatch cancelSignal = new CountDownLatch(1);
 
     private final AtomicInteger errorCount = new AtomicInteger();
     private final AtomicInteger succeededCount = new AtomicInteger();
     private final AtomicInteger submittedCount = new AtomicInteger();
+    private final AtomicInteger resumedCount = new AtomicInteger();
     private final AtomicInteger abandonedCount = new AtomicInteger();
     private final AtomicBoolean producerFinished = new AtomicBoolean();
 
@@ -68,6 +71,7 @@ public final class TaskContext {
                 return false;
             }
             cancelReason.set(reason);
+            finishedAt.set(clock.instant());
             state.set(TaskState.CANCELLED);
             cancelled.set(true);
         }
@@ -78,8 +82,18 @@ public final class TaskContext {
     /** Markiert den Task als vollständig abgearbeitet, sofern er nicht schon abgebrochen wurde. */
     public boolean complete() {
         synchronized (transitionLock) {
-            return state.compareAndSet(TaskState.RUNNING, TaskState.COMPLETED);
+            if (state.get() != TaskState.RUNNING) {
+                return false;
+            }
+            finishedAt.set(clock.instant());
+            state.set(TaskState.COMPLETED);
+            return true;
         }
+    }
+
+    /** Zeitpunkt, zu dem der Task seinen Endzustand erreicht hat; {@code null}, solange er läuft. */
+    public Instant finishedAt() {
+        return finishedAt.get();
     }
 
     public boolean isCancelled() {
@@ -151,6 +165,11 @@ public final class TaskContext {
         submittedCount.incrementAndGet();
     }
 
+    /** Eine bereits früher übermittelte Datei, deren Statusabfrage dieser Task wieder aufnimmt. */
+    public void recordResumed() {
+        resumedCount.incrementAndGet();
+    }
+
     public void recordAbandoned(int files) {
         abandonedCount.addAndGet(files);
     }
@@ -164,8 +183,8 @@ public final class TaskContext {
     }
 
     public TaskSnapshot snapshot(int pending) {
-        return new TaskSnapshot(userId, taskId, state.get(), cancelReason.get(), startedAt,
-                producerFinished.get(), submittedCount.get(), succeededCount.get(), errorCount.get(), pending,
-                abandonedCount.get());
+        return new TaskSnapshot(userId, taskId, state.get(), cancelReason.get(), startedAt, finishedAt.get(),
+                producerFinished.get(), submittedCount.get(), resumedCount.get(), succeededCount.get(),
+                errorCount.get(), pending, abandonedCount.get());
     }
 }

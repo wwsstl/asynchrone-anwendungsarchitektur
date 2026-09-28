@@ -10,7 +10,7 @@ import org.springframework.stereotype.Component;
 
 import de.wwsstl.asynchrone.config.PipelineProperties;
 
-/** Ordnerkonvention {@code <basisverzeichnis>/<userId>/{inbox,errorbox,donebox}}. */
+/** Ordnerkonvention {@code <basisverzeichnis>/<userId>/{inbox,pendingbox,errorbox,donebox}}. */
 @Component
 public class NioUserFolderResolver implements UserFolderResolver {
 
@@ -32,10 +32,11 @@ public class NioUserFolderResolver implements UserFolderResolver {
         if (!root.startsWith(base) || root.equals(base)) {
             throw new InvalidUserIdException(userId);
         }
-        UserFolders folders = new UserFolders(userId, root.resolve("inbox"), root.resolve("errorbox"),
-                root.resolve("donebox"));
+        UserFolders folders = new UserFolders(userId, root.resolve("inbox"), root.resolve("pendingbox"),
+                root.resolve("errorbox"), root.resolve("donebox"));
         try {
             Files.createDirectories(folders.inbox());
+            Files.createDirectories(folders.pendingbox().resolve(UserFolders.TASK_ID_DIR));
             Files.createDirectories(folders.errorbox());
             Files.createDirectories(folders.donebox());
         } catch (IOException e) {
