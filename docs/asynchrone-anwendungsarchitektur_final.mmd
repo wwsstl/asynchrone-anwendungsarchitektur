@@ -6,7 +6,7 @@ flowchart TB
     end
 
     subgraph App["Spring Boot Anwendung — Einzelserver (Java 21, Spring Boot 4, Jackson 3)"]
-        API["REST-Controller (Spring MVC)<br/>Start / Abbruch / Status"]
+        API["REST-Controller (Spring WebFlux)<br/>Start / Abbruch / Status"]
         TM["Task Manager<br/>baut Sandbox je Benutzer vollständig auf"]
         Reg[("TaskRegistry<br/>ConcurrentHashMap<br/>hinter TaskRegistry-Interface")]
 

@@ -22,17 +22,18 @@
     </properties>
 
     <dependencies>
-        <!-- Synchrone REST-Steuerungs-API (Start / Abbruch / Status), loesung_final.md 4.1 -->
+        <!-- Spring WebFlux (Netty): reaktive REST-Steuerungs-API (Start / Abbruch / Status, loesung_final.md 4.1)
+             und WebClient fuer den nicht-blockierenden Cloud-Client -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-webmvc</artifactId>
+            <artifactId>spring-boot-starter-webflux</artifactId>
         </dependency>
 
-        <!-- Ausschliesslich fuer WebClient (nicht-blockierender Cloud-Client), keine reaktiven Controller.
-             In Spring Boot 4 liefert nur dieser Starter die WebClient-Autokonfiguration (WebClient.Builder). -->
+        <!-- WebClient-Autokonfiguration (WebClient.Builder): In Spring Boot 4 ein eigenes Modul, das
+             spring-boot-starter-webflux nicht mitbringt. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-webclient</artifactId>
+            <artifactId>spring-boot-webclient</artifactId>
         </dependency>
 
         <!-- Jackson 3 (tools.jackson) ueber die Spring-Boot-4-Abhaengigkeitsverwaltung -->
@@ -48,7 +49,7 @@
         </dependency>
         <dependency>
             <groupId>org.springframework.boot</groupId>
-            <artifactId>spring-boot-starter-webmvc-test</artifactId>
+            <artifactId>spring-boot-starter-webflux-test</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>

@@ -24,7 +24,7 @@ final class PipelineApi {
 
     PipelineApi(int port, Path base) {
         // Großzügiges Read-Timeout: Der Default (10 s) reißt auf überlasteten Build-Rechnern schon bei der ersten
-        // Anfrage an einen frisch gestarteten Tomcat.
+        // Anfrage an einen frisch gestarteten Server.
         JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory();
         requestFactory.setReadTimeout(Duration.ofSeconds(60));
         this.client = RestClient.builder().baseUrl("http://localhost:" + port).requestFactory(requestFactory)
