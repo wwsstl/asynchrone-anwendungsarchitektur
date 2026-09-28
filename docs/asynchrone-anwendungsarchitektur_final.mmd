@@ -8,7 +8,7 @@ flowchart TB
     subgraph App["Spring Boot Anwendung — Einzelserver (Java 21, Spring Boot 4, Jackson 3)"]
         API["REST-Controller (Spring MVC)<br/>Start / Abbruch / Status"]
         TM["Task Manager<br/>baut Sandbox je Benutzer vollständig auf"]
-        Reg[("TaskRegistry<br/>ConcurrentHashMap<br/>hinter Cache-Abstraktion")]
+        Reg[("TaskRegistry<br/>ConcurrentHashMap<br/>hinter TaskRegistry-Interface")]
 
         subgraph SandboxA["Sandbox Benutzer A (laufzeit-dynamisch, isoliert)"]
             CtxA[("TaskContext A<br/>AtomicBoolean cancelled<br/>AtomicInteger errorCount<br/>Startzeit / Timeout")]
