@@ -28,7 +28,7 @@ class NioUserFolderResolverTest {
     @BeforeEach
     void setUp() {
         PipelineProperties properties = new PipelineProperties(base, 20, 4, Duration.ofSeconds(1),
-                Duration.ofSeconds(5), 200, 10, Duration.ofMinutes(30),
+                Duration.ofSeconds(5), 200, 10, Duration.ofMinutes(30), Duration.ofHours(24),
                 new PipelineProperties.Cloud(java.net.URI.create("http://localhost:8081"), "/tasks",
                         "/tasks/status", Duration.ofSeconds(30), Duration.ofSeconds(30), 0, 2));
         resolver = new NioUserFolderResolver(properties);

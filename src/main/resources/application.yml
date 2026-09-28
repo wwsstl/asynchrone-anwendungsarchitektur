@@ -8,7 +8,7 @@ spring:
 
 # Pipeline-Einstellungen (PipelineProperties); die Werte entsprechen den Standardwerten.
 pipeline:
-  # Je Benutzer: <base-directory>/<userId>/{inbox,errorbox,donebox}
+  # Je Benutzer: <base-directory>/<userId>/{inbox,pendingbox,errorbox,donebox}
   base-directory: ./data/users
   # Dateien je Batch, den der Producer an Cloud-API 1 übergibt
   batch-size: 4
@@ -25,6 +25,9 @@ pipeline:
   error-threshold: 10
   # Maximale Laufzeit einer Aufgabe
   task-timeout: 30m
+  # Beendete Tasks werden automatisch abgemeldet (Threads, Status-Pool, Sandbox); ihr Endzustand bleibt so lange
+  # in der TaskHistory abfragbar, danach liefert die Status-Abfrage 404
+  task-retention: 24h
   cloud:
     base-url: http://localhost:8081
     submit-path: /tasks

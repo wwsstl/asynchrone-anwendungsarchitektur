@@ -13,8 +13,9 @@ import de.wwsstl.asynchrone.context.Sandbox;
 /**
  * {@link TaskRegistry} auf Basis einer {@link ConcurrentHashMap} (Phase 1: rein In-Memory).
  *
- * <p>Singleton-Bean: Es gibt genau eine Instanz, die nie ersetzt, geleert oder verkleinert wird. Die Map ist
- * unbegrenzt — es gibt weder Eviction noch TTL —; ein Task verlässt sie nur durch {@link #remove(UUID)}.
+ * <p>Singleton-Bean: Es gibt genau eine Instanz, die nie ersetzt oder geleert wird. Die Map selbst kennt weder
+ * Eviction noch TTL; ein Task verlässt sie nur durch {@link #remove(UUID)}, aufgerufen vom {@code TaskManager} beim
+ * Abmelden oder Abbrechen.
  */
 @Component
 public class InMemoryTaskRegistry implements TaskRegistry {

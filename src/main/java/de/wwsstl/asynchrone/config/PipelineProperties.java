@@ -10,7 +10,7 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 /**
  * Konfigurationswerte der Pipeline (loesung_final.md, Abschnitt 6, Punkt 3).
  *
- * @param baseDirectory       Basisverzeichnis; je Benutzer {@code <base>/<userId>/{inbox,errorbox,donebox}}
+ * @param baseDirectory       Basisverzeichnis; je Benutzer {@code <base>/<userId>/{inbox,pendingbox,errorbox,donebox}}
  * @param batchSize           Dateien je Batch, den der Producer an Cloud-API 1 übergibt
  * @param poolResumeThreshold Schwellenwert für die Anzahl der Dateien im Status-Pool, ab dem der Producer die
  *                            nächste Dateicharge liest (anforderungen_datenverarbeitung.md, Punkte 1 und 3)
@@ -19,7 +19,9 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * @param statusBulkSize      maximale Anzahl TaskIds je Bulk-Aufruf an Cloud-API 2
  * @param errorThreshold      Abbruch, sobald so viele Dateien fehlerhaft waren
  * @param taskTimeout         maximale Laufzeit einer Aufgabe
- * @param cloud               Einstellungen des Cloud-Clients
+ * @param taskRetention       wie lange der Endzustand eines beendeten Tasks in der TaskHistory abfragbar bleibt;
+ *                            danach wird er entfernt und die Status-Abfrage liefert 404
+ * @param cloud              Einstellungen des Cloud-Clients
  */
 @ConfigurationProperties("pipeline")
 public record PipelineProperties(
@@ -31,6 +33,7 @@ public record PipelineProperties(
         @DefaultValue("200") int statusBulkSize,
         @DefaultValue("10") int errorThreshold,
         @DefaultValue("30m") Duration taskTimeout,
+        @DefaultValue("24h") Duration taskRetention,
         @DefaultValue Cloud cloud) {
 
     public PipelineProperties {
@@ -49,6 +52,7 @@ public record PipelineProperties(
         requirePositive("sweep-interval", sweepInterval);
         requirePositive("poll-interval", pollInterval);
         requirePositive("task-timeout", taskTimeout);
+        requirePositive("task-retention", taskRetention);
     }
 
     /**

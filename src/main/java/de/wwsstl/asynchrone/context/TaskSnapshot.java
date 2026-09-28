@@ -6,7 +6,9 @@ import java.util.UUID;
 /**
  * Unveränderliche Momentaufnahme eines Tasks für die REST-API.
  *
- * @param submitted       Dateien, für die Cloud-API 1 in diesem Task eine TaskId geliefert hat
+ * @param finishedAt      Zeitpunkt des Endzustands; {@code null}, solange der Task läuft. Ab
+ *                        {@code finishedAt + pipeline.task-retention} ist der Task nicht mehr abfragbar (404)
+ * @param submitted      Dateien, für die Cloud-API 1 in diesem Task eine TaskId geliefert hat
  * @param resumed         bereits von einem früheren Task übermittelte Dateien ({@code pendingbox}), deren
  *                        Statusabfrage dieser Task ohne erneute Übermittlung wieder aufgenommen hat
  * @param succeeded       Dateien, die nach {@code donebox} verschoben wurden
@@ -21,6 +23,7 @@ public record TaskSnapshot(
         TaskState state,
         CancelReason cancelReason,
         Instant startedAt,
+        Instant finishedAt,
         boolean producerFinished,
         int submitted,
         int resumed,
