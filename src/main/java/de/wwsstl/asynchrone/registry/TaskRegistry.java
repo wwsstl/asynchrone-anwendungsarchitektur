@@ -8,13 +8,13 @@ import de.wwsstl.asynchrone.context.Sandbox;
 
 /**
  * Zentrales Aufgabenregister (loesung_final.md 4.3). Es lebt als Singleton über die gesamte Laufzeit der
- * Anwendung und enthält je Task genau einen Eintrag: Nach {@code n} gestarteten Tasks liefert {@link #size()}
- * {@code n}.
+ * Anwendung und enthält je lebender Sandbox genau einen Eintrag: Bei {@code n} laufenden Tasks liefert
+ * {@link #size()} {@code n}.
  *
- * <p>Tasks verschwinden nie von selbst: Ein abgeschlossener oder abgebrochener Task bleibt mit seinem Endzustand
- * abfragbar (nur seine Threads sind dann beendet), bis er ausdrücklich per {@link #remove(UUID)} gelöscht wird —
- * das geschieht ausschließlich durch den externen Abbruch. Hinter dieser Abstraktion kann später ein verteilter
- * Cache (Redis) stehen.
+ * <p>Das Register selbst entfernt nichts; das übernimmt der {@code TaskManager} per {@link #remove(UUID)} — beim
+ * externen Abbruch oder automatisch, sobald beide Threads eines Tasks ausgelaufen sind. Im zweiten Fall wandert
+ * der Endzustand vorher in die {@link TaskHistory}. Hinter dieser Abstraktion kann später ein verteilter Cache
+ * (Redis) stehen.
  */
 public interface TaskRegistry {
 
@@ -32,7 +32,7 @@ public interface TaskRegistry {
      */
     Optional<Sandbox> remove(UUID taskId);
 
-    /** Alle jemals registrierten Tasks. */
+    /** Alle derzeit registrierten Tasks. */
     Collection<Sandbox> all();
 
     int size();

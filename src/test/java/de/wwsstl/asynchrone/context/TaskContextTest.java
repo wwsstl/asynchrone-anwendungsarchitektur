@@ -2,39 +2,14 @@ package de.wwsstl.asynchrone.context;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
-import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.time.ZoneOffset;
-import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
 
+import de.wwsstl.asynchrone.MutableClock;
+
 class TaskContextTest {
-
-    /** Steuerbare Uhr für die Timeout-Prüfung. */
-    private static final class MutableClock extends Clock {
-        private final AtomicReference<Instant> now = new AtomicReference<>(Instant.parse("2026-01-01T00:00:00Z"));
-
-        void advance(Duration d) {
-            now.updateAndGet(i -> i.plus(d));
-        }
-
-        @Override
-        public ZoneOffset getZone() {
-            return ZoneOffset.UTC;
-        }
-
-        @Override
-        public Clock withZone(java.time.ZoneId zone) {
-            return this;
-        }
-
-        @Override
-        public Instant instant() {
-            return now.get();
-        }
-    }
 
     private final MutableClock clock = new MutableClock();
     private final TaskContext context = new TaskContext("alice", Duration.ofMinutes(1), 3, clock);
@@ -63,6 +38,29 @@ class TaskContextTest {
         assertThat(context.cancel(CancelReason.USER_REQUEST)).isFalse();
         assertThat(context.state()).isEqualTo(TaskState.COMPLETED);
         assertThat(context.isCancelled()).isFalse();
+    }
+
+    @Test
+    void endzeitpunktWirdBeimErstenEndzustandGesetzt() {
+        assertThat(context.finishedAt()).as("läuft noch").isNull();
+        clock.advance(Duration.ofSeconds(5));
+        Instant completedAt = clock.instant();
+
+        context.complete();
+        clock.advance(Duration.ofSeconds(5));
+        context.cancel(CancelReason.USER_REQUEST);
+
+        assertThat(context.finishedAt()).isEqualTo(completedAt);
+        assertThat(context.snapshot(0).finishedAt()).isEqualTo(completedAt);
+    }
+
+    @Test
+    void abbruchSetztDenEndzeitpunkt() {
+        clock.advance(Duration.ofSeconds(5));
+
+        context.cancel(CancelReason.TIMEOUT);
+
+        assertThat(context.finishedAt()).isEqualTo(clock.instant());
     }
 
     @Test
