@@ -1,0 +1,20 @@
+# Build-Ausgabe (Maven)
+target/
+
+# Laufzeitdaten der Benutzer (pipeline.base-directory, Standard ./data/users)
+data/
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+
+# Betriebssystem
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

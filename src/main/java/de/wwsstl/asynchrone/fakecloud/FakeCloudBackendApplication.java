@@ -26,7 +26,7 @@ import tools.jackson.databind.json.JsonMapper;
 
 /**
  * Eigenständige Applikation: Fake-Backend für den {@code WebClientCloudClient}
- * (anforderungen_intergrationtest.md). Sie läuft in einem eigenen Prozess, unabhängig von der Pipeline-Applikation
+ * (anforderungen_integrationtest.md). Sie läuft in einem eigenen Prozess, unabhängig von der Pipeline-Applikation
  * ({@link de.wwsstl.asynchrone.TestdatenPipelineApplication}), und bildet Cloud-API 1 und Cloud-API 2 so nach, wie
  * es {@code WebClientCloudClient} erwartet — jedoch ohne jede automatische Statuslogik:
  *
