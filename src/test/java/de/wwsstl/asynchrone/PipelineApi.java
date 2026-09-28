@@ -89,9 +89,10 @@ final class PipelineApi {
         }
     }
 
+    /** Die regulären Dateien eines Ordners (ohne Unterordner wie {@code pendingbox/.taskids}). */
     List<String> names(String user, String box) {
         try (Stream<Path> files = Files.list(box(user, box))) {
-            return files.map(p -> p.getFileName().toString()).sorted().toList();
+            return files.filter(Files::isRegularFile).map(p -> p.getFileName().toString()).sorted().toList();
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

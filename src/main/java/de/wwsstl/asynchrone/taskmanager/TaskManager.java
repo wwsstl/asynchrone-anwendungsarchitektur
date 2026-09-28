@@ -1,6 +1,8 @@
 package de.wwsstl.asynchrone.taskmanager;
 
 import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -47,9 +49,17 @@ public class TaskManager {
     private final Clock clock;
 
     /**
+     * Wie lange ein Start auf das Auslaufen der Threads eines gerade abgebrochenen Tasks desselben Benutzers wartet,
+     * bevor er mit 409 abgewiesen wird.
+     */
+    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
+
+    /**
      * Neuester Task je Benutzer; dient ausschließlich dazu, das gleichzeitige Starten zweier Tasks desselben
      * Benutzers atomar abzuweisen (Schlüssel = Benutzer, also höchstens ein Eintrag je Benutzer). Die Menge aller
-     * Tasks steht im {@link TaskRegistry}.
+     * Tasks steht im {@link TaskRegistry}. Der Eintrag bleibt auch nach einem Abbruch stehen, bis ein neuer Task
+     * ihn ersetzt: Solange die Threads des alten Tasks noch laufen (etwa ein laufender Aufruf von Cloud-API 1),
+     * darf kein neuer Task die {@code pendingbox} aufnehmen.
      */
     private final ConcurrentHashMap<String, Sandbox> latestByUser = new ConcurrentHashMap<>();
 
@@ -65,12 +75,13 @@ public class TaskManager {
     /**
      * Startet einen neuen Task für den Benutzer.
      *
-     * @throws TaskAlreadyRunningException wenn für diesen Benutzer noch ein Task läuft
+     * @throws TaskAlreadyRunningException wenn für diesen Benutzer noch ein Task läuft oder noch nicht ausgelaufen ist
      */
     public TaskSnapshot start(String userId) {
         UserFolders folders = folderResolver.resolve(userId);
+        awaitStopped(latestByUser.get(userId));
         Sandbox sandbox = latestByUser.compute(userId, (user, latest) -> {
-            if (latest != null && latest.context().state() == TaskState.RUNNING) {
+            if (latest != null && (latest.context().state() == TaskState.RUNNING || latest.isAlive())) {
                 throw new TaskAlreadyRunningException(user, latest.context().taskId());
             }
             return launch(folders);
@@ -94,7 +105,6 @@ public class TaskManager {
         if (registry.remove(taskId).isEmpty()) {
             throw new TaskNotFoundException(userId, taskId);
         }
-        latestByUser.remove(userId, sandbox);
         log.info("[{}] Task {} {} und aus dem Register gelöscht ({} Tasks im Register)", userId, taskId,
                 signalled ? "abgebrochen" : "war bereits beendet", registry.size());
         return sandbox.snapshot();
@@ -126,6 +136,24 @@ public class TaskManager {
             throw e;
         }
         return sandbox;
+    }
+
+    /** Wartet begrenzt, bis die Threads eines bereits beendeten Tasks ausgelaufen sind; einen laufenden nicht. */
+    private void awaitStopped(Sandbox previous) {
+        if (previous == null || previous.context().state() == TaskState.RUNNING) {
+            return;
+        }
+        Instant deadline = clock.instant().plus(STOP_WAIT);
+        try {
+            for (Thread thread : new Thread[] {previous.producerThread(), previous.consumerThread()}) {
+                Duration left = Duration.between(clock.instant(), deadline);
+                if (left.isNegative() || !thread.join(left)) {
+                    return;
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     private Sandbox find(String userId, UUID taskId) {
