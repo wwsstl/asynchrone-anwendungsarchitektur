@@ -1,0 +1,38 @@
+flowchart LR
+
+    %% Fachlicher Kontext (arc42, Abschnitt 3.1): System als Blackbox, nur fachliche Datenflüsse
+
+    subgraph Akteure["Akteure"]
+        Benutzer(["Benutzer:in<br/>fordert Testdaten an"])
+        Ueberwachung["Überwachungssystem<br/>(optional)"]
+        Betrieb(["Betrieb / Administration"])
+    end
+
+    Pipeline["<b>Testdaten-Pipeline</b><br/>erzeugt Testdaten je Benutzer<br/>asynchron und stapelweise"]
+
+    subgraph Fremdsysteme["Fremdsysteme"]
+        Cloud["Cloud-Testdatendienst<br/>Cloud-API 1: Erstellungsauftrag<br/>Cloud-API 2: Statusabfrage"]
+    end
+
+    Benutzer -->|"Testdatendateien (inbox)"| Pipeline
+    Benutzer -->|"Aufgabe starten / abbrechen,<br/>Status abfragen"| Pipeline
+    Pipeline -.->|"verarbeitete Dateien (donebox / errorbox),<br/>Aufgabenstatus"| Benutzer
+
+    Ueberwachung -->|"Status abfragen, Aufgabe abbrechen"| Pipeline
+    Pipeline -.->|"Aufgabenstatus"| Ueberwachung
+
+    Betrieb -->|"Konfiguration: Batchgröße,<br/>Schwellenwerte, Zeitlimits"| Pipeline
+    Pipeline -.->|"Verarbeitungsprotokoll"| Betrieb
+
+    Pipeline ==>|"Erstellungsaufträge je Batch"| Cloud
+    Cloud -.->|"TaskId je Datei"| Pipeline
+    Pipeline ==>|"Bulk-Statusabfrage"| Cloud
+    Cloud -.->|"SUCCESS / ERROR / PENDING"| Pipeline
+
+    classDef system fill:#e8f0fe,stroke:#4472c4,stroke-width:2px;
+    classDef actor fill:#fef6e0,stroke:#c99a2e,stroke-width:1px;
+    classDef external fill:#eaf7ea,stroke:#3c8a3c,stroke-width:1px;
+
+    class Pipeline system;
+    class Benutzer,Ueberwachung,Betrieb actor;
+    class Cloud external;

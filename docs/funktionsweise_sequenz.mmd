@@ -1,0 +1,81 @@
+sequenceDiagram
+    %% Erste Ebene zu funktionsweise.mmd: Ablauf einer Aufgabe von Start bis Abmeldung
+
+    autonumber
+    actor B as Benutzer
+    participant API as REST-API (WebFlux)
+    participant TM as TaskManager
+    participant Reg as TaskRegistry
+    participant Hist as TaskHistory
+    box Sandbox je Task
+        participant P as Producer
+        participant Pool as Status-Pool
+        participant C as Consumer
+    end
+    participant O as Benutzerordner<br/>inbox / pendingbox / donebox / errorbox
+    participant A1 as Cloud-API 1
+    participant A2 as Cloud-API 2
+
+    Note over B,A2: 1. Start
+    B->>API: Aufgabe starten
+    API->>TM: start(userId)
+    TM->>Reg: Sandbox eintragen
+    TM->>P: starten
+    TM->>C: starten
+    TM-->>API: Aufgabenstatus RUNNING
+    API-->>B: 202 Accepted + Location
+
+    par 2. Producer: übermitteln
+        P->>O: markierte Dateien der pendingbox lesen
+        P->>Pool: TaskIds wiederaufnehmen
+        loop bis die inbox leer ist oder abgebrochen wird
+            P->>O: Batch aus inbox in pendingbox verschieben
+            P->>A1: Batch übermitteln
+            A1-->>P: TaskId je Datei
+            P->>O: TaskId-Marker schreiben
+            P->>Pool: TaskIds einfügen
+            Note over P,Pool: Rückstau: nächster Batch erst bei Poolgröße ≤ pool-resume-threshold
+        end
+    and 3. Consumer: Status verfolgen
+        loop je sweep-interval, bis abgeschlossen oder abgebrochen
+            C->>Pool: fällige TaskIds holen
+            C->>A2: Bulk-Statusabfrage
+            A2-->>C: SUCCESS / ERROR / PENDING je TaskId
+            alt SUCCESS
+                C->>O: pendingbox → donebox, Marker löschen
+            else ERROR
+                C->>O: pendingbox → errorbox, Marker löschen
+            else PENDING
+                C->>Pool: nächsten Prüfzeitpunkt setzen
+            end
+        end
+    end
+
+    Note over B,A2: 4. Statusabfrage (jederzeit)
+    B->>API: Status abfragen
+    API->>TM: status(userId, taskId)
+    alt Task läuft
+        TM->>Reg: Sandbox nachschlagen
+    else Task beendet
+        TM->>Hist: Endzustand nachschlagen
+    end
+    TM-->>API: Aufgabenstatus
+    API-->>B: Aufgabenstatus
+
+    opt 5. Abbruch von außen (während des Laufs)
+        B->>API: Aufgabe abbrechen
+        API->>TM: cancel(userId, taskId)
+        TM->>P: Abbruchsignal
+        TM->>C: Abbruchsignal
+        TM->>Reg: Sandbox entfernen
+        TM-->>API: Aufgabenstatus CANCELLED
+        API-->>B: Aufgabenstatus CANCELLED
+        Note over O: übermittelte Dateien bleiben mit Marker in der pendingbox
+    end
+
+    Note over B,A2: 6. Abschluss und Abmeldung
+    C->>C: Producer fertig und Pool leer → COMPLETED<br/>(Timeout oder Fehlerschwelle → CANCELLED)
+    P-->>TM: Thread-Ende
+    C-->>TM: Thread-Ende (zuletzt endender Thread)
+    TM->>Hist: Endzustand ablegen (task-retention)
+    TM->>Reg: Sandbox entfernen
