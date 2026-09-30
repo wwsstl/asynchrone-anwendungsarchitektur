@@ -1,0 +1,60 @@
+sequenceDiagram
+    %% Innenansicht der Blackbox „Sandbox je Task“ aus funktionsweise_sequenz.mmd
+    %% Phasennummern wie in funktionsweise_sequenz.md
+
+    participant TM as TaskManager
+    box Sandbox je Task
+        participant P as Producer
+        participant Pool as Status-Pool
+        participant C as Consumer
+    end
+    participant O as Benutzerordner
+    participant Cloud as Cloud-Dienst<br/>(API 1, 2, 3)
+
+    TM->>P: starten
+    TM->>C: starten
+
+    par 2. Producer – übermitteln
+        P->>O: markierte Dateien der pendingbox lesen
+        P->>Pool: ihre TaskIds wiederaufnehmen (ohne erneute Übermittlung)
+        loop je Batch, bis die inbox leer ist
+            P->>O: bis zu batch-size Dateien aus inbox in pendingbox verschieben
+            P->>Cloud: API 1: JSON-Daten des Batches als eine Anfrage (je Datei höchstens einmal)
+            Note over Cloud: nur beim ersten Batch: legt den batchgenAuftrag an (einmal je Task)
+            Cloud-->>P: JSON: TaskId je umgewandelter Datei, nicht umgewandelte Dateien
+            P->>O: TaskId-Marker für umgewandelte Dateien schreiben
+            P->>Pool: TaskIds der umgewandelten Dateien eintragen
+            P->>O: nicht umgewandelte Dateien → errorbox
+            Note over P,Pool: Rückstau: warten, bis Poolgröße ≤ pool-resume-threshold
+        end
+    and 3. Consumer – Status verfolgen
+        loop je sweep-interval
+            C->>Pool: fällige TaskIds holen
+            C->>Cloud: API 2: TaskIds als eine Anfrage
+            Cloud-->>C: SUCCESS / ERROR / PENDING je TaskId
+            alt SUCCESS
+                C->>O: pendingbox → donebox, Marker löschen
+            else ERROR
+                C->>O: pendingbox → errorbox, Marker löschen, Fehler +1
+            else PENDING
+                C->>Pool: nach poll-interval erneut prüfen
+            end
+        end
+    end
+
+    alt 5. Abbruch von außen
+        TM->>P: Abbruchsignal
+        TM->>C: Abbruchsignal
+        TM->>Cloud: API 3: batchgenAuftrag = CANCELLED
+        Note over O: übermittelte Dateien bleiben mit Marker in der pendingbox
+        P-->>TM: Thread-Ende
+        C-->>TM: Thread-Ende
+    else 6. Abschluss
+        P-->>TM: Thread-Ende (inbox leer)
+        C->>C: Producer fertig und Pool leer → COMPLETED
+        opt Timeout oder Fehlerschwelle → CANCELLED
+            C->>O: bei Timeout: offene Dateien → errorbox
+        end
+        C-->>TM: Thread-Ende (der zuletzt endende Thread meldet den Task ab)
+        TM->>Cloud: API 3: batchgenAuftrag = COMPLETED / CANCELLED
+    end
