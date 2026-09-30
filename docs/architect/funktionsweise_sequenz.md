@@ -15,7 +15,7 @@ Zuerst nimmt der Producer Dateien wieder auf, die ein früherer Task bereits üb
 Danach arbeitet er die `inbox` batchweise ab:
 
 1. Bis zu `batch-size` Dateien in die `pendingbox` verschieben.
-2. Die JSON-Daten dieser Dateien in einer einzigen Anfrage an Cloud-API 1 übermitteln. Cloud-API 1 legt dazu einen batchgenAuftrag an und antwortet mit JSON-Daten.
+2. Die JSON-Daten dieser Dateien in einer einzigen Anfrage an Cloud-API 1 übermitteln. Cloud-API 1 legt dazu einen batchgenAuftrag an und antwortet mit JSON-Daten. Der Batchgen-Auftrag wird nur einmal generiert.
 3. Die JSON-Antwort von Cloud-API 1 gibt an, welche Dateien erfolgreich in Datenerzeugungsaufträge umgewandelt wurden – jeweils mit TaskId – und welche nicht.
 4. Für die erfolgreich umgewandelten Dateien wird die TaskId als Marker gesichert und in den Status-Pool eingetragen.
 5. Die nicht umgewandelten Dateien werden direkt in die `errorbox` verschoben.

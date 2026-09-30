@@ -17,7 +17,7 @@ flowchart LR
     Inbox[("inbox")] -->|"Batch lesen"| P
     P -->|"beanspruchen,<br/>TaskId-Marker"| Pending[("pendingbox")]
     Pending -.->|"Wiederaufnahme<br/>beim nächsten Start"| P
-    P ==>|"Batch als eine JSON-Anfrage"| API1["Cloud-API 1<br/>batchgenAuftrag anlegen"]
+    P ==>|"Batch als eine JSON-Anfrage"| API1["Cloud-API 1<br/>Batches übernehmen,<br/>batchgenAuftrag einmal je Task"]
     API1 -.->|"TaskId je umgewandelter Datei,<br/>nicht umgewandelte Dateien"| P
     C ==>|"Bulk-Abfrage als eine Anfrage"| API2["Cloud-API 2<br/>Status"]
     C -->|"SUCCESS"| Done[("donebox")]

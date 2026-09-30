@@ -23,7 +23,8 @@ sequenceDiagram
         loop je Batch, bis die inbox leer ist
             S->>O: Batch aus inbox in pendingbox verschieben
             S->>Cloud: API 1: Batch als eine JSON-Anfrage
-            Cloud-->>S: batchgenAuftrag: TaskIds und abgelehnte Dateien
+            Note over Cloud: nur beim ersten Batch: legt den batchgenAuftrag an (einmal je Task)
+            Cloud-->>S: TaskIds und abgelehnte Dateien
             S->>O: TaskId-Marker schreiben, abgelehnte Dateien → errorbox
         end
     and 3. Status verfolgen

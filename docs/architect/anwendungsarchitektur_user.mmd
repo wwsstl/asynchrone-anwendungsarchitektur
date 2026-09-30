@@ -16,7 +16,7 @@ flowchart LR
     OA[("Ordner A<br/>inbox → pendingbox →<br/>donebox / errorbox")]
     OB[("Ordner B<br/>inbox → pendingbox →<br/>donebox / errorbox")]
 
-    Cloud["Cloud-Dienst<br/>API 1: batchgenAuftrag anlegen<br/>API 2: Status abfragen<br/>API 3: Auftragsstatus setzen"]
+    Cloud["Cloud-Dienst<br/>API 1: Batches übernehmen<br/>(batchgenAuftrag einmal je Task)<br/>API 2: Status abfragen<br/>API 3: Auftragsstatus setzen"]
 
     UserA --> API
     UserB --> API
