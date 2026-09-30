@@ -1,0 +1,62 @@
+sequenceDiagram
+    %% Erste Ebene zu funktionsweise_sequenz.md – die Sandbox je Task ist eine Blackbox
+
+    actor B as Benutzer
+    participant API as REST-API
+    participant TM as TaskManager
+    participant Reg as TaskRegistry
+    participant Hist as TaskHistory
+    participant S as Sandbox je Task
+    participant O as Benutzerordner
+    participant Cloud as Cloud-Dienst<br/>(API 1, 2, 3)
+
+    Note over B,Cloud: 1. Start
+    B->>API: Aufgabe starten
+    API->>TM: start
+    TM->>Reg: Sandbox eintragen
+    TM->>S: starten
+    TM-->>API: RUNNING
+    API-->>B: 202 Accepted
+
+    par 2. Übermitteln
+        S->>O: markierte Dateien der pendingbox wiederaufnehmen
+        loop je Batch, bis die inbox leer ist
+            S->>O: Batch aus inbox in pendingbox verschieben
+            S->>Cloud: API 1: Batch als eine JSON-Anfrage
+            Cloud-->>S: batchgenAuftrag: TaskIds und abgelehnte Dateien
+            S->>O: TaskId-Marker schreiben, abgelehnte Dateien → errorbox
+        end
+    and 3. Status verfolgen
+        loop je sweep-interval
+            S->>Cloud: API 2: fällige TaskIds als eine Anfrage
+            Cloud-->>S: SUCCESS / ERROR / PENDING je TaskId
+            S->>O: SUCCESS → donebox, ERROR → errorbox
+        end
+    end
+
+    Note over B,Cloud: 4. Statusabfrage (jederzeit)
+    B->>API: Status abfragen
+    API->>TM: status
+    alt Task läuft
+        TM->>Reg: aktuellen Stand lesen
+    else Task beendet
+        TM->>Hist: Endzustand lesen
+    end
+    TM-->>API: Aufgabenstatus
+    API-->>B: Aufgabenstatus
+
+    alt 5. Abbruch von außen
+        B->>API: Aufgabe abbrechen
+        API->>TM: cancel
+        TM->>S: Abbruchsignal
+        TM->>Cloud: API 3: batchgenAuftrag = CANCELLED
+        TM->>Hist: Endzustand ablegen
+        TM->>Reg: Sandbox entfernen
+        TM-->>API: CANCELLED
+        API-->>B: CANCELLED
+    else 6. Abschluss (fertig, Timeout oder Fehlerschwelle)
+        S-->>TM: beendet: COMPLETED oder CANCELLED
+        TM->>Cloud: API 3: batchgenAuftrag = COMPLETED / CANCELLED
+        TM->>Hist: Endzustand ablegen (8 h abrufbar)
+        TM->>Reg: Sandbox entfernen
+    end

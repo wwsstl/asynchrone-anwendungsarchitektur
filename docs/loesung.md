@@ -1,7 +1,7 @@
 # Lösungsskizze: Asynchrone Testdaten-Pipeline mit Spring Boot
 
 Dieses Dokument leitet aus den funktionalen und nicht-funktionalen Anforderungen
-(`anforderungen.md`) sowie dem Architekturdiagramm
+(`architect/anforderungen.md`) sowie dem Architekturdiagramm
 (`asynchrone-anwendungsarchitektur_deu.puml`) mögliche Lösungsbausteine ab. Es werden
 für jede Komponente Implementierungsoptionen mit Vor-/Nachteilen aufgelistet, damit auf
 Basis dieses Dokuments eine Technologie-/Musterentscheidung getroffen werden kann.

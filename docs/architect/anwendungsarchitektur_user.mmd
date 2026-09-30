@@ -1,0 +1,40 @@
+flowchart LR
+
+    %% Anwendungsarchitektur mit Benutzer A und B (vereinfacht), Stand funktionsweise_sequenz.md
+
+    UserA(["Benutzer A"])
+    UserB(["Benutzer B"])
+
+    API["REST-API<br/>Start / Abbruch / Status"]
+    TM["TaskManager<br/>je Benutzer eine Sandbox"]
+    Reg[("TaskRegistry<br/>laufende Tasks")]
+    Hist[("TaskHistory<br/>Endzustände, 8 h")]
+
+    SA["Sandbox Task A<br/>Producer · Status-Pool · Consumer"]
+    SB["Sandbox Task B<br/>Producer · Status-Pool · Consumer"]
+
+    OA[("Ordner A<br/>inbox → pendingbox →<br/>donebox / errorbox")]
+    OB[("Ordner B<br/>inbox → pendingbox →<br/>donebox / errorbox")]
+
+    Cloud["Cloud-Dienst<br/>API 1: batchgenAuftrag anlegen<br/>API 2: Status abfragen<br/>API 3: Auftragsstatus setzen"]
+
+    UserA --> API
+    UserB --> API
+    API --> TM
+    TM -->|"laufend"| Reg
+    TM -->|"beendet"| Hist
+    TM -->|"starten / abbrechen"| SA
+    TM -->|"starten / abbrechen"| SB
+    SA <-->|"Dateien"| OA
+    SB <-->|"Dateien"| OB
+    SA ==>|"API 1 + 2"| Cloud
+    SB ==>|"API 1 + 2"| Cloud
+    TM ==>|"API 3"| Cloud
+
+    classDef thread fill:#e8f0fe,stroke:#4472c4,stroke-width:1px;
+    classDef store fill:#fef6e0,stroke:#c99a2e,stroke-width:1px;
+    classDef external fill:#eaf7ea,stroke:#3c8a3c,stroke-width:1px;
+
+    class SA,SB thread;
+    class Reg,Hist,OA,OB store;
+    class Cloud external;
