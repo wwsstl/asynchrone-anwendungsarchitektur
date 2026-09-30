@@ -1,6 +1,6 @@
 # Architekturalternative: Abgleichsschleife mit Zustand im Dateisystem
 
-> **Fragestellung:** Gibt es – gemessen an den Anforderungen (`anforderungen.md`, `anforderungen_datenverarbeitung.md`) – eine bessere Architektur als das heutige Sandbox-Modell mit In-Memory-Status-Pool (`loesung_final.md`)?
+> **Fragestellung:** Gibt es – gemessen an den Anforderungen (`architect/anforderungen.md`, `anforderungen_datenverarbeitung.md`) – eine bessere Architektur als das heutige Sandbox-Modell mit In-Memory-Status-Pool (`loesung_final.md`)?
 
 Ergänzt `sandbox_und_containerisierung.md` (Phase A, Schritte 1–3) und `batchauftrag_verwaltung_durch_cloud_api.md`. Der Ordner `processing/` ist dort bereits vorgeschlagen; im Code heißt er inzwischen `pendingbox/`. Dieses Dokument macht daraus das tragende Prinzip der Architektur und prüft es gegen alle Anforderungen.
 
@@ -274,7 +274,7 @@ datei (
 
 ## 6. Empfehlung zur Anforderung „MQ und Redis“
 
-`anforderungen.md` verlangt, den Status-Pool durch eine Message Queue (RabbitMQ, RocketMQ) und das Register durch Redis ersetzbar zu machen. Für dieses Problem ist eine Datenbanktabelle die bessere Zielarchitektur:
+`architect/anforderungen.md` verlangt, den Status-Pool durch eine Message Queue (RabbitMQ, RocketMQ) und das Register durch Redis ersetzbar zu machen. Für dieses Problem ist eine Datenbanktabelle die bessere Zielarchitektur:
 
 | Bedarf | Message Queue | Tabelle |
 |---|---|---|
@@ -286,7 +286,7 @@ datei (
 
 Die Zweifel an einer Warteschlange wurden schon früh geäußert (`prompt.md`, Rückmeldung zu Punkt 7; `loesung.md`, Abschnitt 7). Aus denselben Gründen wurde `DelayQueue` als Status-Pool verworfen (`loesung_final.md`, Abschnitt 5). Eine verteilte MQ hätte dieselben Schwächen. Redis bleibt nur dann sinnvoll, wenn es in Phase 2 keine Datenbank gibt (`abbruch_im_containerbetrieb.md`).
 
-**Vorschlag für den neuen Wortlaut in `anforderungen.md`, Abschnitt Skalierbarkeit:**
+**Vorschlag für den neuen Wortlaut in `architect/anforderungen.md`, Abschnitt Skalierbarkeit:**
 
 > Austauschbare Zustandshaltung: Der Status-Pool ist hinter der Schnittstelle `StatusPool` so zu abstrahieren, dass er künftig durch eine relationale Tabelle mit Statusfeld und nächstem Prüfzeitpunkt ersetzt werden kann. Abbruchwunsch, Benutzersperre und Zuständigkeit eines Pods (Lease) werden im Cluster-Betrieb in derselben Datenbank geführt.
 
@@ -312,7 +312,7 @@ Die Zweifel an einer Warteschlange wurden schon früh geäußert (`prompt.md`, R
 | 5 | Consumer: Reihenfolge „verschieben, dann Marker löschen“; überzählige Marker vor dem Start der Threads entfernen (3.4); neue Abschlussbedingung (3.5); `complete()` weckt den Producer | ◐ Reihenfolge umgesetzt (`UserFolders.settle`). **Zuerst** die Bereinigung verwaister Marker (1.1): klein und sofort wirksam. Abschlussbedingung und Wecken offen. | `StatusConsumer`, `TaskContext`, `TaskManager` |
 | 6 | Aufräumen je Abbruchgrund nach Ende beider Threads (3.6); ersetzt `abandonRemaining` und `failPendingAfterTimeout` | ◐ Abmeldung nach Ende beider Threads umgesetzt (PR #3); die Dateibehandlung liegt noch im Consumer | `StatusConsumer` bzw. neue Klasse für das Aufräumen |
 | 7 | Tests, siehe unten | ◐ | `src/test/…` |
-| 8 | Dokumente nachziehen: `loesung_final.md` 4.6, 4.7 und 4.9 (4.7 beschreibt noch „sofort weiterlesen“ statt Rückstau, 4.9 kennt `pendingbox/` nicht), `asynchrone-anwendungsarchitektur_final.mmd`, `anforderungen.md` (Abschnitt 6) | ◐ PR #5 hat `loesung_final.md` für Starter, Registry und WebFlux angeglichen; die genannten Abschnitte sind offen | Dokumentation |
+| 8 | Dokumente nachziehen: `loesung_final.md` 4.6, 4.7 und 4.9 (4.7 beschreibt noch „sofort weiterlesen“ statt Rückstau, 4.9 kennt `pendingbox/` nicht), `asynchrone-anwendungsarchitektur_final.mmd`, `architect/anforderungen.md` (Abschnitt 6) | ◐ PR #5 hat `loesung_final.md` für Starter, Registry und WebFlux angeglichen; die genannten Abschnitte sind offen | Dokumentation |
 
 Tests:
 

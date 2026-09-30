@@ -174,7 +174,7 @@ Die Entwurfsdokumente liegen in [`docs/`](docs/); Code-Kommentare verweisen auf 
 
 | Dokument | Inhalt |
 |---|---|
-| [`anforderungen.md`](docs/anforderungen.md) | funktionale und nicht-funktionale Anforderungen |
+| [`anforderungen.md`](docs/architect/anforderungen.md) | funktionale und nicht-funktionale Anforderungen |
 | [`anforderungen_datenverarbeitung.md`](docs/anforderungen_datenverarbeitung.md) | Batch-Verarbeitung und Rückstau zwischen Producer und Consumer |
 | [`anforderungen_integrationtest.md`](docs/anforderungen_integrationtest.md) | Anforderungen an das Fake-Backend |
 | [`loesung.md`](docs/loesung.md) | Lösungsskizze mit Optionsanalyse |
