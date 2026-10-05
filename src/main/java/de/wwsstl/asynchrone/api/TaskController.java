@@ -1,7 +1,6 @@
 package de.wwsstl.asynchrone.api;
 
 import java.net.URI;
-import java.util.UUID;
 import java.util.concurrent.Callable;
 
 import org.springframework.http.ResponseEntity;
@@ -12,6 +11,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import de.wwsstl.asynchrone.context.TaskSnapshot;
+import de.wwsstl.asynchrone.taskmanager.CancelResult;
 import de.wwsstl.asynchrone.taskmanager.TaskManager;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
@@ -19,11 +19,11 @@ import reactor.core.scheduler.Scheduler;
 /**
  * Reaktive REST-Steuerungsebene (Spring WebFlux) mit genau drei Operationen: Start, Abbruch, Status
  * (loesung_final.md 4.1). Der Controller enthält keine Geschäftslogik, sondern ruft ausschließlich den
- * {@link TaskManager} auf.
+ * {@link TaskManager} auf. Die {@code taskId} ist die Aufgabennummer, also die Nummer des BatchgenAuftrags.
  *
- * <p>Der {@link TaskManager} arbeitet blockierend (Dateisystem, Sperren, Warten auf auslaufende Threads). Jeder
- * Aufruf wird daher auf den {@code taskManagerScheduler} (Virtual Threads) verlagert und nie auf dem
- * Netty-Event-Loop ausgeführt. Fehler erreichen als {@code Mono.error} den {@link ApiExceptionHandler}.
+ * <p>Der {@link TaskManager} arbeitet blockierend (Dateisystem, Aufrufe der Cloud-Dienste). Jeder Aufruf wird
+ * daher auf den {@code taskManagerScheduler} (Virtual Threads) verlagert und nie auf dem Netty-Event-Loop
+ * ausgeführt. Fehler erreichen als {@code Mono.error} den {@link ApiExceptionHandler}.
  */
 @RestController
 @RequestMapping("/api/users/{userId}/tasks")
@@ -46,17 +46,17 @@ public class TaskController {
     }
 
     /**
-     * Externer Abbruch: beendet einen laufenden Task bzw. löscht einen beendeten aus der Historie; danach liefert
-     * die taskId 404.
+     * Abbruch von außen: markiert den BatchgenAuftrag über Cloud-API 3 als {@code CANCELLED} und antwortet mit
+     * {@code 202} und {@code CANCELLING}. Der Task endet spätestens nach einem {@code sweep-interval}.
      */
     @PostMapping("/{taskId}/cancel")
-    public Mono<TaskSnapshot> cancel(@PathVariable String userId, @PathVariable UUID taskId) {
-        return offload(() -> taskManager.cancel(userId, taskId));
+    public Mono<ResponseEntity<CancelResult>> cancel(@PathVariable String userId, @PathVariable String taskId) {
+        return offload(() -> taskManager.cancel(userId, taskId)).map(result -> ResponseEntity.accepted().body(result));
     }
 
-    /** Aktueller Zustand eines laufenden bzw. Endzustand eines beendeten Tasks (bis {@code task-retention}). */
+    /** Aktueller Zustand des laufenden bzw. Endzustand des letzten Laufs (bis {@code task-retention}). */
     @GetMapping("/{taskId}")
-    public Mono<TaskSnapshot> status(@PathVariable String userId, @PathVariable UUID taskId) {
+    public Mono<TaskSnapshot> status(@PathVariable String userId, @PathVariable String taskId) {
         return offload(() -> taskManager.status(userId, taskId));
     }
 

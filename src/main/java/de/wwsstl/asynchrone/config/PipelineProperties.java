@@ -19,8 +19,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * @param statusBulkSize      maximale Anzahl TaskIds je Bulk-Aufruf an Cloud-API 2
  * @param errorThreshold      Abbruch, sobald so viele Dateien fehlerhaft waren
  * @param taskTimeout         maximale Laufzeit einer Aufgabe
- * @param taskRetention       wie lange der Endzustand eines beendeten Tasks in der TaskHistory abfragbar bleibt;
- *                            danach wird er entfernt und die Status-Abfrage liefert 404
+ * @param taskRetention       wie lange der Endzustand eines beendeten Laufs im Laufregister bleibt; danach wird er
+ *                            entfernt und bei der Vergabe der Laufnummern nicht mehr gezählt
  * @param cloud              Einstellungen des Cloud-Clients
  */
 @ConfigurationProperties("pipeline")
@@ -33,7 +33,7 @@ public record PipelineProperties(
         @DefaultValue("200") int statusBulkSize,
         @DefaultValue("10") int errorThreshold,
         @DefaultValue("30m") Duration taskTimeout,
-        @DefaultValue("24h") Duration taskRetention,
+        @DefaultValue("8h") Duration taskRetention,
         @DefaultValue Cloud cloud) {
 
     public PipelineProperties {
@@ -59,15 +59,17 @@ public record PipelineProperties(
      * @param baseUrl        Basis-URL der Cloud-Dienste
      * @param submitPath     Pfad von Cloud-API 1 (Erstellungsauftrag übermitteln)
      * @param statusPath     Pfad von Cloud-API 2 (Bulk-Statusabfrage)
-     * @param submitTimeout  Timeout je Submit-Aufruf
-     * @param statusTimeout  Timeout je Statusabfrage
+     * @param jobPath        Pfad der BatchgenAufträge (Cloud-API 1 legt sie an, Cloud-API 3 liest und setzt den Status)
+     * @param submitTimeout  Timeout je Aufruf von Cloud-API 1
+     * @param statusTimeout  Timeout je Aufruf von Cloud-API 2 und 3
      * @param submitRetries  Wiederholungen bei Cloud-API 1 (Aufträge sind nicht idempotent, daher standardmäßig 0)
-     * @param statusRetries  Wiederholungen bei Cloud-API 2
+     * @param statusRetries  Wiederholungen bei Cloud-API 2 und 3
      */
     public record Cloud(
             @DefaultValue("http://localhost:8081") URI baseUrl,
             @DefaultValue("/tasks") String submitPath,
             @DefaultValue("/tasks/status") String statusPath,
+            @DefaultValue("/jobs") String jobPath,
             @DefaultValue("30s") Duration submitTimeout,
             @DefaultValue("120s") Duration statusTimeout,
             @DefaultValue("0") int submitRetries,

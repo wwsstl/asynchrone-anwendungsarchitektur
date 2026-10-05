@@ -1,11 +1,15 @@
 package de.wwsstl.asynchrone.taskmanager;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Optional;
-import java.util.UUID;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -13,6 +17,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
+import de.wwsstl.asynchrone.cloud.BatchJob;
+import de.wwsstl.asynchrone.cloud.BatchJobId;
+import de.wwsstl.asynchrone.cloud.BatchJobStatus;
+import de.wwsstl.asynchrone.cloud.CloudCallFailedException;
 import de.wwsstl.asynchrone.cloud.CloudClient;
 import de.wwsstl.asynchrone.config.PipelineProperties;
 import de.wwsstl.asynchrone.consumer.StatusConsumer;
@@ -26,58 +34,60 @@ import de.wwsstl.asynchrone.files.UserFolders;
 import de.wwsstl.asynchrone.pool.InMemoryStatusPool;
 import de.wwsstl.asynchrone.pool.StatusPool;
 import de.wwsstl.asynchrone.producer.InboxProducer;
-import de.wwsstl.asynchrone.registry.TaskHistory;
+import de.wwsstl.asynchrone.registry.Run;
+import de.wwsstl.asynchrone.registry.RunRegistry;
 import de.wwsstl.asynchrone.registry.TaskRegistry;
 import jakarta.annotation.PreDestroy;
 
 /**
- * Task-Scheduling- und Isolationszentrum (loesung_final.md 4.2).
+ * Task-Scheduling- und Isolationszentrum (loesung_final.md 4.2, funktionsweise_sequenz.md).
  *
  * <p><b>Singleton über die gesamte Laufzeit:</b> Der Task Manager ist eine einzige Spring-Bean und hält keinen
- * eigenen Task-Bestand — jeder Start legt genau einen Task samt vollständiger Sandbox an und trägt ihn in das
- * (ebenfalls einzige) {@link TaskRegistry} ein. Bei {@code n} laufenden Tasks enthält das Register {@code n} Tasks.
+ * eigenen Task-Bestand. Belegungen, Laufnummern und Endzustände stehen im {@link RunRegistry Laufregister}, die
+ * lebenden Sandboxen dieser Instanz in der lokalen {@link TaskRegistry}.
  *
- * <p>Je Task baut er eine eigene Sandbox: {@link TaskContext}, exklusiver {@link StatusPool}, Producer-Thread
- * und Consumer-Thread (beide Virtual Threads). Nichts davon wird zwischen Tasks geteilt.
+ * <p><b>Start in vier Schritten</b> (Abschnitt 1), Prüfen und Belegen jeweils atomar im Laufregister:
+ * <ol>
+ *   <li>Benutzer:in belegen — sonst {@link RejectReason#USER_TASK_RUNNING}. Das geschieht vor jedem Aufruf von
+ *       Cloud-API 1, damit kein ungenutzter BatchgenAuftrag entsteht.</li>
+ *   <li>BatchgenAuftrag bestimmen: einen laufenden über Cloud-API 3 fortsetzen; ohne einen solchen bei nicht leerer
+ *       {@code pendingbox} {@link RejectReason#PENDINGBOX_NOT_EMPTY}; sonst über Cloud-API 1 neu anlegen.</li>
+ *   <li>Aufgabennummer (= BatchgenAuftrag-Nummer) belegen und die Laufnummer vergeben — sonst
+ *       {@link RejectReason#TASK_ALREADY_RUNNING}.</li>
+ *   <li>Sandbox aufbauen ({@link TaskContext}, exklusiver {@link StatusPool}, Producer- und Consumer-Thread als
+ *       Virtual Threads), in die lokale Registry eintragen und starten.</li>
+ * </ol>
  *
- * <p><b>Lebensende eines Tasks:</b> Sobald beide Threads ausgelaufen sind, meldet der Task Manager den Task
- * automatisch ab. Zuerst legt er die letzte Momentaufnahme in der {@link TaskHistory} ab, dann entfernt er die
- * Sandbox aus dem Register; danach hält nichts mehr Threads, Status-Pool oder Kontext. Über {@link #status} bleibt
- * der Task mit seinem Endzustand abfragbar, bis die Aufbewahrungsfrist {@code pipeline.task-retention} abgelaufen
- * ist oder der Benutzer ihn per {@link #cancel} löscht. Abgelaufene Einträge werden ohne eigenen Scheduler
- * entfernt: einzeln beim Zugriff und gesammelt bei jedem {@link #start}.
+ * <p><b>Abbruch</b> (Abschnitt 5) liest und schreibt keinen Zustand der Instanz: Er markiert den BatchgenAuftrag
+ * über Cloud-API 3 als {@code CANCELLED}; der Consumer erkennt das im nächsten Durchlauf. Zeitüberschreitung und
+ * Fehlerschwelle meldet die Sandbox als {@link de.wwsstl.asynchrone.context.AbortHandler AbortHandler} hierher; der
+ * Task Manager markiert den BatchgenAuftrag dann ebenso (Abschnitt 6).
+ *
+ * <p><b>Lebensende eines Laufs:</b> Sobald beide Threads ausgelaufen sind, meldet der Task Manager den Lauf ab. Bei
+ * {@code COMPLETED} markiert er zuerst den BatchgenAuftrag über Cloud-API 3 als abgeschlossen. Dann legt er die
+ * letzte Momentaufnahme als Endzustand im Laufregister ab und entfernt die Sandbox aus der Registry. Der Endzustand
+ * bleibt abfragbar, bis {@code pipeline.task-retention} abgelaufen ist; abgelaufene Einträge werden ohne eigenen
+ * Scheduler bei jedem {@link #start} entfernt.
  */
 @Service
 public class TaskManager {
 
     private static final Logger log = LoggerFactory.getLogger(TaskManager.class);
 
-    /**
-     * Wie lange ein Start auf das Auslaufen der Threads eines gerade abgebrochenen Tasks desselben Benutzers wartet,
-     * bevor er mit 409 abgewiesen wird.
-     */
-    private static final Duration STOP_WAIT = Duration.ofSeconds(10);
+    /** Puffer, damit der Client-Timeout (der eigentliche Grenzwert) vor dem Future-Timeout greift. */
+    private static final Duration RESULT_GRACE = Duration.ofSeconds(5);
 
     private final TaskRegistry registry;
-    private final TaskHistory history;
+    private final RunRegistry runs;
     private final UserFolderResolver folderResolver;
     private final CloudClient cloud;
     private final PipelineProperties properties;
     private final Clock clock;
 
-    /**
-     * Neuester Task je Benutzer; dient ausschließlich dazu, das gleichzeitige Starten zweier Tasks desselben
-     * Benutzers atomar abzuweisen (Schlüssel = Benutzer, also höchstens ein Eintrag je Benutzer). Die laufenden
-     * Tasks stehen im {@link TaskRegistry}. Der Eintrag bleibt auch nach einem Abbruch stehen, bis die Threads des
-     * Tasks ausgelaufen sind (Abmeldung) oder ein neuer Task ihn ersetzt: Solange etwa noch ein Aufruf von
-     * Cloud-API 1 läuft, darf kein neuer Task die {@code pendingbox} aufnehmen.
-     */
-    private final ConcurrentHashMap<String, Sandbox> latestByUser = new ConcurrentHashMap<>();
-
-    public TaskManager(TaskRegistry registry, TaskHistory history, UserFolderResolver folderResolver,
+    public TaskManager(TaskRegistry registry, RunRegistry runs, UserFolderResolver folderResolver,
             CloudClient cloud, PipelineProperties properties, Clock clock) {
         this.registry = registry;
-        this.history = history;
+        this.runs = runs;
         this.folderResolver = folderResolver;
         this.cloud = cloud;
         this.properties = properties;
@@ -85,95 +95,164 @@ public class TaskManager {
     }
 
     /**
-     * Startet einen neuen Task für den Benutzer.
+     * Startet einen neuen Lauf für die Benutzer:in — unter einem fortgesetzten oder einem neuen BatchgenAuftrag.
      *
-     * @throws TaskAlreadyRunningException wenn für den Benutzer noch ein Task läuft oder noch nicht ausgelaufen ist
+     * @throws TaskRejectedException     mit {@code USER_TASK_RUNNING}, {@code PENDINGBOX_NOT_EMPTY} oder
+     *                                   {@code TASK_ALREADY_RUNNING}
+     * @throws CloudCallFailedException  wenn Cloud-API 1 oder 3 nicht erreichbar war
      */
     public TaskSnapshot start(String userId) {
         UserFolders folders = folderResolver.resolve(userId);
         evictExpired();
-        awaitStopped(latestByUser.get(userId));
-        Sandbox sandbox = latestByUser.compute(userId, (user, latest) -> {
-            if (latest != null && (latest.context().state() == TaskState.RUNNING || latest.isAlive())) {
-                throw new TaskAlreadyRunningException(user, latest.context().taskId());
+        Run run = runs.claimUser(userId).orElseThrow(() -> new TaskRejectedException(RejectReason.USER_TASK_RUNNING,
+                "Für Benutzer '" + userId + "' läuft bereits eine Aufgabe"));
+        try {
+            BatchJobId jobId = batchJobFor(folders);
+            if (!runs.claimTask(run, jobId)) {
+                throw new TaskRejectedException(RejectReason.TASK_ALREADY_RUNNING,
+                        "Unter Aufgabennummer " + jobId + " läuft bereits eine Aufgabe");
             }
-            return launch(folders);
-        });
-        log.info("[{}] Task {} gestartet ({} Tasks im Register)", userId, sandbox.context().taskId(),
+        } catch (RuntimeException e) {
+            runs.release(run);
+            throw e;
+        }
+        Sandbox sandbox = launch(folders, run);
+        log.info("[{}] Task {} Lauf {} gestartet ({} Tasks im Register)", userId, run.jobId(), run.number(),
                 registry.size());
         return sandbox.snapshot();
     }
 
     /**
-     * Externer Abbruch: beendet einen laufenden Task (Abbruchsignal an Producer und Consumer) und <b>löscht ihn</b>
-     * — er wird dann auch nicht in die Historie übernommen. Ist der Task bereits beendet, wird sein Endzustand aus
-     * der Historie gelöscht. Danach ist die Task-ID in jedem Fall unbekannt.
+     * Start, Schritt 2: der BatchgenAuftrag, unter dem der Lauf arbeitet.
      *
-     * @return den Zustand des Tasks zum Zeitpunkt des Abbruchs
-     * @throws TaskNotFoundException wenn es den Task nicht (mehr) gibt oder er einem anderen Benutzer gehört
+     * @throws TaskRejectedException mit {@code PENDINGBOX_NOT_EMPTY}, wenn kein BatchgenAuftrag läuft, die
+     *                               {@code pendingbox} aber Dateien eines abgebrochenen enthält
      */
-    public TaskSnapshot cancel(String userId, UUID taskId) {
-        Optional<Sandbox> live = findLive(userId, taskId);
-        if (live.isPresent()) {
-            Sandbox sandbox = live.get();
-            synchronized (sandbox) {
-                boolean signalled = sandbox.context().cancel(CancelReason.USER_REQUEST);
-                // Wer den Eintrag löscht, hat den Abbruch "gewonnen": bei zwei gleichzeitigen Abbrüchen erhält der
-                // zweite 404. Die spätere Abmeldung findet den Task dann nicht mehr und archiviert ihn nicht.
-                if (registry.remove(taskId).isPresent()) {
-                    log.info("[{}] Task {} {} und gelöscht ({} Tasks im Register)", userId, taskId,
-                            signalled ? "abgebrochen" : "war bereits beendet", registry.size());
-                    return sandbox.snapshot();
-                }
+    private BatchJobId batchJobFor(UserFolders folders) {
+        String userId = folders.userId();
+        Optional<BatchJobId> running = await(cloud.findRunningBatchJob(userId), statusWait(),
+                "Cloud-API 3 (laufenden BatchgenAuftrag suchen)");
+        if (running.isPresent()) {
+            log.info("[{}] Laufender BatchgenAuftrag {} wird fortgesetzt", userId, running.get());
+            return running.get();
+        }
+        if (hasPendingFiles(folders)) {
+            throw new TaskRejectedException(RejectReason.PENDINGBOX_NOT_EMPTY, "Die pendingbox von Benutzer '"
+                    + userId + "' enthält Dateien eines abgebrochenen BatchgenAuftrags: zuerst fortsetzen (den "
+                    + "BatchgenAuftrag wieder auf RUNNING setzen) oder die pendingbox leeren");
+        }
+        BatchJobId created = await(cloud.createBatchJob(userId), submitWait(), "Cloud-API 1 (BatchgenAuftrag anlegen)");
+        log.info("[{}] BatchgenAuftrag {} angelegt", userId, created);
+        return created;
+    }
+
+    private static boolean hasPendingFiles(UserFolders folders) {
+        try {
+            return folders.hasPendingFiles();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * Abbruch von außen: markiert den BatchgenAuftrag über Cloud-API 3 als {@code CANCELLED}, ohne Zustand dieser
+     * Instanz zu lesen oder zu schreiben. Ein bereits abgebrochener BatchgenAuftrag bleibt unverändert.
+     *
+     * @throws TaskNotFoundException     wenn es den BatchgenAuftrag nicht gibt oder er einer anderen Benutzer:in gehört
+     * @throws TaskRejectedException     mit {@code TASK_NOT_RUNNING}, wenn der BatchgenAuftrag abgeschlossen ist
+     * @throws CloudCallFailedException  wenn Cloud-API 3 nicht erreichbar war
+     */
+    public CancelResult cancel(String userId, String taskId) {
+        BatchJobId jobId = new BatchJobId(taskId);
+        BatchJob job = await(cloud.batchJob(jobId), statusWait(), "Cloud-API 3 (BatchgenAuftrag lesen)")
+                .filter(found -> found.userId().equals(userId))
+                .orElseThrow(() -> new TaskNotFoundException(userId, taskId));
+        switch (job.status()) {
+            case COMPLETED -> throw new TaskRejectedException(RejectReason.TASK_NOT_RUNNING,
+                    "Aufgabe " + taskId + " ist bereits abgeschlossen");
+            case RUNNING -> {
+                await(cloud.setBatchJobStatus(jobId, BatchJobStatus.CANCELLED), statusWait(),
+                        "Cloud-API 3 (BatchgenAuftrag abbrechen)");
+                log.info("[{}] BatchgenAuftrag {} als CANCELLED markiert", userId, jobId);
             }
-            // Inzwischen ausgelaufen und abgemeldet (oder parallel gelöscht): weiter mit der Historie.
+            case CANCELLED -> log.debug("[{}] BatchgenAuftrag {} ist bereits abgebrochen", userId, jobId);
         }
-        TaskSnapshot finished = findFinished(userId, taskId);
-        if (history.remove(taskId).isEmpty()) {
-            throw new TaskNotFoundException(userId, taskId);
-        }
-        log.info("[{}] Beendeter Task {} aus der Historie gelöscht", userId, taskId);
-        return finished;
+        return new CancelResult(jobId.value(), TaskState.CANCELLING);
     }
 
-    /** Laufender Task: aktueller Zustand aus der Sandbox; beendeter Task: Endzustand aus der Historie. */
-    public TaskSnapshot status(String userId, UUID taskId) {
-        Optional<Sandbox> live = findLive(userId, taskId);
-        return live.map(Sandbox::snapshot).orElseGet(() -> findFinished(userId, taskId));
+    /**
+     * Laufender Lauf: aktueller Zustand aus der Sandbox, {@code CANCELLING}, sobald Cloud-API 3 den BatchgenAuftrag
+     * als {@code CANCELLED} meldet. Sonst der Endzustand des letzten Laufs aus dem Laufregister.
+     *
+     * @throws TaskNotFoundException wenn es keinen Lauf (mehr) gibt oder er einer anderen Benutzer:in gehört
+     */
+    public TaskSnapshot status(String userId, String taskId) {
+        BatchJobId jobId = new BatchJobId(taskId);
+        Optional<Sandbox> live = registry.find(jobId).filter(sandbox -> sandbox.context().userId().equals(userId));
+        if (live.isPresent()) {
+            TaskSnapshot snapshot = live.get().snapshot();
+            return snapshot.state() == TaskState.RUNNING && cancelRequested(jobId)
+                    ? snapshot.withState(TaskState.CANCELLING)
+                    : snapshot;
+        }
+        return runs.latestFinished(jobId)
+                .filter(finished -> finished.userId().equals(userId))
+                .filter(finished -> finished.finishedAt().isAfter(retentionCutoff()))
+                .orElseThrow(() -> new TaskNotFoundException(userId, taskId));
     }
 
-    /** Baut die Sandbox auf, trägt den Task ins Register ein und startet dann erst seine Threads. */
-    private Sandbox launch(UserFolders folders) {
-        TaskContext context = new TaskContext(folders.userId(), properties.taskTimeout(),
+    /** Cloud-API 3 meldet den BatchgenAuftrag als {@code CANCELLED}; ist sie nicht erreichbar, gilt: nein. */
+    private boolean cancelRequested(BatchJobId jobId) {
+        try {
+            return await(cloud.batchJob(jobId), statusWait(), "Cloud-API 3 (BatchgenAuftrag lesen)")
+                    .map(BatchJob::status).orElse(null) == BatchJobStatus.CANCELLED;
+        } catch (CloudCallFailedException e) {
+            log.debug("Abbruchstatus von {} nicht abrufbar: {}", jobId, e.toString());
+            return false;
+        }
+    }
+
+    /**
+     * Start, Schritt 4: baut die Sandbox auf, trägt sie in die Registry ein und startet erst dann ihre Threads. Ab
+     * dem Eintrag meldet die Sandbox den Lauf selbst ab; scheitert schon der Eintrag, wird der Lauf freigegeben.
+     */
+    private Sandbox launch(UserFolders folders, Run run) {
+        TaskContext context = new TaskContext(folders.userId(), run.jobId(), run.number(), properties.taskTimeout(),
                 properties.errorThreshold(), clock);
         StatusPool pool = new InMemoryStatusPool();
 
-        // Der zuletzt auslaufende der beiden Threads meldet den Task ab.
+        // Der zuletzt auslaufende der beiden Threads meldet den Lauf ab.
         AtomicReference<Sandbox> self = new AtomicReference<>();
         AtomicInteger runningThreads = new AtomicInteger(2);
         Runnable onThreadExit = () -> {
             if (runningThreads.decrementAndGet() == 0) {
-                deregister(self.get());
+                deregister(self.get(), run);
             }
         };
-        Thread producer = Thread.ofVirtual().name("producer-" + context.taskId()).unstarted(
+        String name = context.jobId() + "-" + context.run();
+        Thread producer = Thread.ofVirtual().name("producer-" + name).unstarted(
                 andThen(new InboxProducer(context, pool, folders, cloud, properties, clock), onThreadExit));
-        Thread consumer = Thread.ofVirtual().name("consumer-" + context.taskId()).unstarted(
-                andThen(new StatusConsumer(context, pool, folders, cloud, properties, clock), onThreadExit));
+        Thread consumer = Thread.ofVirtual().name("consumer-" + name).unstarted(andThen(
+                new StatusConsumer(context, pool, folders, cloud, this::abortBatchJob, properties, clock),
+                onThreadExit));
         Sandbox sandbox = new Sandbox(context, pool, producer, consumer);
         self.set(sandbox);
 
-        // Erst registrieren: Der Task ist damit ab dem ersten Moment abfragbar.
-        registry.register(sandbox);
+        // Erst registrieren: Der Lauf ist damit ab dem ersten Moment abfragbar.
+        try {
+            registry.register(sandbox);
+        } catch (RuntimeException e) {
+            runs.release(run);
+            throw e;
+        }
         try {
             sandbox.start();
         } catch (RuntimeException e) {
             context.cancel(CancelReason.INTERNAL_ERROR);
-            // Ein nie gestarteter Thread läuft auch nie aus; für ihn wird hier abgezählt. latestByUser ist wegen der
-            // Ausnahme nie gesetzt worden, daher genügt das Archivieren.
+            // Ein nie gestarteter Thread läuft auch nie aus; für ihn wird hier abgezählt.
             for (Thread thread : new Thread[] {producer, consumer}) {
                 if (thread.getState() == Thread.State.NEW && runningThreads.decrementAndGet() == 0) {
-                    archive(sandbox);
+                    deregister(sandbox, run);
                 }
             }
             throw e;
@@ -192,73 +271,61 @@ public class TaskManager {
     }
 
     /**
-     * Meldet einen Task ab, dessen Threads beide ausgelaufen sind: Endzustand in die Historie, Sandbox aus dem
-     * Register und aus der Startsperre. Danach referenziert nichts mehr Threads, Status-Pool oder Kontext.
+     * {@link de.wwsstl.asynchrone.context.AbortHandler AbortHandler} der Sandboxen: Zeitüberschreitung oder
+     * Fehlerschwelle markieren den BatchgenAuftrag über Cloud-API 3 als {@code CANCELLED}.
      */
-    private void deregister(Sandbox sandbox) {
-        archive(sandbox);
-        latestByUser.remove(sandbox.context().userId(), sandbox);
+    private boolean abortBatchJob(TaskContext context, CancelReason reason) {
+        try {
+            await(cloud.setBatchJobStatus(context.jobId(), BatchJobStatus.CANCELLED), statusWait(),
+                    "Cloud-API 3 (BatchgenAuftrag abbrechen)");
+            log.info("[{}] Task {}: {} — BatchgenAuftrag als CANCELLED markiert", context.userId(), context.jobId(),
+                    reason);
+            return true;
+        } catch (CloudCallFailedException e) {
+            log.warn("[{}] Task {}: {} — BatchgenAuftrag konnte nicht als CANCELLED markiert werden: {}",
+                    context.userId(), context.jobId(), reason, e.toString());
+            return false;
+        }
     }
 
-    /** Übernimmt den Endzustand in die Historie und entfernt die Sandbox — es sei denn, der Task wurde gelöscht. */
-    private void archive(Sandbox sandbox) {
+    /**
+     * Meldet einen Lauf ab, dessen Threads beide ausgelaufen sind: bei {@code COMPLETED} den BatchgenAuftrag
+     * abschließen, Endzustand ins Laufregister, Sandbox aus der Registry. Danach referenziert nichts mehr Threads,
+     * Status-Pool oder Kontext.
+     */
+    private void deregister(Sandbox sandbox, Run run) {
         TaskContext context = sandbox.context();
-        // Beide Threads sind beendet, also muss es auch der Task sein; sichert den Endzeitpunkt für die Frist.
+        // Beide Threads sind beendet, also muss es auch der Lauf sein; sichert den Endzeitpunkt für die Frist.
         if (context.cancel(CancelReason.INTERNAL_ERROR)) {
-            log.warn("[{}] Task {} lief nach Ende seiner Threads noch", context.userId(), context.taskId());
+            log.warn("[{}] Task {} lief nach Ende seiner Threads noch", context.userId(), context.jobId());
         }
-        synchronized (sandbox) {
-            if (registry.find(context.taskId()).filter(registered -> registered == sandbox).isEmpty()) {
-                return; // durch den Abbruch bereits gelöscht
-            }
-            // Erst ablegen, dann entfernen: Die Status-Abfrage findet den Task so zu jedem Zeitpunkt.
-            history.record(sandbox.snapshot());
-            registry.remove(context.taskId());
+        if (context.state() == TaskState.COMPLETED) {
+            completeBatchJob(context);
         }
-        log.info("[{}] Task {} abgemeldet; Endzustand {} bleibt bis {} abfragbar ({} Tasks im Register)",
-                context.userId(), context.taskId(), context.state(),
+        // Erst ablegen, dann entfernen: Die Status-Abfrage findet den Lauf so zu jedem Zeitpunkt.
+        runs.finish(run, sandbox.snapshot());
+        registry.remove(sandbox);
+        log.info("[{}] Task {} Lauf {} abgemeldet; Endzustand {} bleibt bis {} abfragbar ({} Tasks im Register)",
+                context.userId(), context.jobId(), context.run(), context.state(),
                 context.finishedAt().plus(properties.taskRetention()), registry.size());
     }
 
-    /** Wartet begrenzt, bis die Threads eines bereits beendeten Tasks ausgelaufen sind; einen laufenden nicht. */
-    private void awaitStopped(Sandbox previous) {
-        if (previous == null || previous.context().state() == TaskState.RUNNING) {
-            return;
-        }
-        Instant deadline = clock.instant().plus(STOP_WAIT);
+    private void completeBatchJob(TaskContext context) {
         try {
-            for (Thread thread : new Thread[] {previous.producerThread(), previous.consumerThread()}) {
-                Duration left = Duration.between(clock.instant(), deadline);
-                if (left.isNegative() || !thread.join(left)) {
-                    return;
-                }
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+            await(cloud.setBatchJobStatus(context.jobId(), BatchJobStatus.COMPLETED), statusWait(),
+                    "Cloud-API 3 (BatchgenAuftrag abschließen)");
+        } catch (CloudCallFailedException e) {
+            // Der BatchgenAuftrag bleibt RUNNING; der nächste Start setzt ihn fort, ohne Dateien erneut zu übermitteln.
+            log.error("[{}] BatchgenAuftrag {} konnte nicht als COMPLETED markiert werden: {}", context.userId(),
+                    context.jobId(), e.toString());
         }
     }
 
-    private Optional<Sandbox> findLive(String userId, UUID taskId) {
-        return registry.find(taskId).filter(sandbox -> sandbox.context().userId().equals(userId));
-    }
-
-    /** Ein abgelaufener Eintrag gilt als gelöscht, auch wenn der gesammelte Durchlauf ihn noch nicht erfasst hat. */
-    private TaskSnapshot findFinished(String userId, UUID taskId) {
-        TaskSnapshot snapshot = history.find(taskId)
-                .filter(finished -> finished.userId().equals(userId))
-                .orElseThrow(() -> new TaskNotFoundException(userId, taskId));
-        if (!snapshot.finishedAt().isAfter(retentionCutoff())) {
-            history.remove(taskId);
-            throw new TaskNotFoundException(userId, taskId);
-        }
-        return snapshot;
-    }
-
-    /** Entfernt alle Einträge der Historie, deren Aufbewahrungsfrist abgelaufen ist. */
+    /** Entfernt alle Endzustände, deren Aufbewahrungsfrist abgelaufen ist. */
     private void evictExpired() {
-        int evicted = history.removeFinishedUntil(retentionCutoff());
+        int evicted = runs.removeFinishedUntil(retentionCutoff());
         if (evicted > 0) {
-            log.info("{} beendete Tasks nach Ablauf der Aufbewahrungsfrist ({}) aus der Historie entfernt", evicted,
+            log.info("{} Endzustände nach Ablauf der Aufbewahrungsfrist ({}) aus dem Laufregister entfernt", evicted,
                     properties.taskRetention());
         }
     }
@@ -268,7 +335,34 @@ public class TaskManager {
         return clock.instant().minus(properties.taskRetention());
     }
 
-    /** Beim Herunterfahren laufende Tasks abbrechen; das Register selbst wird dabei nicht angetastet. */
+    private Duration submitWait() {
+        PipelineProperties.Cloud config = properties.cloud();
+        return config.submitTimeout().multipliedBy(config.submitRetries() + 1L).plus(RESULT_GRACE);
+    }
+
+    private Duration statusWait() {
+        PipelineProperties.Cloud config = properties.cloud();
+        return config.statusTimeout().multipliedBy(config.statusRetries() + 1L).plus(RESULT_GRACE);
+    }
+
+    private static <T> T await(CompletableFuture<T> call, Duration wait, String description) {
+        try {
+            return call.get(wait.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new CloudCallFailedException(description, e);
+        } catch (ExecutionException e) {
+            throw new CloudCallFailedException(description, e.getCause());
+        } catch (TimeoutException e) {
+            call.cancel(true);
+            throw new CloudCallFailedException(description, e);
+        }
+    }
+
+    /**
+     * Beim Herunterfahren laufende Tasks abbrechen. Der BatchgenAuftrag bleibt dabei {@code RUNNING}, damit der
+     * nächste Start die Aufgabe fortsetzt.
+     */
     @PreDestroy
     void shutdown() {
         registry.all().forEach(sandbox -> sandbox.context().cancel(CancelReason.SHUTDOWN));

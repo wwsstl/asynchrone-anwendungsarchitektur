@@ -3,24 +3,31 @@ package de.wwsstl.asynchrone.context;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.UUID;
+import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
+import de.wwsstl.asynchrone.cloud.BatchJobId;
+
 /**
- * Zustand genau einer Sandbox (kein Spring-Singleton, loesung_final.md 4.4).
+ * Zustand genau einer Sandbox, also eines Laufs (kein Spring-Singleton, loesung_final.md 4.4).
  *
  * <p>Producer, Consumer und REST-API greifen nebenläufig darauf zu; alle Felder sind daher atomar. Der Wechsel
  * aus {@link TaskState#RUNNING} in einen Endzustand erfolgt genau einmal — wer zuerst kommt (Abschluss oder
  * Abbruch), gewinnt.
+ *
+ * <p>Zeitüberschreitung und Fehlerschwelle brechen den Lauf nicht selbst ab. Der Consumer stellt sie fest und
+ * meldet sie über {@link #requestAbort}; ab dann {@link #isStopping() hält die Sandbox an}, und der eigentliche
+ * Abbruch folgt über Cloud-API 3 (funktionsweise_sequenz.md, Abschnitt 6).
  */
 public final class TaskContext {
 
     private final String userId;
-    private final UUID taskId;
+    private final BatchJobId jobId;
+    private final int run;
     private final Instant startedAt;
     private final Duration timeout;
     private final int errorThreshold;
@@ -29,10 +36,12 @@ public final class TaskContext {
     private final Object transitionLock = new Object();
     private final AtomicBoolean cancelled = new AtomicBoolean();
     private final AtomicReference<CancelReason> cancelReason = new AtomicReference<>();
+    private final AtomicReference<CancelReason> abortRequest = new AtomicReference<>();
     private final AtomicReference<TaskState> state = new AtomicReference<>(TaskState.RUNNING);
     /** Zeitpunkt des Wechsels in einen Endzustand; wird vor {@link #state} gesetzt, also nie später sichtbar. */
     private final AtomicReference<Instant> finishedAt = new AtomicReference<>();
-    private final CountDownLatch cancelSignal = new CountDownLatch(1);
+    /** Weckt wartende Threads bei einer Abbruchmeldung oder einem Abbruch. */
+    private final CountDownLatch stopSignal = new CountDownLatch(1);
 
     private final AtomicInteger errorCount = new AtomicInteger();
     private final AtomicInteger succeededCount = new AtomicInteger();
@@ -41,9 +50,14 @@ public final class TaskContext {
     private final AtomicInteger abandonedCount = new AtomicInteger();
     private final AtomicBoolean producerFinished = new AtomicBoolean();
 
-    public TaskContext(String userId, Duration timeout, int errorThreshold, Clock clock) {
+    /**
+     * @param jobId Aufgabennummer, zugleich die Nummer des BatchgenAuftrags
+     * @param run   Laufnummer unter dieser Aufgabennummer
+     */
+    public TaskContext(String userId, BatchJobId jobId, int run, Duration timeout, int errorThreshold, Clock clock) {
         this.userId = userId;
-        this.taskId = UUID.randomUUID();
+        this.jobId = jobId;
+        this.run = run;
         this.timeout = timeout;
         this.errorThreshold = errorThreshold;
         this.clock = clock;
@@ -54,14 +68,37 @@ public final class TaskContext {
         return userId;
     }
 
-    public UUID taskId() {
-        return taskId;
+    public BatchJobId jobId() {
+        return jobId;
+    }
+
+    public int run() {
+        return run;
     }
 
     // --- Abbruch / Endzustände -------------------------------------------------------------------------------
 
     /**
-     * Setzt das Abbruchsignal. Der erste Grund gewinnt; ein bereits beendeter Task bleibt unverändert.
+     * Hält fest, dass der Lauf wegen {@code reason} abgebrochen werden soll, und weckt wartende Threads. Producer
+     * und Consumer nehmen ab dann keine neue Arbeit mehr an; der Endzustand folgt erst mit {@link #cancel}.
+     *
+     * @return {@code true}, wenn dies die erste Abbruchmeldung eines laufenden Tasks war
+     */
+    public boolean requestAbort(CancelReason reason) {
+        if (state.get() != TaskState.RUNNING || !abortRequest.compareAndSet(null, reason)) {
+            return false;
+        }
+        stopSignal.countDown();
+        return true;
+    }
+
+    /** Der Grund der ersten Abbruchmeldung; leer, wenn es keine gab. */
+    public Optional<CancelReason> abortRequest() {
+        return Optional.ofNullable(abortRequest.get());
+    }
+
+    /**
+     * Setzt den Endzustand {@code CANCELLED}. Der erste Grund gewinnt; ein bereits beendeter Task bleibt unverändert.
      *
      * @return {@code true}, wenn dieser Aufruf den Task abgebrochen hat
      */
@@ -75,7 +112,7 @@ public final class TaskContext {
             state.set(TaskState.CANCELLED);
             cancelled.set(true);
         }
-        cancelSignal.countDown();
+        stopSignal.countDown();
         return true;
     }
 
@@ -100,6 +137,11 @@ public final class TaskContext {
         return cancelled.get();
     }
 
+    /** {@code true}, sobald der Task abgebrochen ist oder sein Abbruch gemeldet wurde. */
+    public boolean isStopping() {
+        return cancelled.get() || abortRequest.get() != null;
+    }
+
     public CancelReason cancelReason() {
         return cancelReason.get();
     }
@@ -109,48 +151,39 @@ public final class TaskContext {
     }
 
     /**
-     * Wartet bis zu {@code maxWait} oder bis der Task abgebrochen wird — was zuerst eintritt. So reagieren
-     * schlafende Threads sofort auf ein Abbruchsignal, ohne dass Interrupts nötig sind.
+     * Wartet bis zu {@code maxWait} oder bis der Task {@linkplain #isStopping() anhält} — was zuerst eintritt. So
+     * reagieren schlafende Threads sofort, ohne dass Interrupts nötig sind.
      *
-     * @return {@code true}, wenn der Task abgebrochen wurde
+     * @return {@code true}, wenn der Task anhält
      */
-    public boolean awaitCancel(Duration maxWait) {
+    public boolean awaitStop(Duration maxWait) {
         try {
-            return cancelSignal.await(maxWait.toNanos(), TimeUnit.NANOSECONDS);
+            stopSignal.await(maxWait.toNanos(), TimeUnit.NANOSECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            return cancelled.get();
         }
+        return isStopping();
     }
 
-    /**
-     * Prüft die maximale Laufzeit (wird im Zyklus des Consumers aufgerufen, loesung_final.md 4.4).
-     *
-     * @return {@code true}, wenn dieser Aufruf den Task wegen Zeitüberschreitung abgebrochen hat
-     */
-    public boolean checkTimeout() {
-        if (state.get() != TaskState.RUNNING) {
-            return false;
-        }
-        if (clock.instant().isBefore(startedAt.plus(timeout))) {
-            return false;
-        }
-        return cancel(CancelReason.TIMEOUT);
+    /** {@code true}, sobald die maximale Laufzeit erreicht ist (geprüft im Zyklus des Consumers). */
+    public boolean isTimedOut() {
+        return !clock.instant().isBefore(startedAt.plus(timeout));
+    }
+
+    /** {@code true}, sobald so viele Dateien fehlerhaft waren, wie {@code error-threshold} erlaubt. */
+    public boolean errorThresholdReached() {
+        return errorCount.get() >= errorThreshold;
     }
 
     // --- Zähler ----------------------------------------------------------------------------------------------
 
     /**
-     * Zählt eine fehlerhafte Datei und bricht den Task ab, sobald der Schwellenwert erreicht ist.
+     * Zählt eine fehlerhafte Datei. Ob damit die Fehlerschwelle erreicht ist, prüft der Consumer.
      *
      * @return der neue Stand des Fehlerzählers
      */
     public int recordError() {
-        int errors = errorCount.incrementAndGet();
-        if (errors >= errorThreshold) {
-            cancel(CancelReason.ERROR_THRESHOLD);
-        }
-        return errors;
+        return errorCount.incrementAndGet();
     }
 
     public int errorCount() {
@@ -183,8 +216,8 @@ public final class TaskContext {
     }
 
     public TaskSnapshot snapshot(int pending) {
-        return new TaskSnapshot(userId, taskId, state.get(), cancelReason.get(), startedAt, finishedAt.get(),
-                producerFinished.get(), submittedCount.get(), resumedCount.get(), succeededCount.get(),
-                errorCount.get(), pending, abandonedCount.get());
+        return new TaskSnapshot(userId, jobId.value(), run, state.get(), cancelReason.get(), startedAt,
+                finishedAt.get(), producerFinished.get(), submittedCount.get(), resumedCount.get(),
+                succeededCount.get(), errorCount.get(), pending, abandonedCount.get());
     }
 }

@@ -11,7 +11,8 @@ import java.util.Collections;
 import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Set;
-import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.AfterAll;
@@ -25,19 +26,21 @@ import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.util.FileSystemUtils;
 
+import de.wwsstl.asynchrone.cloud.BatchJobId;
 import de.wwsstl.asynchrone.context.CancelReason;
 import de.wwsstl.asynchrone.context.Sandbox;
 import de.wwsstl.asynchrone.context.TaskSnapshot;
 import de.wwsstl.asynchrone.context.TaskState;
-import de.wwsstl.asynchrone.registry.TaskHistory;
+import de.wwsstl.asynchrone.registry.RunRegistry;
 import de.wwsstl.asynchrone.registry.TaskRegistry;
 import de.wwsstl.asynchrone.taskmanager.TaskManager;
 
 /**
  * Ende-zu-Ende-Test über die REST-API gegen einen lokalen Fake der Cloud-Dienste (echter HTTP-Server, sodass der
  * {@code WebClient} tatsächlich benutzt wird). Alle Tests teilen sich einen Spring-Kontext — und damit dieselben
- * {@code TaskManager}- und {@code TaskRegistry}-Singletons. Beendete Tasks werden nebenläufig abgemeldet, sobald
- * ihre Threads auslaufen; die Tests prüfen daher einzelne Task-IDs statt der Registergröße.
+ * {@code TaskManager}-, {@code TaskRegistry}- und {@code RunRegistry}-Singletons. Beendete Läufe werden nebenläufig
+ * abgemeldet, sobald ihre Threads auslaufen; die Tests prüfen daher einzelne Aufgabennummern statt der
+ * Registergröße. Jeder Test verwendet eigene Benutzer:innen.
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class TaskPipelineIntegrationTest {
@@ -61,6 +64,7 @@ class TaskPipelineIntegrationTest {
         registry.add("pipeline.poll-interval", () -> "100ms");
         registry.add("pipeline.batch-size", () -> "10");
         registry.add("pipeline.error-threshold", () -> "3");
+        registry.add("pipeline.cloud.status-retries", () -> "0");
     }
 
     @AfterAll
@@ -79,7 +83,7 @@ class TaskPipelineIntegrationTest {
     @Autowired
     TaskRegistry registry;
     @Autowired
-    TaskHistory history;
+    RunRegistry runs;
 
     PipelineApi api;
 
@@ -92,8 +96,10 @@ class TaskPipelineIntegrationTest {
     void taskManagerUndRegisterSindSingletonsUndBleibenDieGanzeLaufzeitBestehen() {
         assertThat(context.getBean(TaskManager.class)).isSameAs(taskManager);
         assertThat(context.getBean(TaskRegistry.class)).isSameAs(registry);
+        assertThat(context.getBean(RunRegistry.class)).isSameAs(runs);
         assertThat(context.getBeansOfType(TaskManager.class)).hasSize(1);
         assertThat(context.getBeansOfType(TaskRegistry.class)).hasSize(1);
+        assertThat(context.getBeansOfType(RunRegistry.class)).hasSize(1);
 
         api.dropFiles("singleton-user", 1, "ok");
         api.awaitFinished("singleton-user", api.start("singleton-user").taskId());
@@ -101,6 +107,18 @@ class TaskPipelineIntegrationTest {
         // Auch nach vielen Requests und beendeten Tasks sind es dieselben Instanzen.
         assertThat(context.getBean(TaskManager.class)).isSameAs(taskManager);
         assertThat(context.getBean(TaskRegistry.class)).isSameAs(registry);
+        assertThat(context.getBean(RunRegistry.class)).isSameAs(runs);
+    }
+
+    @Test
+    void startLegtEinenBatchgenAuftragAnUndVerwendetDessenNummerAlsAufgabennummer() {
+        PipelineApi.Response response = api.startResponse("numbered");
+
+        assertThat(response.status()).isEqualTo(202);
+        assertThat(response.body()).containsEntry("state", "RUNNING").containsEntry("run", 1);
+        assertThat(cloud.jobsOf("numbered")).containsExactly((String) response.body().get("taskId"));
+        assertThat(api.awaitFinished("numbered", (String) response.body().get("taskId")).state())
+                .isEqualTo(TaskState.COMPLETED);
     }
 
     @Test
@@ -122,7 +140,7 @@ class TaskPipelineIntegrationTest {
 
         // n externe Benutzer -> n laufende Tasks im Register, jeder mit seiner eigenen, vollständigen Sandbox
         assertThat(started).extracting(TaskSnapshot::taskId).doesNotHaveDuplicates();
-        List<Sandbox> sandboxes = started.stream().map(s -> registry.find(s.taskId()).orElseThrow()).toList();
+        List<Sandbox> sandboxes = started.stream().map(s -> registry.find(jobId(s)).orElseThrow()).toList();
         assertThat(registry.all()).containsAll(sandboxes);
         assertThat(distinct(sandboxes.stream().map(Sandbox::context).toList())).hasSize(n);
         assertThat(distinct(sandboxes.stream().map(Sandbox::pool).toList())).hasSize(n);
@@ -145,10 +163,11 @@ class TaskPipelineIntegrationTest {
 
         // Beendete Tasks werden samt Threads, Status-Pool und Sandbox abgemeldet ...
         sandboxes.forEach(s -> Awaitility.await().atMost(Duration.ofSeconds(5))
-                .until(() -> registry.find(s.context().taskId()).isEmpty() && !s.isAlive()));
+                .until(() -> registry.find(s.context().jobId()).isEmpty() && !s.isAlive()));
         assertThat(registry.all()).doesNotContainAnyElementsOf(sandboxes);
-        // ... ihr Endzustand bleibt über die REST-API abfragbar.
+        // ... der BatchgenAuftrag ist abgeschlossen, und der Endzustand bleibt über die REST-API abfragbar.
         for (int i = 0; i < n; i++) {
+            assertThat(cloud.jobStatus(started.get(i).taskId())).isEqualTo("COMPLETED");
             TaskSnapshot finished = api.status(users.get(i), started.get(i).taskId());
             assertThat(finished.state()).isEqualTo(TaskState.COMPLETED);
             assertThat(finished.succeeded()).isEqualTo(3);
@@ -204,14 +223,16 @@ class TaskPipelineIntegrationTest {
 
     @Test
     void leereInboxSchliesstDenTaskSofortAb() {
-        TaskSnapshot done = api.awaitFinished("empty", api.start("empty").taskId());
+        TaskSnapshot task = api.start("empty");
+        TaskSnapshot done = api.awaitFinished("empty", task.taskId());
 
         assertThat(done.state()).isEqualTo(TaskState.COMPLETED);
         assertThat(done.submitted()).isZero();
+        awaitJobStatus(task.taskId(), "COMPLETED");
     }
 
     @Test
-    void abbruchVonAussenBeendetNurDenEigenenTask() {
+    void abbruchVonAussenLaeuftUeberCloudApi3UndBeendetNurDenEigenenTask() {
         api.dropFiles("cancel-me", 4, "SLOW");
         api.dropFiles("cancel-neighbor", 3, "ok");
 
@@ -219,39 +240,40 @@ class TaskPipelineIntegrationTest {
         TaskSnapshot neighbor = api.start("cancel-neighbor");
         Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> api.status("cancel-me", mine.taskId())
                 .pending() == 4);
-        Sandbox sandbox = registry.find(mine.taskId()).orElseThrow();
+        Sandbox sandbox = registry.find(jobId(mine)).orElseThrow();
 
-        TaskSnapshot cancelled = api.cancel("cancel-me", mine.taskId());
+        PipelineApi.Response cancelled = api.cancelResponse("cancel-me", mine.taskId());
 
-        assertThat(cancelled.state()).isEqualTo(TaskState.CANCELLED);
-        assertThat(cancelled.cancelReason()).isEqualTo(CancelReason.USER_REQUEST);
+        // Die REST-API markiert nur den BatchgenAuftrag und antwortet sofort mit CANCELLING.
+        assertThat(cancelled.status()).isEqualTo(202);
+        assertThat(cancelled.body()).containsEntry("taskId", mine.taskId()).containsEntry("state", "CANCELLING");
+        assertThat(cloud.jobStatus(mine.taskId())).isEqualTo("CANCELLED");
+        assertThat(api.status("cancel-me", mine.taskId()).state()).isIn(TaskState.CANCELLING, TaskState.CANCELLED);
 
-        // Der Abbruch löscht die übergebene taskId aus der TaskRegistry ...
-        assertThat(registry.find(mine.taskId())).isEmpty();
-        assertThat(registry.all()).doesNotContain(sandbox);
-        assertThat(api.statusCode("cancel-me", mine.taskId().toString())).as("Status nach Abbruch").isEqualTo(404);
-        assertThat(api.cancelStatus("cancel-me", mine.taskId())).as("zweiter Abbruch").isEqualTo(404);
-
-        // ... und beendet die Threads der Sandbox.
-        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> !sandbox.producerThread().isAlive()
-                && !sandbox.consumerThread().isAlive());
-        TaskSnapshot after = sandbox.snapshot();
-        assertThat(after.pending()).isZero();
-        assertThat(after.abandoned()).isEqualTo(4);
+        // Der Consumer erkennt den Abbruch; der Lauf endet mit CANCELLED und bleibt abfragbar.
+        TaskSnapshot done = api.awaitFinished("cancel-me", mine.taskId());
+        assertThat(done.state()).isEqualTo(TaskState.CANCELLED);
+        assertThat(done.cancelReason()).isEqualTo(CancelReason.USER_REQUEST);
+        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> registry.find(jobId(mine)).isEmpty()
+                && !sandbox.isAlive());
+        TaskSnapshot archived = api.status("cancel-me", mine.taskId());
+        assertThat(archived.state()).isEqualTo(TaskState.CANCELLED);
+        assertThat(archived.pending()).isZero();
+        assertThat(archived.abandoned()).isEqualTo(4);
+        assertThat(runs.finished(jobId(mine), 1)).contains(archived);
         // übermittelte Dateien liegen nicht mehr in der inbox, sondern samt TaskId in der pendingbox
         assertThat(api.names("cancel-me", "inbox")).isEmpty();
         assertThat(api.names("cancel-me", "pendingbox")).hasSize(4);
-        // Ein gelöschter Task taucht auch nach dem Auslaufen seiner Threads nicht in der Historie auf.
-        assertThat(history.find(mine.taskId())).isEmpty();
-        assertThat(api.statusCode("cancel-me", mine.taskId().toString())).isEqualTo(404);
+        // Ein zweiter Abbruch ändert nichts.
+        assertThat(api.cancelStatus("cancel-me", mine.taskId())).as("zweiter Abbruch").isEqualTo(202);
 
         // der Nachbar-Task ist davon unberührt: Er läuft zu Ende und bleibt mit seinem Endzustand abfragbar.
         assertThat(api.awaitFinished("cancel-neighbor", neighbor.taskId()).state()).isEqualTo(TaskState.COMPLETED);
-        assertThat(api.statusCode("cancel-neighbor", neighbor.taskId().toString())).isEqualTo(200);
+        assertThat(api.statusCode("cancel-neighbor", neighbor.taskId())).isEqualTo(200);
     }
 
     @Test
-    void nachAbbruchNimmtDerNaechsteTaskUebermittelteDateienWiederAufOhneSieErneutZuUebermitteln() {
+    void wegA_fortsetzenNimmtDieUebermitteltenDateienUnterDerselbenAufgabennummerWiederAuf() {
         api.dropFiles("resume", 3, "SLOW");
         List<String> files = List.of("resume-0.txt", "resume-1.txt", "resume-2.txt");
 
@@ -259,32 +281,73 @@ class TaskPipelineIntegrationTest {
         Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> api.status("resume", first.taskId())
                 .pending() == 3);
         api.cancel("resume", first.taskId());
+        assertThat(api.awaitFinished("resume", first.taskId()).state()).isEqualTo(TaskState.CANCELLED);
         assertThat(api.names("resume", "pendingbox")).containsExactlyElementsOf(files);
+        awaitUserReleased("resume", first.taskId());
 
-        // Die Cloud schließt die Aufträge erst ab, nachdem der erste Task abgebrochen wurde.
+        // Ohne Entscheidung für a oder b wird der Start abgewiesen.
+        PipelineApi.Response rejected = api.startResponse("resume");
+        assertThat(rejected.status()).isEqualTo(409);
+        assertThat(rejected.code()).isEqualTo("PENDINGBOX_NOT_EMPTY");
+
+        // a) BatchgenAuftrag von Hand wieder auf RUNNING setzen; die Cloud schließt die Aufträge inzwischen ab.
+        cloud.setJobStatus(first.taskId(), "RUNNING");
         cloud.release(files);
-        // Der Neustart wartet, bis die Threads des abgebrochenen Tasks ausgelaufen sind, statt 409 zu liefern.
-        TaskSnapshot second = api.awaitFinished("resume", api.start("resume").taskId());
+        TaskSnapshot second = api.start("resume");
 
-        assertThat(second.state()).isEqualTo(TaskState.COMPLETED);
-        assertThat(second.resumed()).isEqualTo(3);
-        assertThat(second.submitted()).isZero();
-        assertThat(second.succeeded()).isEqualTo(3);
+        assertThat(second.taskId()).isEqualTo(first.taskId());
+        assertThat(second.run()).isEqualTo(2);
+        TaskSnapshot done = api.awaitFinished("resume", second.taskId());
+        assertThat(done.run()).isEqualTo(2);
+        assertThat(done.state()).isEqualTo(TaskState.COMPLETED);
+        assertThat(done.resumed()).isEqualTo(3);
+        assertThat(done.submitted()).isZero();
+        assertThat(done.succeeded()).isEqualTo(3);
         assertThat(api.names("resume", "donebox")).containsExactlyElementsOf(files);
         assertThat(api.names("resume", "pendingbox")).isEmpty();
         assertThat(api.box("resume", "pendingbox").resolve(".taskids")).isEmptyDirectory();
         assertThat(cloud.submittedFileNames()).filteredOn(name -> name.startsWith("resume-"))
                 .as("jede Datei genau einmal an Cloud-API 1").containsExactlyInAnyOrderElementsOf(files);
+        assertThat(cloud.jobsOf("resume")).as("kein zweiter BatchgenAuftrag").containsExactly(first.taskId());
+        // Der Endzustand des abgebrochenen ersten Laufs bleibt erhalten.
+        assertThat(runs.finished(jobId(first), 1)).hasValueSatisfying(run1 ->
+                assertThat(run1.state()).isEqualTo(TaskState.CANCELLED));
+        awaitJobStatus(first.taskId(), "COMPLETED");
     }
 
     @Test
-    void dateiOhneTaskIdInDerPendingboxWirdNichtErneutUebermittelt() throws IOException {
-        // Zustand nach einem Absturz zwischen Beanspruchen und Antwort von Cloud-API 1: Datei ohne TaskId-Marker.
+    void wegB_nachDemLeerenDerPendingboxBeginntEinNeuerBatchgenAuftrag() {
+        api.dropFiles("restart", 2, "SLOW");
+        TaskSnapshot first = api.start("restart");
+        Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> api.status("restart", first.taskId())
+                .pending() == 2);
+        api.cancel("restart", first.taskId());
+        api.awaitFinished("restart", first.taskId());
+        awaitUserReleased("restart", first.taskId());
+
+        api.clearPendingbox("restart");
+        TaskSnapshot second = api.start("restart");
+
+        assertThat(second.taskId()).isNotEqualTo(first.taskId());
+        assertThat(second.run()).isEqualTo(1);
+        assertThat(api.awaitFinished("restart", second.taskId()).state()).isEqualTo(TaskState.COMPLETED);
+        assertThat(cloud.jobsOf("restart")).containsExactlyInAnyOrder(first.taskId(), second.taskId());
+        assertThat(cloud.jobStatus(first.taskId())).isEqualTo("CANCELLED");
+        assertThat(api.status("restart", first.taskId()).state()).as("alter Endzustand").isEqualTo(TaskState.CANCELLED);
+    }
+
+    @Test
+    void dateiOhneTaskIdInDerPendingboxWirdBeimFortsetzenNichtErneutUebermittelt() throws IOException {
+        // Zustand nach einem Absturz zwischen Beanspruchen und Antwort von Cloud-API 1: Der BatchgenAuftrag läuft
+        // in der Cloud weiter, die Datei liegt ohne TaskId-Marker in der pendingbox.
+        String job = cloud.createRunningJob("orphan");
         Files.createDirectories(api.box("orphan", "pendingbox"));
         Files.writeString(api.box("orphan", "pendingbox").resolve("orphan-0.txt"), "ok");
 
-        TaskSnapshot done = api.awaitFinished("orphan", api.start("orphan").taskId());
+        TaskSnapshot task = api.start("orphan");
+        TaskSnapshot done = api.awaitFinished("orphan", task.taskId());
 
+        assertThat(task.taskId()).isEqualTo(job);
         assertThat(done.failed()).isEqualTo(1);
         assertThat(api.names("orphan", "errorbox")).containsExactly("orphan-0.txt");
         assertThat(api.names("orphan", "pendingbox")).isEmpty();
@@ -292,29 +355,27 @@ class TaskPipelineIntegrationTest {
     }
 
     @Test
-    void abbruchLoeschtAuchBereitsBeendeteTasksAusDerHistorie() {
+    void abbruchEinerAbgeschlossenenAufgabeWirdMitTaskNotRunningAbgewiesen() {
         TaskSnapshot task = api.start("cancel-finished");
         api.awaitFinished("cancel-finished", task.taskId());
-        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> registry.find(task.taskId()).isEmpty()
-                && history.find(task.taskId()).isPresent());
+        awaitJobStatus(task.taskId(), "COMPLETED");
 
-        TaskSnapshot result = api.cancel("cancel-finished", task.taskId());
+        PipelineApi.Response response = api.cancelResponse("cancel-finished", task.taskId());
 
-        assertThat(result.state()).as("Endzustand bleibt erhalten").isEqualTo(TaskState.COMPLETED);
-        assertThat(history.find(task.taskId())).isEmpty();
-        assertThat(api.statusCode("cancel-finished", task.taskId().toString())).isEqualTo(404);
-        assertThat(api.cancelStatus("cancel-finished", task.taskId())).as("zweiter Abbruch").isEqualTo(404);
+        assertThat(response.status()).isEqualTo(409);
+        assertThat(response.code()).isEqualTo("TASK_NOT_RUNNING");
+        assertThat(api.status("cancel-finished", task.taskId()).state()).isEqualTo(TaskState.COMPLETED);
     }
 
     @Test
-    void gleichzeitigeAbbruecheLoeschenDenTaskGenauEinmal() throws Exception {
+    void gleichzeitigeAbbruecheSindIdempotent() throws Exception {
         api.dropFiles("cancel-race", 2, "SLOW");
         TaskSnapshot task = api.start("cancel-race");
         int attempts = 10;
 
         List<Integer> codes = new ArrayList<>();
-        try (var executor = java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor()) {
-            List<java.util.concurrent.Future<Integer>> futures = new ArrayList<>();
+        try (var executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Future<Integer>> futures = new ArrayList<>();
             for (int i = 0; i < attempts; i++) {
                 futures.add(executor.submit(() -> api.cancelStatus("cancel-race", task.taskId())));
             }
@@ -323,31 +384,37 @@ class TaskPipelineIntegrationTest {
             }
         }
 
-        assertThat(codes).filteredOn(code -> code == 200).hasSize(1);
-        assertThat(codes).filteredOn(code -> code == 404).hasSize(attempts - 1);
-        assertThat(registry.find(task.taskId())).isEmpty();
+        assertThat(codes).containsOnly(202);
+        TaskSnapshot done = api.awaitFinished("cancel-race", task.taskId());
+        assertThat(done.state()).isEqualTo(TaskState.CANCELLED);
+        assertThat(done.cancelReason()).isEqualTo(CancelReason.USER_REQUEST);
     }
 
     @Test
-    void zweiterStartDesselbenBenutzersWirdAbgewiesenSolangeDerTaskLaeuft() {
+    void zweiterStartDerselbenBenutzerinWirdAbgewiesenSolangeIhrTaskLaeuft() {
         api.dropFiles("dup", 2, "SLOW");
 
         TaskSnapshot first = api.start("dup");
-        assertThat(api.startStatus("dup")).isEqualTo(409);
+        PipelineApi.Response second = api.startResponse("dup");
+
+        assertThat(second.status()).isEqualTo(409);
+        assertThat(second.code()).isEqualTo("USER_TASK_RUNNING");
         assertThat(tasksOf("dup")).containsExactly(first.taskId());
+        assertThat(cloud.jobsOf("dup")).as("kein BatchgenAuftrag für den abgewiesenen Start")
+                .containsExactly(first.taskId());
 
-        // Nach dem Abbruch ist der erste Task aus dem Register gelöscht; der Benutzer kann neu starten.
-        api.cancel("dup", first.taskId());
-        assertThat(tasksOf("dup")).isEmpty();
-        TaskSnapshot second = api.start("dup");
+        // Nach dem Abschluss ist die Benutzer:in wieder frei; die leere pendingbox führt zu einem neuen Auftrag.
+        cloud.release(List.of("dup-0.txt", "dup-1.txt"));
+        api.awaitFinished("dup", first.taskId());
+        awaitUserReleased("dup", first.taskId());
+        TaskSnapshot third = api.start("dup");
 
-        assertThat(second.taskId()).isNotEqualTo(first.taskId());
-        assertThat(tasksOf("dup")).containsExactly(second.taskId());
-        api.cancel("dup", second.taskId());
+        assertThat(third.taskId()).isNotEqualTo(first.taskId());
+        assertThat(api.awaitFinished("dup", third.taskId()).state()).isEqualTo(TaskState.COMPLETED);
     }
 
     @Test
-    void fehlerschwellenwertBrichtNurDenBetroffenenTaskAb() {
+    void fehlerschwellenwertBrichtNurDenBetroffenenTaskUeberCloudApi3Ab() {
         api.dropFiles("threshold-bad", 6, "FAIL");
         api.dropFiles("threshold-ok", 3, "ok");
 
@@ -358,10 +425,23 @@ class TaskPipelineIntegrationTest {
         assertThat(badDone.state()).isEqualTo(TaskState.CANCELLED);
         assertThat(badDone.cancelReason()).isEqualTo(CancelReason.ERROR_THRESHOLD);
         assertThat(badDone.failed()).isGreaterThanOrEqualTo(3);
+        assertThat(cloud.jobStatus(bad.taskId())).isEqualTo("CANCELLED");
 
         TaskSnapshot goodDone = api.awaitFinished("threshold-ok", good.taskId());
         assertThat(goodDone.state()).isEqualTo(TaskState.COMPLETED);
         assertThat(goodDone.succeeded()).isEqualTo(3);
+    }
+
+    @Test
+    void nichtErreichbareCloudLiefert502UndGibtDieBenutzerinWiederFrei() {
+        cloud.makeUnavailableFor("cloud-down");
+
+        PipelineApi.Response first = api.startResponse("cloud-down");
+        PipelineApi.Response second = api.startResponse("cloud-down");
+
+        assertThat(first.status()).isEqualTo(502);
+        assertThat(first.code()).isEqualTo("CLOUD_UNAVAILABLE");
+        assertThat(second.status()).as("nicht 409: Die Benutzer:in wurde wieder freigegeben").isEqualTo(502);
     }
 
     @Test
@@ -370,20 +450,37 @@ class TaskPipelineIntegrationTest {
         api.awaitFinished("contract", task.taskId());
 
         assertThat(api.status("contract", task.taskId()).taskId()).isEqualTo(task.taskId());
-        assertThat(api.statusCode("contract", UUID.randomUUID().toString())).as("unbekannte Task-ID").isEqualTo(404);
-        assertThat(api.statusCode("other-user", task.taskId().toString())).as("fremder Benutzer").isEqualTo(404);
-        assertThat(api.statusCode("contract", "keine-uuid")).isEqualTo(400);
+        assertThat(api.statusCode("contract", "unbekannt-1")).as("unbekannte Aufgabennummer").isEqualTo(404);
+        assertThat(api.statusCode("other-user", task.taskId())).as("fremde Benutzer:in").isEqualTo(404);
+        assertThat(api.statusCode("contract", "keine gültige Nummer")).isEqualTo(400);
         assertThat(api.startStatus("bad user")).as("ungültige Benutzerkennung").isEqualTo(400);
-        assertThat(api.cancelStatus("other-user", task.taskId())).as("fremder Benutzer darf nicht abbrechen")
+        assertThat(api.cancelStatus("other-user", task.taskId())).as("fremde Benutzer:in darf nicht abbrechen")
                 .isEqualTo(404);
-        assertThat(api.statusCode("contract", task.taskId().toString())).as("fremder Abbruch löscht nichts")
-                .isEqualTo(200);
+        assertThat(api.cancelStatus("contract", "unbekannt-1")).isEqualTo(404);
+        assertThat(api.cancelStatus("contract", "keine gültige Nummer")).isEqualTo(400);
+        assertThat(api.status("contract", task.taskId()).state()).as("fremder Abbruch ändert nichts")
+                .isEqualTo(TaskState.COMPLETED);
     }
 
-    /** Die Task-IDs des Benutzers im Register. */
-    private List<UUID> tasksOf(String user) {
+    /** Wartet, bis der TaskManager den BatchgenAuftrag über Cloud-API 3 auf {@code status} gesetzt hat. */
+    private void awaitJobStatus(String jobId, String status) {
+        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> status.equals(cloud.jobStatus(jobId)));
+    }
+
+    /** Wartet, bis der Lauf abgemeldet ist und die Benutzer:in damit wieder starten darf. */
+    private void awaitUserReleased(String user, String taskId) {
+        Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> registry.find(new BatchJobId(taskId))
+                .filter(sandbox -> sandbox.context().userId().equals(user)).isEmpty());
+    }
+
+    /** Die Aufgabennummern der Benutzer:in im Register. */
+    private List<String> tasksOf(String user) {
         return registry.all().stream().filter(sandbox -> sandbox.context().userId().equals(user))
-                .map(sandbox -> sandbox.context().taskId()).toList();
+                .map(sandbox -> sandbox.context().jobId().value()).toList();
+    }
+
+    private static BatchJobId jobId(TaskSnapshot snapshot) {
+        return new BatchJobId(snapshot.taskId());
     }
 
     private static <T> Set<T> distinct(List<T> items) {

@@ -35,6 +35,16 @@ public record UserFolders(String userId, Path inbox, Path pendingbox, Path error
         return Files.newDirectoryStream(pendingbox, Files::isRegularFile);
     }
 
+    /**
+     * {@code true}, wenn die {@code pendingbox} noch Dateien enthält, also Dateien eines früheren BatchgenAuftrags
+     * (funktionsweise_sequenz.md, Abschnitt 1).
+     */
+    public boolean hasPendingFiles() throws IOException {
+        try (DirectoryStream<Path> files = openPendingbox()) {
+            return files.iterator().hasNext();
+        }
+    }
+
     /** Beansprucht eine Datei der {@code inbox} für die Übermittlung; liefert ihren neuen Pfad. */
     public Path moveToPending(Path file) throws IOException {
         return moveInto(file, pendingbox);

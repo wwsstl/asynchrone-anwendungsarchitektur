@@ -14,12 +14,14 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 
+import de.wwsstl.asynchrone.cloud.BatchJobStatus;
 import de.wwsstl.asynchrone.cloud.CloudStatus;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
@@ -27,64 +29,94 @@ import tools.jackson.databind.json.JsonMapper;
 /**
  * Eigenständige Applikation: Fake-Backend für den {@code WebClientCloudClient}
  * (anforderungen_integrationtest.md). Sie läuft in einem eigenen Prozess, unabhängig von der Pipeline-Applikation
- * ({@link de.wwsstl.asynchrone.TestdatenPipelineApplication}), und bildet Cloud-API 1 und Cloud-API 2 so nach, wie
- * es {@code WebClientCloudClient} erwartet — jedoch ohne jede automatische Statuslogik:
+ * ({@link de.wwsstl.asynchrone.TestdatenPipelineApplication}), und bildet Cloud-API 1, 2 und 3 so nach, wie es
+ * {@code WebClientCloudClient} erwartet — jedoch ohne jede automatische Statuslogik:
  *
  * <ol>
- *   <li>{@code POST <submit-path>} nimmt Aufträge entgegen (Cloud-API 1) und vergibt je Datei eine TaskId; der
- *       Anfangsstatus ist immer {@code PENDING}.</li>
+ *   <li>{@code POST <job-path>} legt einen BatchgenAuftrag im Status {@code RUNNING} an (Cloud-API 1).</li>
+ *   <li>{@code POST <submit-path>} nimmt Aufträge zu einem BatchgenAuftrag entgegen (Cloud-API 1) und vergibt je
+ *       Datei eine TaskId; der Anfangsstatus ist immer {@code PENDING}.</li>
  *   <li>{@code GET <status-path>?taskIds=…} beantwortet die Bulk-Statusabfragen des {@code StatusConsumer}
  *       (Cloud-API 2) mit dem jeweils aktuell hinterlegten Status.</li>
+ *   <li>{@code GET <job-path>…} und {@code PUT <job-path>/{jobId}/status} lesen und setzen den Status der
+ *       BatchgenAufträge (Cloud-API 3).</li>
  * </ol>
  *
  * <p>Der Status eines Auftrags ändert sich <b>nie von selbst</b> — anders als das automatische Fake
  * ({@code FakeCloud}) in den Integrationstests. Stattdessen stellt diese Applikation einen Admin-Endpunkt bereit,
  * über den der Status eines Auftrags von außen manuell auf {@code SUCCESS} oder {@code ERROR} gesetzt werden kann.
- * So lässt sich das Zusammenspiel von Producer, Status-Pool und Consumer der Pipeline-Applikation von Hand
- * durchspielen und beobachten (z. B. Fehlerschwellenwert, Timeout, Dateiverschiebung).
+ * Den Status eines BatchgenAuftrags setzt man von Hand über Cloud-API 3 selbst, etwa um einen Abbruch auszulösen
+ * oder einen abgebrochenen BatchgenAuftrag zum Fortsetzen wieder auf {@code RUNNING} zu setzen. So lässt sich das
+ * Zusammenspiel von Producer, Status-Pool und Consumer der Pipeline-Applikation von Hand durchspielen und
+ * beobachten (z. B. Fehlerschwellenwert, Timeout, Abbruch, Fortsetzen, Dateiverschiebung).
  *
  * <p><b>Endpunkte</b> (Standard-Pfade entsprechen {@code application.yml}):
  * <ul>
- *   <li>{@code POST /tasks} — Cloud-API 1 (Auftrag übermitteln)</li>
+ *   <li>{@code POST /tasks} — Cloud-API 1 (Auftrag zu einem BatchgenAuftrag übermitteln)</li>
  *   <li>{@code GET /tasks/status?taskIds=…&taskIds=…} — Cloud-API 2 (Bulk-Statusabfrage)</li>
- *   <li>{@code GET /tasks} — listet alle bekannten Aufträge mit Dateiname, TaskId und aktuellem Status</li>
+ *   <li>{@code GET /tasks} — listet alle bekannten Aufträge mit Dateiname, TaskId, BatchgenAuftrag und Status</li>
  *   <li>{@code POST /tasks/{taskId}/status?status=SUCCESS|ERROR|PENDING} — setzt den Status manuell</li>
+ *   <li>{@code POST /jobs} — Cloud-API 1 (BatchgenAuftrag anlegen)</li>
+ *   <li>{@code GET /jobs?userId=…&status=…} — Cloud-API 3 (BatchgenAufträge suchen; ohne Parameter alle)</li>
+ *   <li>{@code GET /jobs/{jobId}} — Cloud-API 3 (BatchgenAuftrag lesen)</li>
+ *   <li>{@code PUT /jobs/{jobId}/status} mit {@code {"status":"RUNNING|COMPLETED|CANCELLED"}} — Cloud-API 3
+ *       (Status setzen, auch von Hand)</li>
  * </ul>
  *
  * <p><b>Start:</b> {@code main}-Methode direkt ausführen, oder
  * {@code mvn -q compile exec:java -Dexec.mainClass=de.wwsstl.asynchrone.fakecloud.FakeCloudBackendApplication}.
  * Optionale Argumente in dieser Reihenfolge: Port (Vorgabe {@code 8081}), Submit-Pfad (Vorgabe {@code /tasks}),
- * Status-Pfad (Vorgabe {@code /tasks/status}) — müssen zu {@code pipeline.cloud.base-url},
- * {@code pipeline.cloud.submit-path} und {@code pipeline.cloud.status-path} der Pipeline-Applikation passen.
+ * Status-Pfad (Vorgabe {@code /tasks/status}), Job-Pfad (Vorgabe {@code /jobs}) — müssen zu
+ * {@code pipeline.cloud.base-url}, {@code pipeline.cloud.submit-path}, {@code pipeline.cloud.status-path} und
+ * {@code pipeline.cloud.job-path} der Pipeline-Applikation passen.
  */
 public final class FakeCloudBackendApplication {
 
     private static final class Job {
+        private final String batchJobId;
         private final String fileName;
         private volatile CloudStatus status = CloudStatus.PENDING;
 
-        Job(String fileName) {
+        Job(String batchJobId, String fileName) {
+            this.batchJobId = batchJobId;
             this.fileName = fileName;
+        }
+    }
+
+    private static final class BatchJob {
+        private final String userId;
+        private volatile BatchJobStatus status = BatchJobStatus.RUNNING;
+
+        BatchJob(String userId) {
+            this.userId = userId;
         }
     }
 
     private final JsonMapper mapper = JsonMapper.builder().build();
     private final Map<String, Job> jobs = new ConcurrentHashMap<>();
+    private final Map<String, BatchJob> batchJobs = new ConcurrentHashMap<>();
+    private final AtomicInteger batchJobSequence = new AtomicInteger();
     private final String submitPath;
     private final String statusPath;
+    private final String jobPath;
     private final Pattern adminStatusPath;
+    private final Pattern batchJobPath;
     private final HttpServer server;
 
-    public FakeCloudBackendApplication(int port, String submitPath, String statusPath) throws IOException {
+    public FakeCloudBackendApplication(int port, String submitPath, String statusPath, String jobPath)
+            throws IOException {
         this.submitPath = submitPath;
         this.statusPath = statusPath;
+        this.jobPath = jobPath;
         this.adminStatusPath = Pattern.compile("^" + Pattern.quote(submitPath) + "/([^/]+)/status$");
+        this.batchJobPath = Pattern.compile("^" + Pattern.quote(jobPath) + "/([^/]+?)(/status)?$");
         this.server = HttpServer.create(new InetSocketAddress(InetAddress.getLoopbackAddress(), port), 0);
         server.setExecutor(Executors.newVirtualThreadPerTaskExecutor());
         // Der spezifischste Pfad gewinnt beim Routing; die Admin-Route liegt unter dem Submit-Pfad und wird im
         // Submit-Handler anhand des Musters "<submit-path>/{taskId}/status" erkannt.
         server.createContext(statusPath, this::handleStatus);
         server.createContext(submitPath, this::handleSubmitOrAdmin);
+        server.createContext(jobPath, this::handleBatchJobs);
     }
 
     public void start() {
@@ -124,15 +156,21 @@ public final class FakeCloudBackendApplication {
     }
 
     private void handleSubmit(HttpExchange exchange) throws IOException {
-        JsonNode items = mapper.readTree(exchange.getRequestBody().readAllBytes()).get("items");
+        JsonNode request = mapper.readTree(exchange.getRequestBody().readAllBytes());
+        String batchJobId = request.path("jobId").asString("");
+        if (!batchJobs.containsKey(batchJobId)) {
+            reply(exchange, 400, Map.of("error", "unbekannter BatchgenAuftrag: " + batchJobId));
+            return;
+        }
+        JsonNode items = request.get("items");
         List<Map<String, String>> tasks = new ArrayList<>();
         if (items != null) {
             for (JsonNode item : items) {
                 String taskId = UUID.randomUUID().toString();
                 String fileName = item.get("fileName").asString();
-                jobs.put(taskId, new Job(fileName));
+                jobs.put(taskId, new Job(batchJobId, fileName));
                 tasks.add(Map.of("fileName", fileName, "taskId", taskId));
-                System.out.printf("[submit] %s -> %s (PENDING)%n", fileName, taskId);
+                System.out.printf("[submit] %s (%s) -> %s (PENDING)%n", fileName, batchJobId, taskId);
             }
         }
         reply(exchange, 200, Map.of("tasks", tasks));
@@ -140,8 +178,8 @@ public final class FakeCloudBackendApplication {
 
     private void handleList(HttpExchange exchange) throws IOException {
         List<Map<String, String>> all = jobs.entrySet().stream()
-                .map(entry -> Map.of("taskId", entry.getKey(), "fileName", entry.getValue().fileName, "status",
-                        entry.getValue().status.name()))
+                .map(entry -> Map.of("taskId", entry.getKey(), "jobId", entry.getValue().batchJobId, "fileName",
+                        entry.getValue().fileName, "status", entry.getValue().status.name()))
                 .sorted(Comparator.comparing(m -> m.get("fileName")))
                 .toList();
         reply(exchange, 200, Map.of("tasks", all));
@@ -166,6 +204,85 @@ public final class FakeCloudBackendApplication {
         } catch (RuntimeException e) {
             reply(exchange, 500, Map.of("error", e.toString()));
         }
+    }
+
+    // --- Cloud-API 1 und 3: BatchgenAufträge -------------------------------------------------------------------
+
+    private void handleBatchJobs(HttpExchange exchange) throws IOException {
+        try {
+            String path = exchange.getRequestURI().getPath();
+            String method = exchange.getRequestMethod();
+            if (jobPath.equals(path)) {
+                switch (method) {
+                    case "POST" -> createBatchJob(exchange);
+                    case "GET" -> listBatchJobs(exchange);
+                    default -> reply(exchange, 405, Map.of("error", "nicht unterstützte Methode"));
+                }
+                return;
+            }
+            Matcher matcher = batchJobPath.matcher(path);
+            if (!matcher.matches()) {
+                reply(exchange, 404, Map.of("error", "unbekannter Pfad: " + path));
+                return;
+            }
+            String batchJobId = matcher.group(1);
+            BatchJob batchJob = batchJobs.get(batchJobId);
+            boolean statusRoute = matcher.group(2) != null;
+            if (batchJob == null) {
+                reply(exchange, 404, Map.of("error", "unbekannter BatchgenAuftrag: " + batchJobId));
+            } else if (!statusRoute && "GET".equals(method)) {
+                reply(exchange, 200, batchJobView(batchJobId, batchJob));
+            } else if (statusRoute && ("PUT".equals(method) || "POST".equals(method))) {
+                setBatchJobStatus(exchange, batchJobId, batchJob);
+            } else {
+                reply(exchange, 405, Map.of("error", "nicht unterstützte Methode"));
+            }
+        } catch (RuntimeException e) {
+            reply(exchange, 500, Map.of("error", e.toString()));
+        }
+    }
+
+    private void createBatchJob(HttpExchange exchange) throws IOException {
+        String userId = mapper.readTree(exchange.getRequestBody().readAllBytes()).path("userId").asString("");
+        if (userId.isEmpty()) {
+            reply(exchange, 400, Map.of("error", "userId fehlt"));
+            return;
+        }
+        String batchJobId = "BJ-" + batchJobSequence.incrementAndGet();
+        batchJobs.put(batchJobId, new BatchJob(userId));
+        System.out.printf("[batchjob] %s fuer %s angelegt (RUNNING)%n", batchJobId, userId);
+        reply(exchange, 200, Map.of("jobId", batchJobId));
+    }
+
+    private void listBatchJobs(HttpExchange exchange) throws IOException {
+        String userId = queryParam(exchange, "userId");
+        String status = queryParam(exchange, "status");
+        List<Map<String, String>> found = batchJobs.entrySet().stream()
+                .filter(entry -> userId == null || userId.equals(entry.getValue().userId))
+                .filter(entry -> status == null || status.equalsIgnoreCase(entry.getValue().status.name()))
+                .map(entry -> batchJobView(entry.getKey(), entry.getValue()))
+                .sorted(Comparator.comparing(m -> m.get("jobId")))
+                .toList();
+        reply(exchange, 200, Map.of("jobs", found));
+    }
+
+    private void setBatchJobStatus(HttpExchange exchange, String batchJobId, BatchJob batchJob) throws IOException {
+        String requested = mapper.readTree(exchange.getRequestBody().readAllBytes()).path("status").asString("");
+        BatchJobStatus status;
+        try {
+            status = BatchJobStatus.valueOf(requested.toUpperCase());
+        } catch (IllegalArgumentException e) {
+            reply(exchange, 400, Map.of("error", "status muss RUNNING, COMPLETED oder CANCELLED sein, war: "
+                    + requested));
+            return;
+        }
+        batchJob.status = status;
+        System.out.printf("[batchjob] %s (%s) -> %s%n", batchJobId, batchJob.userId, status);
+        reply(exchange, 200, batchJobView(batchJobId, batchJob));
+    }
+
+    private static Map<String, String> batchJobView(String batchJobId, BatchJob batchJob) {
+        return Map.of("jobId", batchJobId, "userId", batchJob.userId, "status", batchJob.status.name());
     }
 
     // --- Admin: manuelle Statusänderung von außen --------------------------------------------------------------
@@ -235,8 +352,9 @@ public final class FakeCloudBackendApplication {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 8081;
         String submitPath = args.length > 1 ? args[1] : "/tasks";
         String statusPath = args.length > 2 ? args[2] : "/tasks/status";
+        String jobPath = args.length > 3 ? args[3] : "/jobs";
 
-        FakeCloudBackendApplication app = new FakeCloudBackendApplication(port, submitPath, statusPath);
+        FakeCloudBackendApplication app = new FakeCloudBackendApplication(port, submitPath, statusPath, jobPath);
         app.start();
         Runtime.getRuntime().addShutdownHook(new Thread(app::stop));
 
@@ -246,10 +364,15 @@ public final class FakeCloudBackendApplication {
                   GET  %s?taskIds=...       Cloud-API 2 (Bulk-Statusabfrage)
                   GET  %s              alle bekannten Auftraege auflisten
                   POST %s/{taskId}/status?status=SUCCESS|ERROR|PENDING   Status manuell setzen
+                  POST %s               Cloud-API 1 (BatchgenAuftrag anlegen)
+                  GET  %s?userId=...&status=...   Cloud-API 3 (BatchgenAuftraege suchen)
+                  GET  %s/{jobId}       Cloud-API 3 (BatchgenAuftrag lesen)
+                  PUT  %s/{jobId}/status   Cloud-API 3, Body {"status":"RUNNING|COMPLETED|CANCELLED"}
 
                 In der Pipeline-Applikation muss pipeline.cloud.base-url auf http://localhost:%d zeigen.
                 Beenden mit Strg+C.
-                """, app.port(), submitPath, statusPath, submitPath, submitPath, app.port());
+                """, app.port(), submitPath, statusPath, submitPath, submitPath, jobPath, jobPath, jobPath, jobPath,
+                app.port());
 
         new CountDownLatch(1).await();
     }

@@ -25,15 +25,18 @@ pipeline:
   error-threshold: 10
   # Maximale Laufzeit einer Aufgabe
   task-timeout: 30m
-  # Beendete Tasks werden automatisch abgemeldet (Threads, Status-Pool, Sandbox); ihr Endzustand bleibt so lange
-  # in der TaskHistory abfragbar, danach liefert die Status-Abfrage 404
-  task-retention: 24h
+  # Beendete Tasks werden automatisch abgemeldet (Threads, Status-Pool, Sandbox); der Endzustand jedes Laufs bleibt
+  # so lange im Laufregister abfragbar und zählt so lange bei der Vergabe der Laufnummern
+  task-retention: 8h
   cloud:
     base-url: http://localhost:8081
     submit-path: /tasks
     status-path: /tasks/status
+    # BatchgenAufträge: Cloud-API 1 legt sie an, Cloud-API 3 liest und setzt ihren Status
+    job-path: /jobs
     submit-timeout: 30s
     status-timeout: 30s
     # Cloud-API 1 legt Aufträge an (nicht idempotent) -> standardmäßig keine Wiederholung
     submit-retries: 0
+    # gilt für Cloud-API 2 und 3
     status-retries: 2

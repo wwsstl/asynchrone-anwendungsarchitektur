@@ -29,9 +29,9 @@ import de.wwsstl.asynchrone.pool.TaskId;
 
 /**
  * Producer-Thread einer Sandbox (anforderungen_datenverarbeitung.md, Punkte 1 und 3): liest je Durchlauf bis zu
- * {@code batchSize} Dateien aus der {@code inbox}, übermittelt sie in einem Aufruf über
- * {@link CloudClient#submit(List)} an Cloud-API 1 und trägt die zurückgelieferten {@link SubmittedTask}-Objekte in
- * den <b>eigenen</b> Status-Pool ein.
+ * {@code batchSize} Dateien aus der {@code inbox}, übermittelt sie zusammen mit der BatchgenAuftrag-Nummer in einem
+ * Aufruf über {@link CloudClient#submit} an Cloud-API 1 und trägt die zurückgelieferten {@link SubmittedTask}-Objekte
+ * in den <b>eigenen</b> Status-Pool ein.
  *
  * <p>Danach pausiert der Producer das Einlesen der nächsten Dateicharge, bis der {@code StatusConsumer} den
  * Status-Pool auf den konfigurierten Schwellenwert ({@code pipeline.pool-resume-threshold}) abgebaut hat. Das
@@ -39,13 +39,13 @@ import de.wwsstl.asynchrone.pool.TaskId;
  *
  * <p><b>Keine doppelte Übermittlung:</b> Cloud-API 1 ist nicht idempotent. Jede Datei wird daher vor dem Aufruf
  * aus der {@code inbox} in die {@code pendingbox} verschoben und nach der Antwort mit ihrer TaskId markiert (siehe
- * {@link UserFolders}). Zu Beginn nimmt der Producer die markierten Dateien früherer, abgebrochener Tasks wieder
+ * {@link UserFolders}). Zu Beginn nimmt der Producer die markierten Dateien früherer, abgebrochener Läufe wieder
  * in den Pool auf, statt sie erneut zu übermitteln. Dateien der {@code pendingbox} ohne Marker (Absturz zwischen
  * Verschieben und Antwort) haben einen unbekannten Übermittlungsstatus und gehen — höchstens einmal übermittelt —
  * in die {@code errorbox}.
  *
- * <p>Der Producer beendet sich, wenn die {@code inbox} leer ist, oder sobald das Abbruchsignal gesetzt ist. Erst
- * danach meldet er {@link TaskContext#producerFinished()}.
+ * <p>Der Producer beendet sich, wenn die {@code inbox} leer ist, oder sobald der Task
+ * {@linkplain TaskContext#isStopping() anhält}. Erst danach meldet er {@link TaskContext#producerFinished()}.
  */
 public final class InboxProducer implements Runnable {
 
@@ -80,16 +80,16 @@ public final class InboxProducer implements Runnable {
             resumeSubmitted();
             produce();
         } catch (Throwable t) {
-            log.error("[{}] Producer von Task {} ist fehlgeschlagen", context.userId(), context.taskId(), t);
+            log.error("[{}] Producer von Task {} ist fehlgeschlagen", context.userId(), context.jobId(), t);
             context.cancel(CancelReason.INTERNAL_ERROR);
         } finally {
             context.producerFinished();
-            log.debug("[{}] Producer von Task {} beendet", context.userId(), context.taskId());
+            log.debug("[{}] Producer von Task {} beendet", context.userId(), context.jobId());
         }
     }
 
     /**
-     * Nimmt die von früheren Tasks übermittelten, noch unentschiedenen Dateien der {@code pendingbox} wieder in den
+     * Nimmt die von früheren Läufen übermittelten, noch unentschiedenen Dateien der {@code pendingbox} wieder in den
      * Pool auf — ohne erneuten Aufruf von Cloud-API 1.
      */
     private void resumeSubmitted() throws IOException {
@@ -99,7 +99,7 @@ public final class InboxProducer implements Runnable {
         }
         int resumed = 0;
         for (Path file : files) {
-            if (context.isCancelled()) {
+            if (context.isStopping()) {
                 return;
             }
             Optional<TaskId> id = submittedTaskId(file);
@@ -115,7 +115,7 @@ public final class InboxProducer implements Runnable {
         }
         if (resumed > 0) {
             log.info("[{}] Task {} nimmt {} bereits übermittelte Dateien aus der pendingbox wieder auf",
-                    context.userId(), context.taskId(), resumed);
+                    context.userId(), context.jobId(), resumed);
             awaitResumeThreshold();
         }
     }
@@ -131,7 +131,7 @@ public final class InboxProducer implements Runnable {
 
     private void produce() throws IOException {
         List<Path> batch;
-        while (!context.isCancelled() && !(batch = nextBatch()).isEmpty()) {
+        while (!context.isStopping() && !(batch = nextBatch()).isEmpty()) {
             submit(batch);
             awaitResumeThreshold();
         }
@@ -142,7 +142,7 @@ public final class InboxProducer implements Runnable {
         List<Path> batch = new ArrayList<>(properties.batchSize());
         try (DirectoryStream<Path> inbox = folders.openInbox()) {
             for (Path file : inbox) {
-                if (context.isCancelled()) {
+                if (context.isStopping()) {
                     return List.of();
                 }
                 if (!seen.add(file)) {
@@ -160,20 +160,20 @@ public final class InboxProducer implements Runnable {
     /**
      * Pausiert das Einlesen der nächsten Dateicharge, bis die Anzahl der Dateien im Status-Pool auf
      * {@code pipeline.pool-resume-threshold} gesunken ist (anforderungen_datenverarbeitung.md, Punkte 1 und 3),
-     * oder bis das Abbruchsignal gesetzt wird.
+     * oder bis der Task anhält.
      */
     private void awaitResumeThreshold() {
         while (pool.size() > properties.poolResumeThreshold()) {
-            if (context.awaitCancel(properties.sweepInterval())) {
+            if (context.awaitStop(properties.sweepInterval())) {
                 return;
             }
         }
     }
 
     /**
-     * Übermittelt einen Batch in einem Aufruf an Cloud-API 1 und trägt die zurückgelieferten TaskIds in den Pool
-     * ein (anforderungen_datenverarbeitung.md, Punkt 1). Der Producer-Thread wartet auf die Antwort; da er ein
-     * virtueller Thread ist, blockiert das keinen Plattform-Thread.
+     * Übermittelt einen Batch zusammen mit der BatchgenAuftrag-Nummer in einem Aufruf an Cloud-API 1 und trägt die
+     * zurückgelieferten TaskIds in den Pool ein (anforderungen_datenverarbeitung.md, Punkt 1). Der Producer-Thread
+     * wartet auf die Antwort; da er ein virtueller Thread ist, blockiert das keinen Plattform-Thread.
      */
     private void submit(List<Path> inboxFiles) {
         Map<String, Path> byName = new HashMap<>();
@@ -203,7 +203,7 @@ public final class InboxProducer implements Runnable {
 
         List<SubmittedTask> tasks;
         try {
-            tasks = cloud.submit(items).join();
+            tasks = cloud.submit(context.jobId(), items).join();
         } catch (RuntimeException e) {
             // Auch bei einem Timeout kann Cloud-API 1 den Batch angenommen haben: nicht wiederholen, sondern errorbox.
             log.warn("[{}] Übermittlung eines Batches mit {} Dateien an Cloud-API 1 fehlgeschlagen: {}",
@@ -223,8 +223,8 @@ public final class InboxProducer implements Runnable {
             }
             recordTaskId(file.getValue(), id);
             context.recordSubmitted();
-            if (context.isCancelled()) {
-                context.recordAbandoned(1); // bleibt markiert in der pendingbox, der nächste Task fragt weiter ab
+            if (context.isStopping()) {
+                context.recordAbandoned(1); // bleibt markiert in der pendingbox, das Fortsetzen fragt weiter ab
             } else {
                 pool.add(id, file.getValue(), clock.instant());
             }
@@ -235,7 +235,7 @@ public final class InboxProducer implements Runnable {
         try {
             folders.recordTaskId(file, id);
         } catch (IOException e) {
-            // Die Datei ist übermittelt; ohne Marker verfolgt sie nur dieser Task, ein späterer legt sie in die errorbox.
+            // Die Datei ist übermittelt; ohne Marker verfolgt sie nur dieser Lauf, ein späterer legt sie in die errorbox.
             log.error("[{}] TaskId {} für {} konnte nicht gesichert werden", context.userId(), id,
                     file.getFileName(), e);
         }

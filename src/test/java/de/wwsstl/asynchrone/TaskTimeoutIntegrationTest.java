@@ -18,7 +18,10 @@ import de.wwsstl.asynchrone.context.CancelReason;
 import de.wwsstl.asynchrone.context.TaskSnapshot;
 import de.wwsstl.asynchrone.context.TaskState;
 
-/** Prüft die im Consumer-Zyklus integrierte Timeout-Erkennung (loesung_final.md 4.4 / 4.8). */
+/**
+ * Prüft die im Consumer-Zyklus integrierte Timeout-Erkennung (loesung_final.md 4.4 / 4.8) und den Abbruch über
+ * Cloud-API 3 (funktionsweise_sequenz.md, Abschnitt 6).
+ */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 class TaskTimeoutIntegrationTest {
 
@@ -64,5 +67,7 @@ class TaskTimeoutIntegrationTest {
         assertThat(done.failed()).isEqualTo(3);
         assertThat(api.names("slow", "errorbox")).hasSize(3);
         assertThat(api.names("slow", "inbox")).isEmpty();
+        // Der TaskManager hat den BatchgenAuftrag über Cloud-API 3 abgebrochen.
+        assertThat(cloud.jobStatus(slow.taskId())).isEqualTo("CANCELLED");
     }
 }

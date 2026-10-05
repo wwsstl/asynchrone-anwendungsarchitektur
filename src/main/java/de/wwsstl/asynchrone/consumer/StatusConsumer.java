@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
@@ -15,10 +16,13 @@ import java.util.concurrent.TimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import de.wwsstl.asynchrone.cloud.BatchJob;
+import de.wwsstl.asynchrone.cloud.BatchJobStatus;
 import de.wwsstl.asynchrone.cloud.CloudClient;
 import de.wwsstl.asynchrone.cloud.CloudStatus;
 import de.wwsstl.asynchrone.cloud.TaskStatusResult;
 import de.wwsstl.asynchrone.config.PipelineProperties;
+import de.wwsstl.asynchrone.context.AbortHandler;
 import de.wwsstl.asynchrone.context.CancelReason;
 import de.wwsstl.asynchrone.context.TaskContext;
 import de.wwsstl.asynchrone.files.UserFolders;
@@ -29,17 +33,23 @@ import de.wwsstl.asynchrone.pool.TaskId;
 /**
  * Consumer-Thread einer Sandbox — der „Verbraucher-Überwachungsthread" des Diagramms (loesung_final.md 4.8).
  *
- * <p>In einer Schleife: Timeout prüfen, fällige Einträge des <b>eigenen</b> Status-Pools sammeln, sie in einem
- * Bulk-Aufruf an Cloud-API 2 übergeben und je Ergebnis routen:
+ * <p>Jeder Durchlauf prüft zuerst über Cloud-API 3 den Status des BatchgenAuftrags. Steht er auf
+ * {@code CANCELLED}, endet der Task (funktionsweise_sequenz.md, Abschnitt 5). Danach sammelt der Consumer die
+ * fälligen Einträge des <b>eigenen</b> Status-Pools, übergibt sie in einem Bulk-Aufruf an Cloud-API 2 und routet
+ * je Ergebnis:
  * <ul>
  *   <li>{@code SUCCESS} → Datei nach {@code donebox}, Eintrag entfernen</li>
  *   <li>{@code ERROR} → Datei nach {@code errorbox}, Fehlerzähler erhöhen, Eintrag entfernen</li>
  *   <li>{@code PENDING} → Eintrag bleibt im Pool, nächster Prüfzeitpunkt wird gesetzt</li>
  * </ul>
  * Ist der Producer fertig, alle Submit-Antworten sind eingegangen und der Pool ist leer, gilt der Task als
- * abgeschlossen. Bei einem Abbruch endet die Schleife; noch offene Dateien bleiben samt TaskId in der
- * {@code pendingbox} und werden vom nächsten Task des Benutzers weiter abgefragt, nicht erneut übermittelt. Nur bei
- * Zeitüberschreitung werden sie wie Fehler behandelt (nach {@code errorbox}).
+ * abgeschlossen.
+ *
+ * <p>Zeitüberschreitung und Fehlerschwelle meldet der Consumer über den {@link AbortHandler} an den
+ * {@code TaskManager}, der den BatchgenAuftrag über Cloud-API 3 als {@code CANCELLED} markiert; im nächsten
+ * Durchlauf endet der Task dann wie bei einem Abbruch von außen (Abschnitt 6). Bei Zeitüberschreitung wandern die
+ * noch offenen Dateien in die {@code errorbox}. Sonst bleiben sie bei einem Abbruch samt TaskId in der
+ * {@code pendingbox} und werden beim Fortsetzen weiter abgefragt, nicht erneut übermittelt.
  */
 public final class StatusConsumer implements Runnable {
 
@@ -52,15 +62,17 @@ public final class StatusConsumer implements Runnable {
     private final StatusPool pool;
     private final UserFolders folders;
     private final CloudClient cloud;
+    private final AbortHandler abortHandler;
     private final PipelineProperties properties;
     private final Clock clock;
 
     public StatusConsumer(TaskContext context, StatusPool pool, UserFolders folders, CloudClient cloud,
-            PipelineProperties properties, Clock clock) {
+            AbortHandler abortHandler, PipelineProperties properties, Clock clock) {
         this.context = context;
         this.pool = pool;
         this.folders = folders;
         this.cloud = cloud;
+        this.abortHandler = abortHandler;
         this.properties = properties;
         this.clock = clock;
     }
@@ -70,29 +82,63 @@ public final class StatusConsumer implements Runnable {
         try {
             loop();
         } catch (Throwable t) {
-            log.error("[{}] Consumer von Task {} ist fehlgeschlagen", context.userId(), context.taskId(), t);
+            log.error("[{}] Consumer von Task {} ist fehlgeschlagen", context.userId(), context.jobId(), t);
             context.cancel(CancelReason.INTERNAL_ERROR);
         } finally {
             abandonRemaining();
-            log.info("[{}] Task {} beendet: {}", context.userId(), context.taskId(), context.snapshot(0));
+            log.info("[{}] Task {} beendet: {}", context.userId(), context.jobId(), context.snapshot(0));
         }
     }
 
     private void loop() {
         while (!context.isCancelled()) {
-            if (context.checkTimeout()) {
+            // Abbruch von außen oder bereits gemeldeter Abbruch: Der BatchgenAuftrag steht auf CANCELLED.
+            if (context.isStopping() || batchJobCancelled()) {
+                context.cancel(context.abortRequest().orElse(CancelReason.USER_REQUEST));
+                return;
+            }
+            if (context.isTimedOut()) {
+                log.warn("[{}] Task {} hat die maximale Laufzeit von {} überschritten", context.userId(),
+                        context.jobId(), properties.taskTimeout());
+                requestAbort(CancelReason.TIMEOUT);
                 failPendingAfterTimeout();
-                return;
+            } else {
+                sweep();
+                if (context.errorThresholdReached()) {
+                    requestAbort(CancelReason.ERROR_THRESHOLD);
+                } else if (!context.isStopping() && isFinished()) {
+                    context.complete();
+                    return;
+                }
             }
-            sweep();
-            if (context.isCancelled()) {
-                return;
-            }
-            if (isFinished()) {
-                context.complete();
-                return;
-            }
-            context.awaitCancel(properties.sweepInterval());
+            context.awaitStop(properties.sweepInterval());
+        }
+    }
+
+    /** Cloud-API 3: {@code true}, wenn der BatchgenAuftrag als {@code CANCELLED} markiert ist. */
+    private boolean batchJobCancelled() {
+        try {
+            Duration wait = properties.cloud().statusTimeout().plus(RESULT_GRACE);
+            Optional<BatchJob> job = cloud.batchJob(context.jobId()).get(wait.toMillis(), TimeUnit.MILLISECONDS);
+            return job.map(BatchJob::status).orElse(null) == BatchJobStatus.CANCELLED;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            context.cancel(CancelReason.SHUTDOWN);
+            return false;
+        } catch (ExecutionException | TimeoutException | RuntimeException e) {
+            log.warn("[{}] Status des BatchgenAuftrags {} nicht abrufbar, nächster Versuch folgt: {}",
+                    context.userId(), context.jobId(), e.toString());
+            return false;
+        }
+    }
+
+    /**
+     * Meldet den Abbruch an den {@code TaskManager}. Ist Cloud-API 3 nicht erreichbar, endet der Task sofort, damit
+     * er nicht auf einen Status wartet, der nie gesetzt wird.
+     */
+    private void requestAbort(CancelReason reason) {
+        if (context.requestAbort(reason) && !abortHandler.abort(context, reason)) {
+            context.cancel(reason);
         }
     }
 
@@ -109,7 +155,7 @@ public final class StatusConsumer implements Runnable {
         Instant now = clock.instant();
         List<Map.Entry<TaskId, PollEntry>> due = new ArrayList<>(pool.due(now).entrySet());
         for (int from = 0; from < due.size(); from += properties.statusBulkSize()) {
-            if (context.isCancelled()) {
+            if (context.isStopping()) {
                 return;
             }
             int to = Math.min(from + properties.statusBulkSize(), due.size());
@@ -173,8 +219,6 @@ public final class StatusConsumer implements Runnable {
 
     /** Zeitüberschreitung: alle noch offenen Dateien werden wie {@code ERROR} behandelt (loesung_final.md 4.8). */
     private void failPendingAfterTimeout() {
-        log.warn("[{}] Task {} hat die maximale Laufzeit von {} überschritten", context.userId(), context.taskId(),
-                properties.taskTimeout());
         pool.drain().values().forEach(entry -> {
             move(entry, false);
             context.recordError();
@@ -183,14 +227,14 @@ public final class StatusConsumer implements Runnable {
 
     /**
      * Beim Beenden verbliebene Einträge freigeben; die Dateien bleiben mit ihrer TaskId in der {@code pendingbox},
-     * damit der nächste Task die Statusabfrage fortsetzt.
+     * damit das Fortsetzen die Statusabfrage wieder aufnimmt.
      */
     private void abandonRemaining() {
         int abandoned = pool.drain().size();
         if (abandoned > 0) {
             context.recordAbandoned(abandoned);
             log.info("[{}] Task {}: {} übermittelte Dateien blieben unentschieden in der pendingbox",
-                    context.userId(), context.taskId(), abandoned);
+                    context.userId(), context.jobId(), abandoned);
         }
     }
 }

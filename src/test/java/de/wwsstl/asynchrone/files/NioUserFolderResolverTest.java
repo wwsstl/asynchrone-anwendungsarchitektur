@@ -28,9 +28,9 @@ class NioUserFolderResolverTest {
     @BeforeEach
     void setUp() {
         PipelineProperties properties = new PipelineProperties(base, 20, 4, Duration.ofSeconds(1),
-                Duration.ofSeconds(5), 200, 10, Duration.ofMinutes(30), Duration.ofHours(24),
+                Duration.ofSeconds(5), 200, 10, Duration.ofMinutes(30), Duration.ofHours(8),
                 new PipelineProperties.Cloud(java.net.URI.create("http://localhost:8081"), "/tasks",
-                        "/tasks/status", Duration.ofSeconds(30), Duration.ofSeconds(30), 0, 2));
+                        "/tasks/status", "/jobs", Duration.ofSeconds(30), Duration.ofSeconds(30), 0, 2));
         resolver = new NioUserFolderResolver(properties);
     }
 
@@ -61,6 +61,19 @@ class NioUserFolderResolverTest {
         assertThat(folders.donebox().resolve("a.txt")).hasContent("a");
         assertThat(folders.submittedTaskId(pending)).as("Marker mit der Datei entfernt").isEmpty();
         assertThat(folders.pendingbox().resolve(".taskids")).isEmptyDirectory();
+    }
+
+    @Test
+    void pendingboxGiltNurMitDateienAlsNichtLeer() throws IOException {
+        UserFolders folders = resolver.resolve("alice");
+        assertThat(folders.hasPendingFiles()).isFalse();
+
+        Path pending = folders.moveToPending(Files.writeString(folders.inbox().resolve("a.txt"), "a"));
+        folders.recordTaskId(pending, new TaskId("t-1"));
+        assertThat(folders.hasPendingFiles()).isTrue();
+
+        folders.moveToDone(pending);
+        assertThat(folders.hasPendingFiles()).as("leerer Marker-Ordner zählt nicht").isFalse();
     }
 
     @Test

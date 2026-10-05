@@ -8,17 +8,21 @@ import java.time.Instant;
 import org.junit.jupiter.api.Test;
 
 import de.wwsstl.asynchrone.MutableClock;
+import de.wwsstl.asynchrone.cloud.BatchJobId;
 
 class TaskContextTest {
 
     private final MutableClock clock = new MutableClock();
-    private final TaskContext context = new TaskContext("alice", Duration.ofMinutes(1), 3, clock);
+    private final TaskContext context = new TaskContext("alice", new BatchJobId("BJ-1"), 2, Duration.ofMinutes(1), 3,
+            clock);
 
     @Test
-    void neuerTaskLaeuftUndHatEineEigeneId() {
+    void neuerTaskLaeuftUnterSeinerAufgabennummerUndLaufnummer() {
         assertThat(context.state()).isEqualTo(TaskState.RUNNING);
         assertThat(context.isCancelled()).isFalse();
-        assertThat(new TaskContext("alice", Duration.ofMinutes(1), 3, clock).taskId()).isNotEqualTo(context.taskId());
+        assertThat(context.isStopping()).isFalse();
+        assertThat(context.jobId()).isEqualTo(new BatchJobId("BJ-1"));
+        assertThat(context.run()).isEqualTo(2);
     }
 
     @Test
@@ -36,6 +40,7 @@ class TaskContextTest {
         assertThat(context.complete()).isTrue();
 
         assertThat(context.cancel(CancelReason.USER_REQUEST)).isFalse();
+        assertThat(context.requestAbort(CancelReason.TIMEOUT)).isFalse();
         assertThat(context.state()).isEqualTo(TaskState.COMPLETED);
         assertThat(context.isCancelled()).isFalse();
     }
@@ -64,36 +69,49 @@ class TaskContextTest {
     }
 
     @Test
-    void fehlerschwellenwertBrichtDenTaskAb() {
+    void fehlerschwellenwertWirdNurFestgestelltUndBrichtNichtSelbstAb() {
         context.recordError();
         context.recordError();
-        assertThat(context.isCancelled()).isFalse();
+        assertThat(context.errorThresholdReached()).isFalse();
 
         context.recordError();
 
-        assertThat(context.isCancelled()).isTrue();
-        assertThat(context.cancelReason()).isEqualTo(CancelReason.ERROR_THRESHOLD);
+        assertThat(context.errorThresholdReached()).isTrue();
+        assertThat(context.isCancelled()).as("der Abbruch folgt über Cloud-API 3").isFalse();
         assertThat(context.errorCount()).isEqualTo(3);
     }
 
     @Test
-    void timeoutWirdErstNachAblaufDerLaufzeitGesetzt() {
+    void timeoutGiltErstNachAblaufDerLaufzeit() {
         clock.advance(Duration.ofSeconds(59));
-        assertThat(context.checkTimeout()).isFalse();
+        assertThat(context.isTimedOut()).isFalse();
 
         clock.advance(Duration.ofSeconds(1));
-        assertThat(context.checkTimeout()).isTrue();
-        assertThat(context.cancelReason()).isEqualTo(CancelReason.TIMEOUT);
-        assertThat(context.checkTimeout()).as("nur der auslösende Aufruf meldet true").isFalse();
+        assertThat(context.isTimedOut()).isTrue();
+        assertThat(context.isCancelled()).isFalse();
     }
 
     @Test
-    void awaitCancelKehrtSofortBeiAbbruchZurueck() {
-        assertThat(context.awaitCancel(Duration.ofMillis(10))).isFalse();
+    void abbruchmeldungHaeltDenTaskAnOhneIhnZuBeenden() {
+        assertThat(context.requestAbort(CancelReason.ERROR_THRESHOLD)).isTrue();
+        assertThat(context.requestAbort(CancelReason.TIMEOUT)).as("die erste Meldung gewinnt").isFalse();
 
-        context.cancel(CancelReason.USER_REQUEST);
+        assertThat(context.isStopping()).isTrue();
+        assertThat(context.abortRequest()).contains(CancelReason.ERROR_THRESHOLD);
+        assertThat(context.state()).isEqualTo(TaskState.RUNNING);
+        assertThat(context.finishedAt()).isNull();
+    }
 
-        assertThat(context.awaitCancel(Duration.ofMinutes(5))).isTrue();
+    @Test
+    void awaitStopKehrtBeiAbbruchmeldungUndAbbruchSofortZurueck() {
+        assertThat(context.awaitStop(Duration.ofMillis(10))).isFalse();
+
+        context.requestAbort(CancelReason.TIMEOUT);
+        assertThat(context.awaitStop(Duration.ofMinutes(5))).isTrue();
+
+        TaskContext other = new TaskContext("bob", new BatchJobId("BJ-2"), 1, Duration.ofMinutes(1), 3, clock);
+        other.cancel(CancelReason.USER_REQUEST);
+        assertThat(other.awaitStop(Duration.ofMinutes(5))).isTrue();
     }
 
     @Test
@@ -107,11 +125,13 @@ class TaskContextTest {
         TaskSnapshot snapshot = context.snapshot(7);
 
         assertThat(snapshot.userId()).isEqualTo("alice");
-        assertThat(snapshot.taskId()).isEqualTo(context.taskId());
+        assertThat(snapshot.taskId()).isEqualTo("BJ-1");
+        assertThat(snapshot.run()).isEqualTo(2);
         assertThat(snapshot.submitted()).isEqualTo(2);
         assertThat(snapshot.succeeded()).isEqualTo(1);
         assertThat(snapshot.failed()).isEqualTo(1);
         assertThat(snapshot.pending()).isEqualTo(7);
         assertThat(snapshot.abandoned()).isEqualTo(4);
+        assertThat(snapshot.withState(TaskState.CANCELLING).state()).isEqualTo(TaskState.CANCELLING);
     }
 }

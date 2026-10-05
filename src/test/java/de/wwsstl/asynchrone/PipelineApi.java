@@ -6,7 +6,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
-import java.util.UUID;
+import java.util.Map;
 import java.util.stream.Stream;
 
 import org.awaitility.Awaitility;
@@ -15,9 +15,19 @@ import org.springframework.web.client.RestClient;
 
 import de.wwsstl.asynchrone.context.TaskSnapshot;
 import de.wwsstl.asynchrone.context.TaskState;
+import de.wwsstl.asynchrone.taskmanager.CancelResult;
 
 /** Hilfsklasse der Integrationstests: REST-Aufrufe gegen den laufenden Server und Zugriff auf die Benutzerordner. */
 final class PipelineApi {
+
+    /** Statuscode und Body einer Antwort; bei Fehlern ein ProblemDetail. */
+    record Response(int status, Map<String, Object> body) {
+
+        /** Der Ursachencode eines abgewiesenen Aufrufs. */
+        Object code() {
+            return body == null ? null : body.get("code");
+        }
+    }
 
     private final RestClient client;
     private final Path base;
@@ -38,11 +48,15 @@ final class PipelineApi {
         return client.post().uri("/api/users/{u}/tasks", user).retrieve().body(TaskSnapshot.class);
     }
 
-    int startStatus(String user) {
-        return client.post().uri("/api/users/{u}/tasks", user).exchange((req, res) -> res.getStatusCode().value());
+    Response startResponse(String user) {
+        return client.post().uri("/api/users/{u}/tasks", user).exchange((req, res) -> response(res));
     }
 
-    TaskSnapshot status(String user, UUID taskId) {
+    int startStatus(String user) {
+        return startResponse(user).status();
+    }
+
+    TaskSnapshot status(String user, String taskId) {
         return client.get().uri("/api/users/{u}/tasks/{t}", user, taskId).retrieve().body(TaskSnapshot.class);
     }
 
@@ -51,20 +65,35 @@ final class PipelineApi {
                 .exchange((req, res) -> res.getStatusCode().value());
     }
 
-    TaskSnapshot cancel(String user, UUID taskId) {
+    CancelResult cancel(String user, String taskId) {
         return client.post().uri("/api/users/{u}/tasks/{t}/cancel", user, taskId).retrieve()
-                .body(TaskSnapshot.class);
+                .body(CancelResult.class);
     }
 
-    int cancelStatus(String user, UUID taskId) {
-        return client.post().uri("/api/users/{u}/tasks/{t}/cancel", user, taskId)
-                .exchange((req, res) -> res.getStatusCode().value());
+    Response cancelResponse(String user, String taskId) {
+        return client.post().uri("/api/users/{u}/tasks/{t}/cancel", user, taskId).exchange((req, res) -> response(res));
     }
 
-    TaskSnapshot awaitFinished(String user, UUID taskId) {
+    int cancelStatus(String user, String taskId) {
+        return cancelResponse(user, taskId).status();
+    }
+
+    /** Wartet auf einen Endzustand ({@code COMPLETED} oder {@code CANCELLED}) des letzten Laufs. */
+    TaskSnapshot awaitFinished(String user, String taskId) {
         Awaitility.await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(50))
-                .until(() -> status(user, taskId).state() != TaskState.RUNNING);
+                .until(() -> isFinal(status(user, taskId).state()));
         return status(user, taskId);
+    }
+
+    private static boolean isFinal(TaskState state) {
+        return state == TaskState.COMPLETED || state == TaskState.CANCELLED;
+    }
+
+    @SuppressWarnings("unchecked")
+    private static Response response(RestClient.RequestHeadersSpec.ConvertibleClientHttpResponse res)
+            throws IOException {
+        int status = res.getStatusCode().value();
+        return new Response(status, res.bodyTo(Map.class));
     }
 
     // --- Ordner ----------------------------------------------------------------------------------------------
@@ -93,6 +122,21 @@ final class PipelineApi {
     List<String> names(String user, String box) {
         try (Stream<Path> files = Files.list(box(user, box))) {
             return files.filter(Files::isRegularFile).map(p -> p.getFileName().toString()).sorted().toList();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** Leert die {@code pendingbox} samt TaskId-Markern, wie es die Benutzer:in von Hand tut (Weg b). */
+    void clearPendingbox(String user) {
+        try (Stream<Path> files = Files.walk(box(user, "pendingbox"))) {
+            files.filter(Files::isRegularFile).forEach(file -> {
+                try {
+                    Files.delete(file);
+                } catch (IOException e) {
+                    throw new UncheckedIOException(e);
+                }
+            });
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }

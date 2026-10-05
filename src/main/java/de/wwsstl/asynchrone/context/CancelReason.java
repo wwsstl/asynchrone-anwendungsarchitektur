@@ -2,9 +2,9 @@ package de.wwsstl.asynchrone.context;
 
 /** Grund, aus dem ein Task abgebrochen wurde. */
 public enum CancelReason {
-    /** Abbruch von außen über die REST-API. */
+    /** Der BatchgenAuftrag wurde von außen über Cloud-API 3 abgebrochen (REST-API oder manuell). */
     USER_REQUEST,
-    /** Fehlerschwellenwert überschritten. */
+    /** Fehlerschwellenwert erreicht. */
     ERROR_THRESHOLD,
     /** Maximale Laufzeit überschritten. */
     TIMEOUT,
