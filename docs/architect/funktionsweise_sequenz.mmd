@@ -1,5 +1,7 @@
 sequenceDiagram
     %% Erste Ebene zu funktionsweise_sequenz.md – die Sandbox je Task ist eine Blackbox
+    %% Aufgabennummer = BatchgenAuftrag-Nr.; jeder Start unter derselben Nummer ist ein neuer Lauf
+    %% (gezählt werden nur Läufe innerhalb von task-retention, 8 h)
 
     actor B as Benutzer
     participant API as REST-API
@@ -13,22 +15,39 @@ sequenceDiagram
     Note over B,Cloud: 1. Start
     B->>API: Aufgabe starten
     API->>TM: start
-    TM->>Reg: Sandbox eintragen
+    TM->>Cloud: API 3: RUNNING-BatchgenAuftrag des Benutzers suchen
+    Cloud-->>TM: BatchgenAuftrag-Nr. oder keiner
+    TM->>Reg: Nr. bereits eingetragen?
+    TM->>O: Dateien in der pendingbox?
+    break Nr. bereits in der TaskRegistry
+        TM-->>API: abgewiesen: TASK_ALREADY_RUNNING
+        API-->>B: 409 Conflict, TASK_ALREADY_RUNNING
+    end
+    break kein RUNNING-BatchgenAuftrag, aber Dateien in der pendingbox
+        TM-->>API: abgewiesen: PENDINGBOX_NOT_EMPTY
+        API-->>B: 409 Conflict, PENDINGBOX_NOT_EMPTY<br/>Hinweis: erst a) fortsetzen oder b) pendingbox leeren
+    end
+    opt kein RUNNING-BatchgenAuftrag, pendingbox leer
+        TM->>Cloud: API 1: BatchgenAuftrag anlegen
+        Cloud-->>TM: neue BatchgenAuftrag-Nr.
+    end
+    TM->>Reg: Sandbox unter Aufgabennummer, neuer Lauf, eintragen
     TM->>S: starten
-    TM-->>API: RUNNING
+    TM-->>API: RUNNING, Aufgabennummer
     API-->>B: 202 Accepted
 
     par 2. Übermitteln
         S->>O: markierte Dateien der pendingbox wiederaufnehmen
         loop je Batch, bis die inbox leer ist
             S->>O: Batch aus inbox in pendingbox verschieben
-            S->>Cloud: API 1: Batch als eine JSON-Anfrage
-            Note over Cloud: nur beim ersten Batch: legt den batchgenAuftrag an (einmal je Task)
+            S->>Cloud: API 1: Batch und BatchgenAuftrag-Nr. als eine JSON-Anfrage
             Cloud-->>S: TaskIds und abgelehnte Dateien
             S->>O: TaskId-Marker schreiben, abgelehnte Dateien → errorbox
         end
     and 3. Status verfolgen
         loop je sweep-interval
+            S->>Cloud: API 3: Status des BatchgenAuftrags prüfen
+            Cloud-->>S: aktiv oder CANCELLED
             S->>Cloud: API 2: fällige TaskIds als eine Anfrage
             Cloud-->>S: SUCCESS / ERROR / PENDING je TaskId
             S->>O: SUCCESS → donebox, ERROR → errorbox
@@ -36,28 +55,41 @@ sequenceDiagram
     end
 
     Note over B,Cloud: 4. Statusabfrage (jederzeit)
-    B->>API: Status abfragen
+    B->>API: Status abfragen (Aufgabennummer)
     API->>TM: status
-    alt Task läuft
+    alt Task läuft oder wird abgebrochen
         TM->>Reg: aktuellen Stand lesen
     else Task beendet
-        TM->>Hist: Endzustand lesen
+        TM->>Hist: Endzustand des letzten Laufs lesen
     end
     TM-->>API: Aufgabenstatus
-    API-->>B: Aufgabenstatus
+    API-->>B: RUNNING / CANCELLING / COMPLETED / CANCELLED
 
-    alt 5. Abbruch von außen
-        B->>API: Aufgabe abbrechen
-        API->>TM: cancel
-        TM->>S: Abbruchsignal
-        TM->>Cloud: API 3: batchgenAuftrag = CANCELLED
-        TM->>Hist: Endzustand ablegen
+    alt Abbruch (5. von außen · 6. Timeout oder Fehlerschwelle)
+        alt 5. Abbruch von außen
+            B->>API: Aufgabe abbrechen (Aufgabennummer)
+            API->>TM: Abbruch vermerken
+            TM->>Reg: Status = CANCELLING
+            API->>Cloud: API 3: BatchgenAuftrag = CANCELLED
+            API-->>B: CANCELLING
+        else 6. Timeout oder Fehlerschwelle
+            S->>O: bei Timeout: offene Dateien → errorbox
+            S-->>TM: Timeout oder Fehlerschwelle erreicht
+            TM->>Reg: Status = CANCELLING
+            TM->>Cloud: API 3: BatchgenAuftrag = CANCELLED
+        end
+        Note over S: nächster Durchlauf, spätestens nach einem sweep-interval
+        S->>Cloud: API 3: Status des BatchgenAuftrags prüfen
+        Cloud-->>S: CANCELLED
+        Note over S: Producer und Consumer beenden sich
+        S-->>TM: beendet: CANCELLED
+        TM->>Hist: Endzustand CANCELLED ablegen (Aufgabennummer + Lauf)
         TM->>Reg: Sandbox entfernen
-        TM-->>API: CANCELLED
-        API-->>B: CANCELLED
-    else 6. Abschluss (fertig, Timeout oder Fehlerschwelle)
-        S-->>TM: beendet: COMPLETED oder CANCELLED
-        TM->>Cloud: API 3: batchgenAuftrag = COMPLETED / CANCELLED
-        TM->>Hist: Endzustand ablegen (8 h abrufbar)
+        Note over B,O: danach: a) BatchgenAuftrag manuell auf RUNNING setzen und neu starten → Fortsetzen<br/>oder b) pendingbox manuell leeren und neu starten → neuer BatchgenAuftrag
+    else 6. Normales Ende
+        S-->>TM: fertig: inbox und Status-Pool leer
+        TM->>Cloud: API 3: BatchgenAuftrag = COMPLETED
+        TM->>S: Sandbox beenden, Ressourcen freigeben
+        TM->>Hist: Endzustand COMPLETED ablegen (Aufgabennummer + Lauf, 8 h abrufbar)
         TM->>Reg: Sandbox entfernen
     end
