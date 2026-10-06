@@ -1,0 +1,43 @@
+sequenceDiagram
+    %% 人工终止任务时Sandbox内部的过程（依据 zusatz_anforderungen.md 第2.1、4节）
+    %% 前提：用户已经通过REST-API把BatchgenAuftrag设为CANCELED（cancelReason=USER）
+    %% Sandbox外部的过程（中止接口、CleanMassenanlageAuftrag）不在这张图里
+
+    participant A3 as Cloud-API 3
+    box Sandbox（运行任务的POD）
+        participant C as Consumer
+        participant Ctx as TaskContext
+        participant Pool as Status-Pool
+        participant P as Producer
+    end
+    participant A1 as Cloud-API 1
+    participant O as pendingbox
+    participant TM as TaskManager
+
+    Note over A3: BatchgenAuftrag = CANCELED，cancelReason=USER
+
+    Note over C: 如果Consumer正在调用API2：先处理完这次的结果<br/>（有结果的数据移到donebox或errorbox），下一轮才读到CANCELED
+    C->>A3: 新一轮（最多一个sweep-interval之后）：读取状态
+    A3-->>C: CANCELED
+    C->>Ctx: cancel(USER_REQUEST)
+    Note over Ctx: 本地状态 = CANCELLED，触发停止信号
+    Note over C: 不再更新lastSeen，不再查询API2
+    C->>Pool: 清空
+    Note over Pool,O: 还没有结果的数据连同TaskId标记留在pendingbox（计为abandoned）
+    C-)TM: 线程结束（计数器 2 → 1）
+
+    Ctx-->>P: 停止信号
+    alt Producer正在等待Status-Pool降下来（Rückstau）
+        Note over P: 立即被唤醒
+    else Producer正在调用API1提交一个Batch
+        Note over P,A1: 这次调用不会被打断：API1不是幂等的
+        A1-->>P: 每个文件的TaskId
+        P->>O: 写TaskId标记，文件留在pendingbox
+        Note over P: 不再放入Status-Pool（计为abandoned）
+    end
+    Note over P: 不再读取inbox
+    P-)TM: 线程结束（计数器 1 → 0）
+
+    Note over C,P: 两个线程结束的先后顺序不固定，后结束的那个触发注销
+    TM->>TM: 从本地TaskRegistry移除Sandbox
+    Note over TM: 不写云端：状态已经是CANCELED；<br/>pendingbox中的数据由CleanMassenanlageAuftrag清理
