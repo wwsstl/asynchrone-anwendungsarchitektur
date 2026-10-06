@@ -1,27 +1,42 @@
 sequenceDiagram
-    %% 人工终止任务时Sandbox内部的过程（依据 zusatz_anforderungen.md 第2.1、4节）
-    %% 前提：用户已经通过REST-API把BatchgenAuftrag设为CANCELED（cancelReason=USER）
-    %% Sandbox外部的过程（中止接口、CleanMassenanlageAuftrag）不在这张图里
+    %% 外部终止任务时Sandbox内部的过程（第一阶段，依据 erste_phase_zusatz_anforderungen.md 第4节和 funktionsweise_sequenz.md 第5节）
+    %% 沿用现有实现：应用在本地直接停止Sandbox，不写云端
+    %% CleanMassenanlageAuftrag之后的清理不在这张图里（见 funktionsweise_sequenz.mmd 第7阶段）
 
-    participant A3 as Cloud-API 3
-    box Sandbox（运行任务的POD）
-        participant C as Consumer
+    actor U as 用户
+    participant API as REST-API
+    participant TM as TaskManager
+    participant Reg as TaskRegistry（本地）
+    box Sandbox（本地）
         participant Ctx as TaskContext
+        participant C as Consumer
         participant Pool as Status-Pool
         participant P as Producer
     end
     participant A1 as Cloud-API 1
     participant O as pendingbox
-    participant TM as TaskManager
+    participant A3 as Cloud-API 3
 
-    Note over A3: BatchgenAuftrag = CANCELED，cancelReason=USER
-
-    Note over C: 如果Consumer正在调用API2：先处理完这次的结果<br/>（有结果的数据移到donebox或errorbox），下一轮才读到CANCELED
-    C->>A3: 新一轮（最多一个sweep-interval之后）：读取状态
-    A3-->>C: CANCELED
-    C->>Ctx: cancel(USER_REQUEST)
+    U->>API: 中止任务（任务号）
+    API->>TM: cancel
+    TM->>Reg: 查找这个任务的Sandbox
+    break 本地找不到
+        TM-->>API: 不存在
+        API-->>U: 404 Not Found
+    end
+    TM->>Ctx: cancel(USER_REQUEST)
     Note over Ctx: 本地状态 = CANCELLED，触发停止信号
-    Note over C: 不再更新lastSeen，不再查询API2
+    TM->>Reg: 立即删除Sandbox
+    TM-->>API: 中止时的任务状态
+    API-->>U: 200
+
+    Ctx-->>C: 停止信号
+    alt Consumer正在等待下一轮
+        Note over C: 立即被唤醒
+    else Consumer正在调用API2
+        Note over C: 先处理完这次的结果（有结果的数据移到donebox或errorbox）
+    end
+    Note over C: 循环结束：不再查询API2，不再更新lastSeen
     C->>Pool: 清空
     Note over Pool,O: 还没有结果的数据连同TaskId标记留在pendingbox（计为abandoned）
     C-)TM: 线程结束（计数器 2 → 1）
@@ -39,5 +54,6 @@ sequenceDiagram
     P-)TM: 线程结束（计数器 1 → 0）
 
     Note over C,P: 两个线程结束的先后顺序不固定，后结束的那个触发注销
-    TM->>TM: 从本地TaskRegistry移除Sandbox
-    Note over TM: 不写云端：状态已经是CANCELED；<br/>pendingbox中的数据由CleanMassenanlageAuftrag清理
+    Note over TM: Sandbox已经被中止接口从TaskRegistry中删除，注销时不再做其他处理
+
+    Note over A3: 云端不被写入：BatchgenAuftrag保持RUNNING，lastSeen不再更新<br/>lastSeen超时后，由CleanMassenanlageAuftrag清理pendingbox并标为ERROR
