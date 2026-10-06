@@ -1,43 +1,39 @@
 sequenceDiagram
-    %% Erste Ebene zu funktionsweise_sequenz.md – die Sandbox je Task ist eine Blackbox
-    %% Aufgabennummer = BatchgenAuftrag-Nr.; jeder Start unter derselben Nummer ist ein neuer Lauf
-    %% (gezählt werden nur Läufe innerhalb von task-retention, 8 h)
+    %% Erste Ebene zu funktionsweise_sequenz.md (Phase 1, erste_phase_zusatz_anforderungen.md) – die Sandbox je Task ist eine Blackbox
+    %% Eine Instanz, Aufgabennummer = BatchgenAuftrag-Nr., abgebrochene Aufgaben werden nicht fortgesetzt
+    %% Statusänderungen am BatchgenAuftrag sind bedingte Schreibvorgänge in der Cloud
 
     actor B as Benutzer
     participant API as REST-API
     participant TM as TaskManager
-    participant Reg as TaskRegistry
-    participant Hist as TaskHistory
+    participant Reg as TaskRegistry<br/>(lokal)
     participant S as Sandbox je Task
     participant O as Benutzerordner
     participant Cloud as Cloud-Dienst<br/>(API 1, 2, 3)
+    participant CL as CleanMassenanlageAuftrag<br/>(eigenständig)
 
     Note over B,Cloud: 1. Start
     B->>API: Aufgabe starten
     API->>TM: start
-    TM->>Cloud: API 3: RUNNING-BatchgenAuftrag des Benutzers suchen
-    Cloud-->>TM: BatchgenAuftrag-Nr. oder keiner
-    TM->>Reg: Nr. bereits eingetragen?
-    TM->>O: Dateien in der pendingbox?
-    break Nr. bereits in der TaskRegistry
-        TM-->>API: abgewiesen: TASK_ALREADY_RUNNING
-        API-->>B: 409 Conflict, TASK_ALREADY_RUNNING
+    TM->>O: pendingbox leer?
+    break pendingbox nicht leer
+        TM->>Cloud: API 3: BatchgenAuftrag in RUNNING oder CANCELED? (nur für den Ursachencode)
+        TM-->>API: abgewiesen
+        API-->>B: 409 USER_TASK_RUNNING / CLEANUP_REQUIRED / PENDINGBOX_NOT_EMPTY
     end
-    break kein RUNNING-BatchgenAuftrag, aber Dateien in der pendingbox
-        TM-->>API: abgewiesen: PENDINGBOX_NOT_EMPTY
-        API-->>B: 409 Conflict, PENDINGBOX_NOT_EMPTY<br/>Hinweis: erst a) fortsetzen oder b) pendingbox leeren
+    TM->>Cloud: API 1: BatchgenAuftrag anlegen
+    break Benutzer hat bereits einen BatchgenAuftrag in RUNNING oder CANCELED
+        Cloud-->>TM: abgelehnt: Nr. und Status des vorhandenen BatchgenAuftrags
+        TM-->>API: abgewiesen
+        API-->>B: 409 USER_TASK_RUNNING / CLEANUP_REQUIRED
     end
-    opt kein RUNNING-BatchgenAuftrag, pendingbox leer
-        TM->>Cloud: API 1: BatchgenAuftrag anlegen
-        Cloud-->>TM: neue BatchgenAuftrag-Nr.
-    end
-    TM->>Reg: Sandbox unter Aufgabennummer, neuer Lauf, eintragen
+    Cloud-->>TM: neue BatchgenAuftrag-Nr. (RUNNING)
+    TM->>Reg: Sandbox unter der Aufgabennummer eintragen
     TM->>S: starten
     TM-->>API: RUNNING, Aufgabennummer
     API-->>B: 202 Accepted
 
     par 2. Übermitteln
-        S->>O: markierte Dateien der pendingbox wiederaufnehmen
         loop je Batch, bis die inbox leer ist
             S->>O: Batch aus inbox in pendingbox verschieben
             S->>Cloud: API 1: Batch und BatchgenAuftrag-Nr. als eine JSON-Anfrage
@@ -46,50 +42,61 @@ sequenceDiagram
         end
     and 3. Status verfolgen
         loop je sweep-interval
-            S->>Cloud: API 3: Status des BatchgenAuftrags prüfen
-            Cloud-->>S: aktiv oder CANCELLED
             S->>Cloud: API 2: fällige TaskIds als eine Anfrage
             Cloud-->>S: SUCCESS / ERROR / PENDING je TaskId
             S->>O: SUCCESS → donebox, ERROR → errorbox
+            S->>Cloud: API 3: lastSeen aktualisieren (Herzschlag)
         end
     end
 
     Note over B,Cloud: 4. Statusabfrage (jederzeit)
     B->>API: Status abfragen (Aufgabennummer)
-    API->>TM: status
-    alt Task läuft oder wird abgebrochen
-        TM->>Reg: aktuellen Stand lesen
-    else Task beendet
-        TM->>Hist: Endzustand des letzten Laufs lesen
-    end
-    TM-->>API: Aufgabenstatus
-    API-->>B: RUNNING / CANCELLING / COMPLETED / CANCELLED
+    API->>Cloud: API 3 / API 2: Status, Zahl der Datensätze je Status, lastSeen
+    Cloud-->>API: Werte aus der Cloud
+    API-->>B: RUNNING / CANCELED / COMPLETED / ERROR, Summen, lastSeen
 
-    alt Abbruch (5. von außen · 6. Timeout oder Fehlerschwelle)
-        alt 5. Abbruch von außen
-            B->>API: Aufgabe abbrechen (Aufgabennummer)
-            API->>TM: Abbruch vermerken
-            TM->>Reg: Status = CANCELLING
-            API->>Cloud: API 3: BatchgenAuftrag = CANCELLED
-            API-->>B: CANCELLING
-        else 6. Timeout oder Fehlerschwelle
-            S->>O: bei Timeout: offene Dateien → errorbox
-            S-->>TM: Timeout oder Fehlerschwelle erreicht
-            TM->>Reg: Status = CANCELLING
-            TM->>Cloud: API 3: BatchgenAuftrag = CANCELLED
+    alt 5. Abbruch von außen
+        B->>API: Aufgabe abbrechen (Aufgabennummer)
+        API->>TM: cancel
+        TM->>Reg: Sandbox suchen
+        break Aufgabe lokal nicht bekannt
+            TM-->>API: nicht gefunden
+            API-->>B: 404 Not Found
         end
-        Note over S: nächster Durchlauf, spätestens nach einem sweep-interval
-        S->>Cloud: API 3: Status des BatchgenAuftrags prüfen
-        Cloud-->>S: CANCELLED
-        Note over S: Producer und Consumer beenden sich
-        S-->>TM: beendet: CANCELLED
-        TM->>Hist: Endzustand CANCELLED ablegen (Aufgabennummer + Lauf)
+        TM->>S: Abbruchsignal (nur lokal, die Cloud bleibt RUNNING)
+        Note over S,O: Producer und Consumer beenden sich, ein laufender API-1-Aufruf wird nicht unterbrochen<br/>offene Dateien bleiben mit Marker in der pendingbox, lastSeen wird nicht mehr aktualisiert
         TM->>Reg: Sandbox entfernen
-        Note over B,O: danach: a) BatchgenAuftrag manuell auf RUNNING setzen und neu starten → Fortsetzen<br/>oder b) pendingbox manuell leeren und neu starten → neuer BatchgenAuftrag
-    else 6. Normales Ende
-        S-->>TM: fertig: inbox und Status-Pool leer
-        TM->>Cloud: API 3: BatchgenAuftrag = COMPLETED
-        TM->>S: Sandbox beenden, Ressourcen freigeben
-        TM->>Hist: Endzustand COMPLETED ablegen (Aufgabennummer + Lauf, 8 h abrufbar)
-        TM->>Reg: Sandbox entfernen
+        API-->>B: abgebrochen
+    else 6. Ende der Sandbox
+        alt normales Ende
+            S-->>TM: fertig: inbox und Status-Pool leer
+            TM->>Cloud: API 3: RUNNING → COMPLETED
+        else Fehlerschwelle
+            S-->>TM: error-threshold erreicht
+            TM->>Cloud: API 3: RUNNING → CANCELED
+            Note over S,O: offene Dateien bleiben mit Marker in der pendingbox
+        else Timeout
+            S-->>TM: task-timeout überschritten
+            TM->>Cloud: API 3: RUNNING → ERROR
+            S->>O: offene Dateien → errorbox
+        end
+        Note over TM,Cloud: Schreibvorgang abgelehnt → nicht wiederholen, der Status in der Cloud bleibt
+        S-->>TM: Threads beendet
+        TM->>Reg: Sandbox abmelden
+    else 6. Unerwartetes Ende (Absturz, OOM, Serverausfall)
+        Note over S,Cloud: BatchgenAuftrag bleibt RUNNING, lastSeen wird nicht mehr aktualisiert
     end
+
+    Note over B,CL: 7. Aufräumen nach Abbruch von außen, Fehlerschwelle oder unerwartetem Ende
+    B->>CL: Aufräumen starten
+    CL->>Cloud: API 3: Zeit seit lastSeen (Uhr der Cloud)
+    break lastSeen noch frisch
+        CL-->>B: Aufgabe läuft noch, bitte später erneut versuchen
+    end
+    loop bis die pendingbox leer ist
+        CL->>Cloud: API 2: aktueller Status der Reste
+        Cloud-->>CL: SUCCESS / ERROR / PENDING
+        CL->>O: Reste mit Ergebnis → donebox / errorbox
+    end
+    CL->>Cloud: API 3: RUNNING oder CANCELED → ERROR
+    CL-->>B: aufgeräumt, eine neue Aufgabe ist möglich

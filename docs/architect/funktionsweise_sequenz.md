@@ -1,39 +1,35 @@
 # Ablauf einer Aufgabe (erste Ebene)
 
-Sequenzdiagramm: [`../funktionsweise_sequenz_old.mmd`](../funktionsweise_sequenz_old.mmd) – erste Verfeinerung des Überblicks in [`anwendungsarchitektur.mmd`](anwendungsarchitektur.mmd). Die Nummern der Abschnitte entsprechen den Phasen im Diagramm. Chinesische Fassung: [`../funktionsweise_sequenz_zh.md`](../funktionsweise_sequenz_zh.md).
+Sequenzdiagramm: [`funktionsweise_sequenz.mmd`](funktionsweise_sequenz.mmd) – erste Verfeinerung des Überblicks in [`anwendungsarchitektur.mmd`](anwendungsarchitektur.mmd). Die Nummern der Abschnitte entsprechen den Phasen im Diagramm. Chinesische Fassung: [`../funktionsweise_sequenz_zh.md`](../funktionsweise_sequenz_zh.md).
+
+Stand: Phase 1 nach [`erste_phase_zusatz_anforderungen.md`](erste_phase_zusatz_anforderungen.md) – genau eine Instanz der Anwendung (ein Prozess, ein Server). Die Zustände des BatchgenAuftrags und die Ursachencodes sind dort festgelegt; dieses Dokument beschreibt den Ablauf.
+
+Grundsätze:
+
+- Die Aufgabennummer ist die Nummer des BatchgenAuftrags. Jede Aufgabe hat genau einen BatchgenAuftrag. Abgebrochene Aufgaben werden nicht fortgesetzt; ihre Reste in der `pendingbox` räumt das eigenständige Programm CleanMassenanlageAuftrag auf (Abschnitt 7).
+- Der Zustand einer Aufgabe liegt in der Cloud: Status des BatchgenAuftrags, Status der Datensätze und lastSeen. Die Anwendung hält nur die laufenden Sandboxen in ihrer lokalen TaskRegistry; Momentaufnahmen, Historie oder Endzustände speichert sie nicht.
+- Jede Statusänderung am BatchgenAuftrag ist ein atomarer bedingter Schreibvorgang in der Cloud: Sie gelingt nur, wenn der aktuelle Status passt (siehe erste_phase_zusatz_anforderungen.md, Abschnitt 2.1).
 
 ## 1. Start
 
 Die Benutzer:in startet über die REST-API eine Aufgabe. Die API ist mit Spring WebFlux umgesetzt und reicht den Aufruf auf einem Virtual Thread an den TaskManager weiter, damit der Event-Loop nicht blockiert.
 
-Der Start läuft in vier Schritten. Prüfen und Belegen geschehen jeweils in einem einzigen atomaren Schritt im Laufregister (Abschnitt 7). So können sich zwei gleichzeitige Starts nicht gegenseitig übersehen, auch wenn sie auf verschiedenen Instanzen eintreffen.
+Der Start läuft in drei Schritten:
 
-1. **Benutzer:in belegen:** Der TaskManager legt im Laufregister einen Lauf mit dem Status `STARTING` an. Hat die Benutzer:in bereits einen Lauf in `STARTING` oder `RUNNING`, schlägt das fehl, und der Start wird mit `409 Conflict` und dem Ursachencode `USER_TASK_RUNNING` abgewiesen.
-2. **BatchgenAuftrag bestimmen:** Der TaskManager prüft über Cloud-API 3, ob für die Benutzer:in bereits ein BatchgenAuftrag im Status „RUNNING“ existiert (Fortsetzen nach einem Abbruch, siehe Abschnitt 5):
+1. **`pendingbox` prüfen:** Nach `COMPLETED` oder `ERROR` ist die `pendingbox` leer; die Prüfung ist eine Absicherung. Ist sie nicht leer, ruft der TaskManager Cloud-API 1 nicht auf und weist den Start mit `409 Conflict` ab. Für den Ursachencode fragt er über Cloud-API 3 nach einem BatchgenAuftrag der Benutzer:in in `RUNNING` oder `CANCELED`: `RUNNING` → `USER_TASK_RUNNING`, `CANCELED` → `CLEANUP_REQUIRED`, keiner → `PENDINGBOX_NOT_EMPTY`.
+2. **BatchgenAuftrag anlegen:** Der TaskManager lässt über Cloud-API 1 einen neuen BatchgenAuftrag anlegen. Hat die Benutzer:in bereits einen BatchgenAuftrag in `RUNNING` oder `CANCELED`, lehnt die Cloud das in derselben atomaren Operation ab und liefert dessen Nummer und Status. Der Start wird dann mit `409 Conflict` abgewiesen: `RUNNING` → `USER_TASK_RUNNING`, `CANCELED` → `CLEANUP_REQUIRED`.
+3. **Sandbox starten:** Unter der Aufgabennummer baut der TaskManager eine eigene Sandbox auf (Kontext, Status-Pool, Producer- und Consumer-Thread), trägt sie in die lokale TaskRegistry ein und startet Producer und Consumer. Die API antwortet sofort mit `202 Accepted`, dem Aufgabenstatus `RUNNING`, der Aufgabennummer und der Adresse für spätere Statusabfragen.
 
-   | Ergebnis | Reaktion |
-   |---|---|
-   | BatchgenAuftrag vorhanden | Der TaskManager verwendet dessen Nummer wieder (Fortsetzen). |
-   | kein BatchgenAuftrag, aber Dateien in der `pendingbox` | Die Dateien gehören zu einem abgebrochenen BatchgenAuftrag. Der Lauf aus Schritt 1 wird wieder entfernt, und der Start wird mit `409 Conflict` und dem Ursachencode `PENDINGBOX_NOT_EMPTY` abgewiesen. Die Benutzer:in wird aufgefordert, zuerst fortzusetzen (a) oder neu zu beginnen (b), siehe Abschnitt 5. |
-   | kein BatchgenAuftrag, `pendingbox` leer | Der TaskManager lässt über Cloud-API 1 einen neuen BatchgenAuftrag anlegen. |
+Ob die Benutzer:in schon eine Aufgabe hat, entscheidet allein die Cloud beim Anlegen. Die Anwendung führt dafür keine eigene Liste; doppelte Startanfragen (Doppelklick, Wiederholung nach einem Timeout des Clients) und Neustarts der Anwendung sind damit abgedeckt.
 
-3. **Aufgabennummer belegen:** Die Nummer des BatchgenAuftrags ist zugleich die Aufgabennummer. Der TaskManager trägt sie mit der nächsten Laufnummer in den Lauf ein und setzt ihn auf `RUNNING`, zusammen mit der Instanz, die ihn ausführt. Läuft unter dieser Aufgabennummer bereits ein Lauf, schlägt das fehl: Der Lauf aus Schritt 1 wird entfernt, und der Start wird mit `409 Conflict` und dem Ursachencode `TASK_ALREADY_RUNNING` abgewiesen.
-4. **Sandbox starten:** Unter der Aufgabennummer baut der TaskManager eine eigene Sandbox auf (Kontext, Status-Pool, Producer- und Consumer-Thread), trägt sie in die lokale TaskRegistry seiner Instanz ein und startet Producer und Consumer. Die API antwortet sofort mit `202 Accepted`, dem Aufgabenstatus `RUNNING` und der Adresse für spätere Statusabfragen.
-
-Die Benutzer:in wird belegt, **bevor** Cloud-API 1 aufgerufen wird. Sonst könnten zwei fast gleichzeitige Starts derselben Benutzer:in je einen neuen BatchgenAuftrag anlegen, von dem einer ungenutzt in der Cloud zurückbliebe.
-
-Die Ursachencodes stehen in der Antwort der REST-API, damit die Oberfläche je Ursache einen passenden Hinweis anzeigen kann.
-
-Jeder Start unter derselben Aufgabennummer ist ein neuer Lauf mit fortlaufender Laufnummer (1, 2, …). Gezählt werden nur Läufe, die noch im Laufregister stehen; ältere Läufe werden nach Ablauf von `task-retention` (8 Stunden) ignoriert.
+Ist Cloud-API 1 oder 3 nicht erreichbar, antwortet die API mit `502 Bad Gateway`. Zwei Sonderfälle werden wie ein unerwartetes Ende der Anwendung behandelt (Abschnitt 6): Der Aufruf von Cloud-API 1 läuft in ein Timeout, obwohl die Cloud den BatchgenAuftrag angelegt hat; oder die Sandbox startet nach dem Anlegen nicht. Der BatchgenAuftrag steht dann auf `RUNNING`, ohne dass eine Sandbox ihn bearbeitet.
 
 ## 2. Producer – übermitteln
 
-Zuerst nimmt der Producer Dateien wieder auf, die ein früherer Task bereits übermittelt hat. Sie liegen mit TaskId-Marker in der `pendingbox`; ihre TaskIds wandern direkt zurück in den Status-Pool, ohne erneute Übermittlung.
-
-Danach arbeitet er die `inbox` batchweise ab:
+Der Producer arbeitet die `inbox` batchweise ab:
 
 1. Bis zu `batch-size` Dateien in die `pendingbox` verschieben.
-2. Die JSON-Daten dieser Dateien zusammen mit der BatchgenAuftrag-Nummer in einer einzigen Anfrage an Cloud-API 1 übermitteln. Der BatchgenAuftrag besteht seit dem Start (Abschnitt 1); alle Batches der Aufgabe gehören zu ihm. Cloud-API 1 antwortet mit JSON-Daten.
+2. Die JSON-Daten dieser Dateien zusammen mit der BatchgenAuftrag-Nummer in einer einzigen Anfrage an Cloud-API 1 übermitteln. Alle Batches der Aufgabe gehören zu dem BatchgenAuftrag aus dem Start (Abschnitt 1). Cloud-API 1 antwortet mit JSON-Daten.
 3. Die JSON-Antwort von Cloud-API 1 gibt an, welche Dateien erfolgreich in Datenerzeugungsaufträge umgewandelt wurden – jeweils mit TaskId – und welche nicht.
 4. Für die erfolgreich umgewandelten Dateien wird die TaskId als Marker gesichert und in den Status-Pool eingetragen.
 5. Die nicht umgewandelten Dateien werden direkt in die `errorbox` verschoben.
@@ -50,102 +46,63 @@ Parallel zum Producer holt der Consumer in jedem `sweep-interval` die fälligen 
 | `ERROR` | Datei wandert in die `errorbox`; der Marker wird gelöscht, der Fehlerzähler steigt um eins. |
 | `PENDING` | Der Eintrag bleibt im Status-Pool und wird nach `poll-interval` erneut geprüft. |
 
-Zusätzlich prüft der Consumer in jedem Durchlauf über Cloud-API 3 den Status des BatchgenAuftrags. Steht er auf „CANCELLED“, beenden sich Producer und Consumer (siehe Abschnitt 5).
+Zusätzlich aktualisiert der Consumer in jedem Durchlauf über Cloud-API 3 das Feld lastSeen des BatchgenAuftrags (Herzschlag). Die Cloud schreibt dabei ihre eigene Uhrzeit, damit unterschiedliche Uhren keine Rolle spielen. Am Herzschlag erkennt CleanMassenanlageAuftrag, ob noch eine Sandbox an dem BatchgenAuftrag arbeitet (Abschnitt 7).
 
-Außerdem schreibt der Consumer in jedem Durchlauf den aktuellen Fortschritt (übermittelte, erfolgreiche, fehlerhafte und offene Dateien) als Momentaufnahme in seinen Lauf im Laufregister und verlängert dessen Lease (Abschnitt 7).
+Kann der Consumer lastSeen mehrmals hintereinander nicht aktualisieren (z. B. weil Cloud-API 3 nicht erreichbar ist), beendet er die Aufgabe selbst, und zwar bevor das Herzschlag-Timeout abläuft (z. B. nach 2 fehlgeschlagenen Durchläufen bei einem Timeout von 3 `sweep-interval`). Der BatchgenAuftrag bleibt `RUNNING`; es gilt dasselbe wie bei einem unerwarteten Ende (Abschnitt 6). So ist sicher, dass keine Sandbox mehr arbeitet, sobald lastSeen abgelaufen ist.
 
 ## 4. Statusabfrage
 
-Die Benutzer:in kann den Status jederzeit abfragen. Die Antwort stammt immer aus dem Laufregister, nie aus dem Speicher einer einzelnen Instanz; jede Instanz kann die Abfrage also beantworten:
+Die Benutzer:in kann den Status jederzeit abfragen. Die Antwort stammt vollständig aus der Cloud: Status des BatchgenAuftrags, die Zahl der Datensätze je Status (`SUCCESS`, `ERROR`, `PENDING`) und lastSeen. Weil die Anwendung nichts davon selbst speichert, bleibt die Statusabfrage auch nach einem Neustart der Anwendung unverändert möglich.
 
-- **Laufende Aufgabe:** die Momentaufnahme des Laufs, höchstens ein `sweep-interval` alt.
-- **Aufgabe wird abgebrochen:** Steht der Lauf noch auf `RUNNING`, meldet Cloud-API 3 für den BatchgenAuftrag aber bereits „CANCELLED“, liefert die Abfrage `CANCELLING` („wird abgebrochen“). Dieser Status wird bei der Abfrage abgeleitet und nirgends gespeichert.
-- **Beendete Aufgabe:** der Endzustand des letzten Laufs; er bleibt für `task-retention` erhalten (Standard 8 Stunden).
+Der Status hat die vier Werte der Cloud: `RUNNING`, `CANCELED`, `COMPLETED` und `ERROR`; einen eigenen Status `CANCELLING` gibt es nicht. Ob noch eine Sandbox arbeitet, zeigt lastSeen:
 
-Das Laufregister legt jeden Lauf unter Aufgabennummer und Laufnummer ab. Wird eine abgebrochene Aufgabe fortgesetzt, bleibt der Endzustand des abgebrochenen Laufs daher erhalten und wird nicht überschrieben.
+- **`RUNNING` oder `CANCELED`, lastSeen frisch:** Die Sandbox läuft noch bzw. räumt gerade auf.
+- **`RUNNING` oder `CANCELED`, lastSeen abgelaufen:** Keine Sandbox arbeitet mehr, etwa nach einem Abbruch von außen (Abschnitt 5) oder einem unerwarteten Ende. Die Benutzer:in kann CleanMassenanlageAuftrag starten.
+
+Zähler, die nur lokal existieren (z. B. fehlgeschlagene Dateiverschiebungen), sind in der Antwort nicht enthalten.
 
 ## 5. Abbruch von außen
 
-Bricht die Benutzer:in eine Aufgabe ab, leitet die REST-API den Abbruch direkt an Cloud-API 3 weiter: Da die Aufgabennummer zugleich die BatchgenAuftrag-Nummer ist, markiert sie den BatchgenAuftrag als „CANCELLED“ und antwortet mit `CANCELLING`. Dabei liest und schreibt sie keinen Zustand der Instanz. Jede Instanz kann den Abbruch daher entgegennehmen, unabhängig davon, auf welcher Instanz die Aufgabe läuft.
+Phase 1 übernimmt die bestehende Umsetzung: Bricht die Benutzer:in eine Aufgabe über die REST-API ab, stoppt der TaskManager die Sandbox direkt lokal.
 
-Der Consumer prüft den Status des BatchgenAuftrags in jedem Durchlauf über die Cloud-API 3. Ist er als „CANCELLED“ markiert, werden sowohl der Producer als auch der Consumer beendet – spätestens nach einem `sweep-interval`. Bis dahin liefert die Statusabfrage `CANCELLING` (Abschnitt 4).
+- Er findet die Sandbox in seiner TaskRegistry und setzt das Abbruchsignal im Kontext; Producer und Consumer beenden sich daraufhin. Ein laufender Aufruf von Cloud-API 1 wird nicht unterbrochen, weil Cloud-API 1 nicht idempotent ist; die zurückgelieferten TaskIds werden noch als Marker gesichert.
+- Dateien, deren Ergebnis noch aussteht, bleiben mit ihrem Marker in der `pendingbox`.
+- Die Sandbox wird aus der TaskRegistry entfernt. Ist die Aufgabe lokal nicht bekannt, antwortet die API mit `404 Not Found`.
+- Die Cloud wird nicht beschrieben: Der BatchgenAuftrag bleibt `RUNNING`, und lastSeen wird nicht mehr aktualisiert. Danach gilt dasselbe wie bei einem unerwarteten Ende: Ist lastSeen abgelaufen, startet die Benutzer:in CleanMassenanlageAuftrag (Abschnitt 7), das die Reste verteilt und den BatchgenAuftrag auf `ERROR` setzt. Bis dahin wird ein neuer Start mit `USER_TASK_RUNNING` abgewiesen.
 
-Danach legt der TaskManager der ausführenden Instanz den Endzustand `CANCELLED` im Laufregister ab und entfernt die Sandbox aus seiner TaskRegistry. So bleibt die Aufgabe jederzeit abfragbar, während Threads, Status-Pool und Kontext freigegeben werden.
-
-Bereits übermittelte Dateien bleiben mit ihrem Marker in der `pendingbox`. Danach hat die Benutzer:in zwei Wege:
-
-- **a) Fortsetzen:** Sie setzt den abgebrochenen BatchgenAuftrag manuell wieder auf „RUNNING“ und startet erneut eine Aufgabe. Der TaskManager findet beim Start den laufenden BatchgenAuftrag und verwendet dessen Nummer wieder (Abschnitt 1). Der Producer nimmt die markierten Dateien der `pendingbox` wieder auf, ohne sie erneut zu übermitteln (Abschnitt 2).
-- **b) Neu beginnen:** Sie leert die `pendingbox` manuell und startet eine neue Aufgabe; dafür wird ein neuer BatchgenAuftrag angelegt.
+Ein Abbruch über den Status des BatchgenAuftrags in der Cloud, wie ihn der Betrieb mit mehreren Instanzen braucht, folgt in Phase 2 (siehe [`zusatz_anforderungen.md`](zusatz_anforderungen.md)).
 
 ## 6. Abschluss und Abmeldung
 
-Die Aufgabe endet auf einem von zwei Wegen:
+Die Aufgabe endet auf einem der folgenden Wege. Wo die Anwendung den Status des BatchgenAuftrags setzt, geschieht das mit einem bedingten Schreibvorgang über Cloud-API 3, der nur aus `RUNNING` gelingt:
 
-- **`COMPLETED`:** Der Producer ist fertig und der Status-Pool leer.
-- **`CANCELLED`:** Die maximale Laufzeit (`task-timeout`) ist überschritten – noch offene Dateien gehen dann in die `errorbox` – oder die Fehlerschwelle (`error-threshold`) ist erreicht.
-
-**Timeout oder Fehlerschwelle** lösen denselben Mechanismus aus wie der Abbruch von außen (Abschnitt 5):
-
-1. Die Sandbox meldet das Ereignis dem TaskManager ihrer Instanz.
-2. Der TaskManager markiert den BatchgenAuftrag über Cloud-API 3 als „CANCELLED“. Das geschieht auf der Instanz, auf der die Sandbox läuft; ein gemeinsamer Zustand ist dafür nicht nötig.
-3. Im nächsten Durchlauf erkennt der Consumer den Status, und Producer und Consumer beenden sich.
-4. Der TaskManager legt den Endzustand `CANCELLED` im Laufregister ab und entfernt die Sandbox aus seiner TaskRegistry.
-
-Danach gelten dieselben zwei Wege wie in Abschnitt 5: fortsetzen oder neu beginnen.
-
-**Normales Ende:** Ist der Producer fertig und der Status-Pool leer, meldet die Sandbox dies dem TaskManager. Der TaskManager markiert den BatchgenAuftrag über Cloud-API 3 als „COMPLETED“. Danach beendet er die Sandbox und gibt ihre Ressourcen frei: Er legt den Endzustand `COMPLETED` im Laufregister ab und entfernt die Sandbox aus seiner TaskRegistry.
-
-In allen Fällen bleibt die Aufgabe jederzeit abfragbar, während Threads, Status-Pool und Kontext freigegeben werden.
-
-## 7. Gemeinsamer Zustand und Betrieb mit mehreren Instanzen
-
-Die Anwendung soll später auf mehreren Instanzen (Container/Pods) laufen können. Eine Anfrage kann dann auf einer anderen Instanz eintreffen als der, auf der die Aufgabe läuft. Deshalb hängt nichts, was eine Instanz einer anderen mitteilen muss, vom Speicher einer einzelnen Instanz ab. Der Zustand ist so aufgeteilt:
-
-| Zustand | Ort | Grund |
+| Ende | Status des BatchgenAuftrags | Reste in der `pendingbox` |
 |---|---|---|
-| laufende Sandbox (Threads, Status-Pool, Kontext) | lokale TaskRegistry der ausführenden Instanz | lässt sich nicht teilen und muss es auch nicht |
-| Läufe: Benutzer:in, Aufgabennummer, Laufnummer, Status, ausführende Instanz, Lease, Fortschritt, Endzustand | Laufregister (gemeinsam) | Startprüfungen, Statusabfrage und Historie müssen auf jeder Instanz gleich ausfallen |
-| Abbruchwunsch | Status des BatchgenAuftrags in Cloud-API 3 | liegt ohnehin außerhalb aller Instanzen |
-| Dateien | Benutzerordner auf einem gemeinsamen Volume | Startprüfung und Fortsetzen lesen die `pendingbox` |
+| **Normales Ende:** Der Producer ist fertig und der Status-Pool leer | `COMPLETED` | keine |
+| **Fehlerschwelle:** `error-threshold` erreicht | `CANCELED` | bleiben; CleanMassenanlageAuftrag räumt auf |
+| **Timeout:** `task-timeout` überschritten | `ERROR` | die Anwendung verschiebt sie in die `errorbox`; kein Aufräumen nötig |
+| **Abbruch von außen** (Abschnitt 5) | bleibt `RUNNING` | bleiben; CleanMassenanlageAuftrag räumt nach Ablauf von lastSeen auf |
+| **Unerwartetes Ende:** Absturz, OOM, Serverausfall | bleibt `RUNNING` | bleiben; CleanMassenanlageAuftrag räumt nach Ablauf von lastSeen auf |
 
-Ein Lauf hat die Status `STARTING`, `RUNNING`, `COMPLETED` und `CANCELLED`. Das Laufregister bietet nur atomare Operationen an:
+Beim normalen Ende darf einzelnes `ERROR` vorkommen, solange die Fehlerschwelle nicht erreicht ist. Wird ein bedingter Schreibvorgang abgelehnt, etwa weil jemand den Status direkt in der Cloud geändert hat, wiederholt die Anwendung ihn nicht, beendet die Aufgabe und lässt den Status in der Cloud unverändert.
 
-- Benutzer:in belegen;
-- Aufgabennummer belegen;
-- Lauf freigeben;
-- Lease verlängern;
-- Momentaufnahme schreiben und lesen;
-- Endzustand ablegen.
+**Abmeldung:** Sobald Producer- und Consumer-Thread ausgelaufen sind, meldet der TaskManager die Sandbox ab und entfernt sie aus seiner TaskRegistry; Threads, Status-Pool und Kontext werden freigegeben. Einen Endzustand legt die Anwendung nicht ab – die Aufgabe bleibt über die Cloud abfragbar (Abschnitt 4).
 
-Prüfen und Belegen sind dadurch nie getrennte Schritte.
+## 7. Aufräumen mit CleanMassenanlageAuftrag
 
-- **Phase 1 (ein Server):** Das Laufregister ist eine In-Memory-Implementierung ohne Datenbank; die bisherige TaskHistory geht darin auf (siehe „Phase 1 ohne Datenbank“).
-- **Phase 2 (mehrere Instanzen):** Das Laufregister wird eine Datenbanktabelle mit zwei partiellen Unique-Indizes:
-  - auf der Benutzer:in für Läufe in `STARTING` oder `RUNNING` – eine Aufgabe je Benutzer:in;
-  - auf der Aufgabennummer für Läufe in `RUNNING` – kein BatchgenAuftrag läuft doppelt.
+CleanMassenanlageAuftrag ist ein eigenständiges Programm und gehört nicht zur Anwendung. Es räumt einen BatchgenAuftrag in `RUNNING` oder `CANCELED` auf, sobald keine Sandbox mehr daran arbeitet:
 
-  `task-retention` wird zu einer Löschregel. REST-API und TaskManager ändern sich dabei nicht; ausgetauscht wird nur die Implementierung hinter den Operationen.
-- **Ausfall einer Instanz:** Die ausführende Instanz verlängert in jedem Durchlauf die Lease ihres Laufs. Fällt sie aus, läuft die Lease ab, und der Lauf zählt nicht mehr als laufend; die Benutzer:in kann neu starten. Der BatchgenAuftrag steht in der Cloud noch auf „RUNNING“, und die Dateien liegen mit Marker in der `pendingbox`. Der neue Start setzt die Aufgabe deshalb fort (Abschnitt 1).
+1. **lastSeen frisch:** Das Programm lehnt ab und meldet „Aufgabe läuft noch, bitte später erneut versuchen“. Maßgeblich ist die Uhrzeit der Cloud: Cloud-API 3 liefert die seit lastSeen vergangene Zeit.
+2. **`pendingbox` nicht leer:** Das Programm verteilt die Reste nach dem aktuellen Status aus Cloud-API 2 auf `donebox` und `errorbox`, bis die `pendingbox` leer ist, und setzt den BatchgenAuftrag dann auf `ERROR`.
+3. **`pendingbox` leer:** Das Programm setzt den BatchgenAuftrag direkt auf `ERROR`.
 
-### Phase 1 ohne Datenbank
+Lässt sich die `pendingbox` nicht leeren (z. B. weil Datensätze in der Cloud nie einen Endstatus erreichen), wird sie von Hand geleert und das Programm danach erneut gestartet.
 
-In Phase 1 läuft genau ein Prozess auf einem Server. Für das Laufregister genügt deshalb eine In-Memory-Implementierung mit den Mitteln der JVM:
+Erst wenn der BatchgenAuftrag auf `COMPLETED` oder `ERROR` steht, kann die Benutzer:in eine neue Aufgabe starten. Das Herzschlag-Timeout ist konfigurierbar (z. B. 3 `sweep-interval`); Anwendung und CleanMassenanlageAuftrag verwenden denselben Wert.
 
-| Operation | Umsetzung |
-|---|---|
-| Benutzer:in belegen | `putIfAbsent` auf einer `ConcurrentHashMap` je Benutzer:in |
-| Aufgabennummer belegen | `putIfAbsent` auf einer `ConcurrentHashMap` je Aufgabennummer |
-| Lauf freigeben | `remove(key, value)` in beiden Maps |
-| Momentaufnahme | direkt aus dem Kontext der Sandbox gelesen |
-| Endzustände | `ConcurrentHashMap` mit dem Schlüssel Aufgabennummer und Laufnummer; Einträge werden nach `task-retention` gelöscht |
-| Lease | entfällt: Es gibt nur einen Prozess. Endet er, verschwindet der gesamte Zustand im Speicher, als wären alle Leases abgelaufen. |
+## 8. Betrieb in Phase 1
 
-**Neustart der Anwendung:** Der Speicher ist danach leer.
-
-- **Laufende Aufgaben** enden mit dem Prozess. Der BatchgenAuftrag steht in der Cloud weiter auf „RUNNING“, und die Dateien liegen mit Marker in der `pendingbox`. Startet die Benutzer:in erneut, findet der Start den BatchgenAuftrag und setzt die Aufgabe fort (Abschnitt 1). Das ist derselbe Weg wie nach dem Ausfall einer Instanz in Phase 2.
-- **Endzustände beendeter Aufgaben** gehen verloren; die Statusabfrage liefert dann `404`, und die Laufnummern beginnen wieder bei 1. Das entspricht der Regel, dass Läufe nach `task-retention` ignoriert werden.
-
-**Grenzen:**
-
-- **Nur ein Prozess:** Auf denselben Benutzerordnern darf nur ein Prozess laufen. Ein versehentlich gestarteter zweiter Prozess sähe die Belegungen im Speicher nicht. Absichern lässt sich das mit einer Dateisperre (`FileChannel.tryLock()`) oder als Betriebsregel.
-- **Statusabfrage:** Jede Statusabfrage einer laufenden Aufgabe fragt Cloud-API 3 ab, um `CANCELLING` abzuleiten. Bei häufigen Abfragen kann das Ergebnis kurz zwischengespeichert werden, höchstens für ein `sweep-interval`.
+- **Genau eine Instanz:** Der Abbruch von außen (Abschnitt 5) erreicht nur Sandboxen der Instanz, die die Anfrage erhält. Auf denselben Benutzerordnern darf deshalb nur ein Prozess der Anwendung laufen; absichern lässt sich das mit einer Dateisperre (`FileChannel.tryLock()`) oder als Betriebsregel. Anwendung und CleanMassenanlageAuftrag greifen auf dieselben Benutzerordner zu.
+- **Neustart und Update:** Weil abgebrochene Aufgaben nicht fortgesetzt werden, würde ein Neustart laufende Aufgaben wie ein unerwartetes Ende beenden. Vor einem geplanten Neustart wird daher zuerst der Start neuer Aufgaben gesperrt (z. B. `503 Service Unavailable` im Wartungsmodus), dann gewartet, bis die TaskRegistry leer ist, und erst dann neu gestartet. Ungeplante Ausfälle lassen sich nicht vermeiden; sie werden wie ein unerwartetes Ende behandelt.
+- **Ursachencodes:** Die Codes und die Hinweise für die Oberfläche stehen in erste_phase_zusatz_anforderungen.md, Abschnitt 8.
+- **Phase 2:** Was sich beim Betrieb mit mehreren Instanzen ändert (Abbruch über die Cloud, Neustart mehrerer Instanzen, gemeinsames Volume), steht in erste_phase_zusatz_anforderungen.md, Abschnitt 10, und in [`zusatz_anforderungen.md`](zusatz_anforderungen.md).

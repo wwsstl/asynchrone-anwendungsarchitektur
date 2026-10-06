@@ -1,6 +1,7 @@
 sequenceDiagram
     %% Innenansicht der Blackbox „Sandbox je Task“ aus funktionsweise_sequenz.mmd
-    %% Phasennummern wie in funktionsweise_sequenz.md
+    %% Phasennummern wie in funktionsweise_sequenz.md (Phase 1, erste_phase_zusatz_anforderungen.md)
+    %% Der BatchgenAuftrag ist beim Start bereits angelegt (Abschnitt 1), seine Nummer ist die Aufgabennummer
 
     participant TM as TaskManager
     box Sandbox je Task
@@ -15,12 +16,9 @@ sequenceDiagram
     TM->>C: starten
 
     par 2. Producer – übermitteln
-        P->>O: markierte Dateien der pendingbox lesen
-        P->>Pool: ihre TaskIds wiederaufnehmen (ohne erneute Übermittlung)
         loop je Batch, bis die inbox leer ist
             P->>O: bis zu batch-size Dateien aus inbox in pendingbox verschieben
-            P->>Cloud: API 1: JSON-Daten des Batches als eine Anfrage (je Datei höchstens einmal)
-            Note over Cloud: nur beim ersten Batch: legt den batchgenAuftrag an (einmal je Task)
+            P->>Cloud: API 1: JSON-Daten des Batches und BatchgenAuftrag-Nr. als eine Anfrage (je Datei höchstens einmal)
             Cloud-->>P: JSON: TaskId je umgewandelter Datei, nicht umgewandelte Dateien
             P->>O: TaskId-Marker für umgewandelte Dateien schreiben
             P->>Pool: TaskIds der umgewandelten Dateien eintragen
@@ -39,22 +37,44 @@ sequenceDiagram
             else PENDING
                 C->>Pool: nach poll-interval erneut prüfen
             end
+            C->>Cloud: API 3: lastSeen aktualisieren (Herzschlag)
         end
     end
 
-    alt 5. Abbruch von außen
+    alt 5. Abbruch von außen (nur lokal)
         TM->>P: Abbruchsignal
         TM->>C: Abbruchsignal
-        TM->>Cloud: API 3: batchgenAuftrag = CANCELLED
+        Note over P,C: ein laufender API-1-Aufruf wird nicht unterbrochen, seine TaskIds werden noch als Marker gesichert
         Note over O: übermittelte Dateien bleiben mit Marker in der pendingbox
+        Note over Cloud: kein Schreibvorgang: BatchgenAuftrag bleibt RUNNING, lastSeen wird nicht mehr aktualisiert
         P-->>TM: Thread-Ende
         C-->>TM: Thread-Ende
-    else 6. Abschluss
+    else 6. Normales Ende
         P-->>TM: Thread-Ende (inbox leer)
-        C->>C: Producer fertig und Pool leer → COMPLETED
-        opt Timeout oder Fehlerschwelle → CANCELLED
-            C->>O: bei Timeout: offene Dateien → errorbox
-        end
-        C-->>TM: Thread-Ende (der zuletzt endende Thread meldet den Task ab)
-        TM->>Cloud: API 3: batchgenAuftrag = COMPLETED / CANCELLED
+        C->>C: Producer fertig und Pool leer
+        C-->>TM: fertig
+        TM->>Cloud: API 3: RUNNING → COMPLETED
+        C-->>TM: Thread-Ende
+    else 6. Fehlerschwelle
+        C-->>TM: error-threshold erreicht
+        TM->>Cloud: API 3: RUNNING → CANCELED
+        TM->>P: Abbruchsignal
+        Note over O: offene Dateien bleiben mit Marker in der pendingbox
+        P-->>TM: Thread-Ende
+        C-->>TM: Thread-Ende
+    else 6. Timeout
+        C-->>TM: task-timeout überschritten
+        TM->>Cloud: API 3: RUNNING → ERROR
+        C->>O: offene Dateien → errorbox
+        TM->>P: Abbruchsignal
+        P-->>TM: Thread-Ende
+        C-->>TM: Thread-Ende
+    else 3. Herzschlag mehrmals fehlgeschlagen
+        C->>C: vor Ablauf des Herzschlag-Timeouts selbst beenden
+        Note over Cloud: BatchgenAuftrag bleibt RUNNING, wie bei einem unerwarteten Ende
+        C-->>TM: Thread-Ende
+        TM->>P: Abbruchsignal
+        P-->>TM: Thread-Ende
     end
+    Note over TM,Cloud: ein bedingter Schreibvorgang wird abgelehnt → nicht wiederholen, der Status in der Cloud bleibt
+    Note over TM: der zuletzt endende Thread meldet die Sandbox ab: TaskManager entfernt sie aus der TaskRegistry
