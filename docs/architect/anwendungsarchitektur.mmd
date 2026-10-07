@@ -1,12 +1,14 @@
 flowchart LR
 
     %% Funktionsweise (Überblick, Stand funktionsweise_sequenz.md)
+    %% Aufgabennummer = Nr. des BatchgenAuftrags, kein Fortsetzen abgebrochener Aufgaben
 
     API["REST-API (WebFlux)<br/>Start / Abbruch / Status"] --> TM["TaskManager"]
     TM -->|"baut auf, startet,<br/>Abbruchsignal"| Sandbox
-    TM -->|"laufende Tasks"| Reg[("TaskRegistry")]
-    TM -->|"Endzustände nach Abschluss<br/>oder Abbruch (task-retention, 8 h)"| Hist[("TaskHistory")]
-    TM ==>|"batchgenAuftrag:<br/>COMPLETED / CANCELLED"| API3["Cloud-API 3<br/>Auftragsstatus setzen"]
+    TM -->|"laufende Tasks,<br/>lokaler Stand"| Reg[("TaskRegistry")]
+    TM -.->|"Start: leer?"| Pending
+    TM ==>|"Start: BatchgenAuftrag anlegen"| API1
+    TM ==>|"Endzustand setzen: COMPLETED / TIMEOUT /<br/>ERROR / TERMINATED, Status abfragen"| API3["Cloud-API 3<br/>BatchgenAuftrag"]
 
     subgraph Sandbox["Sandbox je Task"]
         P["Producer<br/>(Virtual Thread)"] -->|"TaskIds"| Pool[("Status-Pool")]
@@ -15,13 +17,13 @@ flowchart LR
     end
 
     Inbox[("inbox")] -->|"Batch lesen"| P
-    P -->|"beanspruchen,<br/>TaskId-Marker"| Pending[("pendingbox")]
-    Pending -.->|"Wiederaufnahme<br/>beim nächsten Start"| P
-    P ==>|"Batch als eine JSON-Anfrage"| API1["Cloud-API 1<br/>Batches übernehmen,<br/>batchgenAuftrag einmal je Task"]
+    P -->|"vor dem Aufruf verschieben,<br/>TaskId-Marker"| Pending[("pendingbox")]
+    P -.->|"eindeutig nicht verarbeitet:<br/>zurück, später erneut"| Inbox
+    P ==>|"Batch + Aufgabennummer<br/>als eine JSON-Anfrage"| API1["Cloud-API 1<br/>BatchgenAuftrag anlegen,<br/>Batches übernehmen"]
     API1 -.->|"TaskId je umgewandelter Datei,<br/>nicht umgewandelte Dateien"| P
-    C ==>|"Bulk-Abfrage als eine Anfrage"| API2["Cloud-API 2<br/>Status"]
+    C ==>|"Bulk-Abfrage als eine Anfrage"| API2["Cloud-API 2<br/>Status der Datensätze"]
     C -->|"SUCCESS"| Done[("donebox")]
-    C -->|"ERROR / Timeout"| Error[("errorbox")]
+    C -->|"ERROR"| Error[("errorbox")]
     P -->|"nicht umgewandelt"| Error
     Sandbox -.->|"Threads beendet:<br/>Abmeldung"| TM
 
@@ -30,5 +32,5 @@ flowchart LR
     classDef external fill:#eaf7ea,stroke:#3c8a3c,stroke-width:1px;
 
     class P,C thread;
-    class Pool,Reg,Hist,Inbox,Pending,Done,Error store;
+    class Pool,Reg,Inbox,Pending,Done,Error store;
     class API1,API2,API3 external;

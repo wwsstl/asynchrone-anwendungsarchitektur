@@ -6,9 +6,8 @@ flowchart LR
     UserB(["Benutzer B"])
 
     API["REST-API<br/>Start / Abbruch / Status"]
-    TM["TaskManager<br/>je Benutzer eine Sandbox"]
-    Reg[("TaskRegistry<br/>laufende Tasks")]
-    Hist[("TaskHistory<br/>Endzustände, 8 h")]
+    TM["TaskManager<br/>je Benutzer eine Sandbox,<br/>Start nur bei leerer pendingbox"]
+    Reg[("TaskRegistry<br/>laufende Tasks, lokaler Stand")]
 
     SA["Sandbox Task A<br/>Producer · Status-Pool · Consumer"]
     SB["Sandbox Task B<br/>Producer · Status-Pool · Consumer"]
@@ -16,25 +15,24 @@ flowchart LR
     OA[("Ordner A<br/>inbox → pendingbox →<br/>donebox / errorbox")]
     OB[("Ordner B<br/>inbox → pendingbox →<br/>donebox / errorbox")]
 
-    Cloud["Cloud-Dienst<br/>API 1: Batches übernehmen<br/>(batchgenAuftrag einmal je Task)<br/>API 2: Status abfragen<br/>API 3: Auftragsstatus setzen"]
+    Cloud["Cloud-Dienst<br/>API 1: BatchgenAuftrag anlegen (einmal je Task),<br/>Batches übernehmen<br/>API 2: Status der Datensätze<br/>API 3: Endzustand setzen, Status abfragen"]
 
     UserA --> API
     UserB --> API
     API --> TM
     TM -->|"laufend"| Reg
-    TM -->|"beendet"| Hist
     TM -->|"starten / abbrechen"| SA
     TM -->|"starten / abbrechen"| SB
     SA <-->|"Dateien"| OA
     SB <-->|"Dateien"| OB
     SA ==>|"API 1 + 2"| Cloud
     SB ==>|"API 1 + 2"| Cloud
-    TM ==>|"API 3"| Cloud
+    TM ==>|"API 1: anlegen<br/>API 3: Endzustand, Status"| Cloud
 
     classDef thread fill:#e8f0fe,stroke:#4472c4,stroke-width:1px;
     classDef store fill:#fef6e0,stroke:#c99a2e,stroke-width:1px;
     classDef external fill:#eaf7ea,stroke:#3c8a3c,stroke-width:1px;
 
     class SA,SB thread;
-    class Reg,Hist,OA,OB store;
+    class Reg,OA,OB store;
     class Cloud external;

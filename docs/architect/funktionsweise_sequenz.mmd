@@ -1,11 +1,12 @@
 sequenceDiagram
     %% Erste Ebene zu funktionsweise_sequenz.md – die Sandbox je Task ist eine Blackbox
+    %% Aufgabennummer = Nr. des BatchgenAuftrags, TaskId = Nr. eines Datensatzes der Untertabelle (je Datei)
+    %% Kein Fortsetzen: Restdateien in der pendingbox bearbeitet die Benutzer:in vor dem nächsten Start (Abschnitt 7)
 
     actor B as Benutzer
     participant API as REST-API
     participant TM as TaskManager
     participant Reg as TaskRegistry
-    participant Hist as TaskHistory
     participant S as Sandbox je Task
     participant O as Benutzerordner
     participant Cloud as Cloud-Dienst<br/>(API 1, 2, 3)
@@ -13,20 +14,30 @@ sequenceDiagram
     Note over B,Cloud: 1. Start
     B->>API: Aufgabe starten
     API->>TM: start
+    TM->>O: pendingbox leer?
+    break pendingbox nicht leer
+        TM-->>API: abgewiesen
+        API-->>B: 409 Conflict, PENDINGBOX_NOT_EMPTY
+    end
+    TM->>Cloud: API 1: BatchgenAuftrag anlegen
+    break Cloud nicht erreichbar
+        TM-->>API: abgewiesen, keine Sandbox
+        API-->>B: 502 Bad Gateway
+    end
+    Cloud-->>TM: Aufgabennummer (BatchgenAuftrag RUNNING)
     TM->>Reg: Sandbox eintragen
     TM->>S: starten
-    TM-->>API: RUNNING
+    TM-->>API: RUNNING, Aufgabennummer
     API-->>B: 202 Accepted
 
     par 2. Übermitteln
-        S->>O: markierte Dateien der pendingbox wiederaufnehmen
         loop je Batch, bis die inbox leer ist
             S->>O: Batch aus inbox in pendingbox verschieben
-            S->>Cloud: API 1: Batch als eine JSON-Anfrage
-            Note over Cloud: nur beim ersten Batch: legt den batchgenAuftrag an (einmal je Task)
-            Cloud-->>S: TaskIds und abgelehnte Dateien
-            S->>O: TaskId-Marker schreiben, abgelehnte Dateien → errorbox
+            S->>Cloud: API 1: Batch und Aufgabennummer als eine JSON-Anfrage
+            Cloud-->>S: TaskId je umgewandelter Datei, nicht umgewandelte Dateien
+            S->>O: TaskId-Marker schreiben, nicht umgewandelte Dateien → errorbox
         end
+        Note over S,Cloud: Aufruf fehlgeschlagen: eindeutig nicht verarbeitet → zurück in die inbox, später erneut<br/>Ergebnis unklar → Dateien bleiben ohne Marker in der pendingbox
     and 3. Status verfolgen
         loop je sweep-interval
             S->>Cloud: API 2: fällige TaskIds als eine Anfrage
@@ -36,28 +47,31 @@ sequenceDiagram
     end
 
     Note over B,Cloud: 4. Statusabfrage (jederzeit)
-    B->>API: Status abfragen
+    B->>API: Status abfragen (Aufgabennummer)
     API->>TM: status
-    alt Task läuft
-        TM->>Reg: aktuellen Stand lesen
-    else Task beendet
-        TM->>Hist: Endzustand lesen
+    TM->>Cloud: API 3 / API 2: Status des BatchgenAuftrags, Anzahl je Status
+    opt Aufgabe läuft noch
+        TM->>Reg: lokalen Stand aus der Sandbox lesen
     end
-    TM-->>API: Aufgabenstatus
-    API-->>B: Aufgabenstatus
+    TM-->>API: Status (auch Endzustand), Summen
+    API-->>B: Status
 
     alt 5. Abbruch von außen
-        B->>API: Aufgabe abbrechen
+        B->>API: Aufgabe abbrechen (Aufgabennummer)
         API->>TM: cancel
         TM->>S: Abbruchsignal
-        TM->>Cloud: API 3: batchgenAuftrag = CANCELLED
-        TM->>Hist: Endzustand ablegen
+        Note over S,O: übermittelte Dateien bleiben mit Marker in der pendingbox
+        TM->>Cloud: API 3: BatchgenAuftrag = TERMINATED
         TM->>Reg: Sandbox entfernen
-        TM-->>API: CANCELLED
-        API-->>B: CANCELLED
-    else 6. Abschluss (fertig, Timeout oder Fehlerschwelle)
-        S-->>TM: beendet: COMPLETED oder CANCELLED
-        TM->>Cloud: API 3: batchgenAuftrag = COMPLETED / CANCELLED
-        TM->>Hist: Endzustand ablegen (8 h abrufbar)
+        TM-->>API: abgebrochen
+        API-->>B: abgebrochen
+    else 6. Abschluss (normales Ende, Timeout oder Fehlerschwelle)
+        S-->>TM: beendet: COMPLETED / TIMEOUT / ERROR
+        TM->>Cloud: API 3: BatchgenAuftrag = COMPLETED / TIMEOUT / ERROR
+        Note over S,O: bei TIMEOUT und ERROR bleiben Dateien ohne Ergebnis mit Marker in der pendingbox
         TM->>Reg: Sandbox entfernen
+    else Absturz der Anwendung
+        Note over TM,Cloud: kein Endzustand: BatchgenAuftrag bleibt RUNNING, manuelle Korrektur
     end
+
+    Note over B,O: 7. Restdateien in der pendingbox bearbeitet die Benutzer:in vor dem nächsten Start (sonst 409 PENDINGBOX_NOT_EMPTY)
