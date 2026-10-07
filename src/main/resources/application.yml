@@ -1,0 +1,42 @@
+spring:
+  application:
+    name: asynchrone-anwendungsarchitektur
+  threads:
+    virtual:
+      # Virtual Threads durchgängig (anforderungen.md, Thread-Management)
+      enabled: true
+
+# Pipeline-Einstellungen (PipelineProperties); die Werte entsprechen den Standardwerten.
+pipeline:
+  # Je Benutzer: <base-directory>/<userId>/{inbox,pendingbox,donebox,errorbox}
+  base-directory: ./data/users
+  # Dateien je Batch, den der Producer an Cloud-API 1 übermittelt
+  batch-size: 4
+  # Der Producer liest den nächsten Batch erst, wenn der Status-Pool auf diesen Wert oder darunter gesunken ist
+  pool-resume-threshold: 2
+  # Abstand zwischen zwei Durchläufen des Consumers
+  sweep-interval: 1s
+  # Abstand zwischen zwei Statusabfragen derselben TaskId
+  poll-interval: 5s
+  # Höchstens so viele TaskIds je Anfrage an Cloud-API 2
+  status-bulk-size: 200
+  # Die Aufgabe endet mit ERROR, sobald so viele Dateien fehlerhaft waren
+  error-threshold: 10
+  # Die Aufgabe endet mit TIMEOUT, sobald sie so lange läuft
+  task-timeout: 30m
+  # Längste Wartezeit vor einem erneuten Versuch, wenn Cloud-API 1 einen Batch eindeutig nicht verarbeitet hat
+  submit-retry-max-wait: 1m
+  cloud:
+    base-url: http://localhost:8081
+    # BatchgenAufträge: anlegen (Cloud-API 1), lesen und Endzustand setzen (Cloud-API 3)
+    job-path: /jobs
+    # Batch übermitteln (Cloud-API 1)
+    submit-path: /tasks
+    # Bulk-Statusabfrage (Cloud-API 2)
+    status-path: /tasks/status
+    # Timeout je Aufruf von Cloud-API 1; danach ist das Ergebnis unklar
+    submit-timeout: 30s
+    # Timeout je Aufruf von Cloud-API 2 und 3
+    status-timeout: 30s
+    # Wiederholungen bei Cloud-API 2 und 3; Cloud-API 1 wird nie wiederholt
+    retries: 2

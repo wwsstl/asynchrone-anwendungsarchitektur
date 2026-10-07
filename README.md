@@ -1,132 +1,138 @@
 # Asynchrone Testdaten-Pipeline
 
-Spring-Boot-Anwendung, die Testdatendateien je Benutzer stapelweise aus einem lokalen Ordner liest, über zwei
-Cloud-Dienste erzeugen lässt und die Dateien je nach Ergebnis in eine `donebox` oder `errorbox` verschiebt. Jeder
-Benutzer-Task läuft vollständig isoliert in einer eigenen Sandbox aus Producer, Consumer und Status-Pool
-(Producer-Consumer-Muster auf Virtual Threads).
+Spring-Boot-Anwendung, die Testdaten je Benutzer:in in der Cloud erzeugen lässt. Für jede Aufgabe legt sie in der
+Cloud einen BatchgenAuftrag an, übermittelt die Dateien aus dem lokalen Ordner `inbox` stapelweise, verfolgt den
+Erzeugungsstatus, den die Cloud selbst aktualisiert, und verschiebt jede Datei je nach Ergebnis in die `donebox` oder
+`errorbox`. Den Endzustand des BatchgenAuftrags schreibt die Anwendung zurück in die Cloud.
 
-**Technik:** Java 21 · Spring Boot 4.1 (WebFlux für REST-API und WebClient) · Jackson 3 · Java NIO.2 · rein In-Memory (Phase 1)
+Jede Aufgabe läuft isoliert in einer eigenen Sandbox aus Producer, Consumer und Status-Pool (Producer-Consumer-Muster
+auf Virtual Threads). Der Ablauf ist in [`funktionsweise_sequenz.md`](docs/architect/funktionsweise_sequenz.md)
+beschrieben; der Code verweist auf dessen Abschnitte.
+
+**Technik:** Java 21 · Spring Boot 4.1 (WebFlux für REST-API und WebClient) · Jackson 3 · Java NIO.2 · In-Memory (Phase 1)
 
 ## Funktionsweise
 
 ```mermaid
 flowchart LR
-    subgraph Sandbox["Sandbox je Task"]
+    API["REST-API<br/>Start / Status / Abbruch"] --> TM["TaskManager"]
+    TM -->|BatchgenAuftrag anlegen| API1["Cloud-API 1"]
+    TM -->|Endzustand setzen,<br/>Status lesen| API3["Cloud-API 3"]
+    TM -->|baut auf, trägt ein| Sandbox
+    subgraph Sandbox["Sandbox je Aufgabe"]
         P["Producer<br/>(Virtual Thread)"] -->|TaskIds| Pool[("Status-Pool")]
         Pool --> C["Consumer<br/>(Virtual Thread)"]
     end
-    API["REST-API<br/>Start / Abbruch / Status"] --> TM["TaskManager"]
-    TM -->|baut auf| Sandbox
     Inbox[("inbox")] --> P
-    P -->|Batch| API1["Cloud-API 1<br/>Auftrag anlegen"]
-    C -->|Bulk-Abfrage| API2["Cloud-API 2<br/>Status"]
+    P -->|Batch| API1
+    C -->|Bulk-Abfrage| API2["Cloud-API 2"]
     C -->|SUCCESS| Done[("donebox")]
     C -->|ERROR| Error[("errorbox")]
 ```
 
-1. **Producer** — liest bis zu `batch-size` Dateien aus der `inbox`, verschiebt sie in die `pendingbox`, übermittelt
-   sie in einem Aufruf an Cloud-API 1 und legt die zurückgelieferten TaskIds im Status-Pool ab. Danach wartet er, bis
-   der Pool auf `pool-resume-threshold` abgebaut ist, und liest die nächste Charge.
-2. **Consumer** — fragt die fälligen TaskIds gebündelt bei Cloud-API 2 ab: `SUCCESS` → `donebox`, `ERROR` →
+1. **Start** – Liegen in der `pendingbox` noch Dateien, wird der Start abgewiesen. Sonst legt der TaskManager über
+   Cloud-API 1 einen BatchgenAuftrag an (seine Nummer ist die Aufgabennummer), baut die Sandbox auf, trägt sie in die
+   TaskRegistry ein und startet Producer und Consumer. Je Benutzer:in läuft höchstens eine Aufgabe.
+2. **Producer** – verschiebt bis zu `batch-size` Dateien aus der `inbox` in die `pendingbox` und übermittelt sie
+   zusammen mit der Aufgabennummer in einem Aufruf an Cloud-API 1. Die TaskId jeder umgewandelten Datei sichert er als
+   Marker und trägt die Datei in den Status-Pool ein; nicht umgewandelte Dateien kommen in die `errorbox`. Danach
+   wartet er, bis der Pool auf `pool-resume-threshold` gesunken ist.
+3. **Consumer** – fragt die fälligen TaskIds gebündelt bei Cloud-API 2 ab: `SUCCESS` → `donebox`, `ERROR` →
    `errorbox`, `PENDING` → nach `poll-interval` erneut.
-3. **Abbruch** — von außen über die REST-API, automatisch nach `error-threshold` fehlerhaften Dateien oder nach
-   `task-timeout`.
-4. **Lebensende** — sind beide Threads ausgelaufen, wird der Task samt Sandbox abgemeldet; sein Endzustand bleibt
-   `task-retention` lang über die Status-Abfrage abrufbar.
+4. **Statusabfrage** – aus der Cloud (Cloud-API 3), solange die Aufgabe läuft zusätzlich der lokale Stand der Sandbox.
+5. **Abbruch von außen** – setzt das Abbruchsignal; Producer und Consumer beenden sich, ihre Dateien bleiben liegen.
+6. **Abschluss und Abmeldung** – Sind beide Threads beendet, schreibt der TaskManager den Endzustand über Cloud-API 3
+   und entfernt die Sandbox aus der TaskRegistry.
 
-Cloud-API 1 ist nicht idempotent: Jede Datei wird höchstens einmal übermittelt. Bereits übermittelte Dateien liegen
-mit ihrer TaskId in der `pendingbox`; nach einem Abbruch nimmt der nächste Task desselben Benutzers ihre
-Statusabfrage wieder auf, statt sie erneut zu übermitteln.
+Cloud-API 1 ist nicht idempotent und wird nie wiederholt. Schlägt eine Übermittlung fehl, entscheidet die Art des
+Fehlers:
 
-### Ordner je Benutzer
+| Fehler | Beispiel | Folge |
+|---|---|---|
+| eindeutig nicht verarbeitet | Verbindung abgelehnt, `4xx`, `503` | Dateien zurück in die `inbox`; erneuter Versuch nach `sweep-interval`, die Wartezeit verdoppelt sich bis `submit-retry-max-wait` |
+| Ergebnis unklar | Timeout, sonstige `5xx`, unlesbare Antwort | Dateien bleiben **ohne Marker** in der `pendingbox` und werden nicht erneut übermittelt |
+
+### Endzustände
+
+| Zustand | Auslöser | Was liegen bleibt |
+|---|---|---|
+| `COMPLETED` | `inbox` vollständig übermittelt und Status-Pool leer | nur Dateien mit unklarem Übermittlungsergebnis |
+| `TIMEOUT` | Laufzeit erreicht `task-timeout` | Dateien ohne Ergebnis mit Marker in der `pendingbox`, nicht gelesene in der `inbox` |
+| `ERROR` | Fehlerzähler erreicht `error-threshold` | wie bei `TIMEOUT` |
+| `TERMINATED` | Abbruch über die REST-API | wie bei `TIMEOUT` |
+
+Die Anwendung schreibt diese Zustände über Cloud-API 3 in den BatchgenAuftrag. Wird die Anwendung beendet oder stoppt
+ein unerwarteter Fehler die Sandbox, wird wie bei einem Absturz nichts geschrieben: Der BatchgenAuftrag bleibt
+`RUNNING` und muss manuell korrigiert werden (Abschnitt 7).
+
+### Ordner je Benutzer:in
 
 ```
 <base-directory>/<userId>/
-├── inbox/        vom Benutzer abgelegte, noch zu verarbeitende Dateien
-├── pendingbox/   an Cloud-API 1 übermittelt, Ergebnis steht aus
-│   └── .taskids/ TaskId je Datei (verhindert eine erneute Übermittlung)
+├── inbox/        abgelegte, noch zu übermittelnde Dateien
+├── pendingbox/   an Cloud-API 1 übergeben, Ergebnis steht aus
+│   └── .taskids/ TaskId je Datei als Marker; eine Datei ohne Marker hat ein unklares Übermittlungsergebnis
 ├── donebox/      erfolgreich erzeugt
-└── errorbox/     fehlgeschlagen oder Übermittlungsstatus unbekannt
+└── errorbox/     nicht umgewandelt, fehlerhaft erzeugt oder unlesbar
 ```
 
-Die Ordner werden beim ersten Start eines Tasks angelegt. Gültige Benutzerkennungen:
-`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
+Die Ordner werden beim ersten Start angelegt. Gültige Benutzerkennungen: `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
 
-## Voraussetzungen
-
-- JDK 21
-- Maven
-
-## Bauen und testen
-
-```bash
-mvn test
-```
-
-Die Integrationstests starten die Anwendung mit einem eigenen, lokalen Fake der Cloud-Dienste; es wird kein externer
-Dienst benötigt.
-
-## Lokal ausprobieren
-
-Für manuelle Tests gibt es ein eigenständiges Fake-Backend der Cloud-Dienste (`FakeCloudBackendApplication`). Dessen
-Aufträge bleiben `PENDING`, bis man ihren Status von Hand setzt.
-
-1. Fake-Backend starten (Port 8081, eigenes Terminal):
-
-   ```bash
-   mvn -q compile exec:java -Dexec.mainClass=de.wwsstl.asynchrone.fakecloud.FakeCloudBackendApplication
-   ```
-
-2. Pipeline starten (Port 8080, eigenes Terminal):
-
-   ```bash
-   mvn spring-boot:run
-   ```
-
-3. Eine Datei ablegen und einen Task starten:
-
-   ```bash
-   mkdir -p data/users/alice/inbox
-   echo '{"name": "Beispiel"}' > data/users/alice/inbox/beispiel.json
-   curl -X POST http://localhost:8080/api/users/alice/tasks
-   ```
-
-4. Den Auftrag im Fake-Backend abschließen — die TaskId des Auftrags liefert die Liste:
-
-   ```bash
-   curl http://localhost:8081/tasks
-   curl -X POST "http://localhost:8081/tasks/<auftrags-taskId>/status?status=SUCCESS"
-   ```
-
-5. Status abfragen (`<taskId>` aus der Antwort von Schritt 3). Nach dem nächsten Abfragezyklus liegt die Datei in
-   `data/users/alice/donebox` und der Task ist `COMPLETED`:
-
-   ```bash
-   curl http://localhost:8080/api/users/alice/tasks/<taskId>
-   ```
-
-Unter Windows PowerShell ist `curl` ein Alias für `Invoke-WebRequest`; dort `curl.exe` verwenden.
+Es gibt kein Fortsetzen: Eine neue Aufgabe übernimmt keine Dateien aus der `pendingbox`. Solange dort Dateien liegen,
+wird der Start mit `PENDINGBOX_NOT_EMPTY` abgewiesen; die Benutzer:in bearbeitet sie zuerst von Hand (Abschnitt 7).
 
 ## REST-API
 
 | Methode | Pfad | Wirkung |
 |---|---|---|
-| `POST` | `/api/users/{userId}/tasks` | Startet einen Task. `202` mit `Location`-Header; `409`, wenn für den Benutzer noch ein Task aktiv ist; `400` bei ungültiger Benutzerkennung. |
-| `GET` | `/api/users/{userId}/tasks/{taskId}` | Laufender Task: aktueller Zustand. Beendeter Task: Endzustand, bis `task-retention` abgelaufen ist. Sonst `404`. |
-| `POST` | `/api/users/{userId}/tasks/{taskId}/cancel` | Bricht einen laufenden Task ab bzw. löscht den Endzustand eines beendeten. Danach liefert die `taskId` `404`. |
+| `POST` | `/api/users/{userId}/tasks` | Startet eine Aufgabe: `202` mit `Location`-Header und lokalem Stand |
+| `GET` | `/api/users/{userId}/tasks/{taskNumber}` | Status aus der Cloud, solange die Aufgabe läuft zusätzlich der lokale Stand |
+| `POST` | `/api/users/{userId}/tasks/{taskNumber}/cancel` | Abbruch von außen: `202` mit lokalem Stand; `TERMINATED` wird nach dem Ende der Threads geschrieben |
 
-Alle Antworten enthalten eine Momentaufnahme des Tasks:
+Die Statusabfrage liefert:
 
 | Feld | Bedeutung |
 |---|---|
-| `state` | `RUNNING`, `COMPLETED` oder `CANCELLED` |
-| `cancelReason` | `USER_REQUEST`, `ERROR_THRESHOLD`, `TIMEOUT`, `INTERNAL_ERROR` oder `SHUTDOWN` |
-| `startedAt`, `finishedAt` | Start und Ende (`finishedAt` ist `null`, solange der Task läuft) |
-| `submitted` | in diesem Task an Cloud-API 1 übermittelte Dateien |
-| `resumed` | von einem früheren Task übernommene Dateien der `pendingbox` |
-| `succeeded`, `failed` | nach `donebox` bzw. `errorbox` verschobene Dateien |
-| `pending` | Dateien, deren Ergebnis noch aussteht |
-| `abandoned` | bei einem Abbruch unentschiedene Dateien (bleiben in der `pendingbox`) |
+| `taskNumber`, `userId` | Aufgabennummer (= Nummer des BatchgenAuftrags) und Benutzer:in |
+| `cloud` | `status` des BatchgenAuftrags sowie `success`, `error`, `pending` je Datensatzstatus; `null`, wenn die Cloud gerade nicht erreichbar ist |
+| `local` | lokaler Stand der Sandbox; `null`, sobald die Aufgabe abgemeldet ist |
+
+Der lokale Stand (auch Antwort von Start und Abbruch) enthält:
+
+| Feld | Bedeutung |
+|---|---|
+| `state` | `RUNNING`, `COMPLETED`, `TIMEOUT`, `ERROR`, `TERMINATED` oder `ABORTED` |
+| `startedAt`, `finishedAt` | Start und Ende (`finishedAt` ist `null`, solange die Aufgabe läuft) |
+| `submitted` | Dateien, für die Cloud-API 1 eine TaskId geliefert hat |
+| `succeeded`, `failed` | Dateien in der `donebox` bzw. Stand des Fehlerzählers |
+| `pending` | Dateien im Status-Pool, deren Ergebnis aussteht |
+| `unclear` | Dateien mit unklarem Übermittlungsergebnis |
+
+Der lokale Stand kann den Zahlen der Cloud etwas hinterherhinken. Fehler werden als `ProblemDetail` mit der
+Eigenschaft `code` beantwortet:
+
+| Status | `code` | Ursache |
+|---|---|---|
+| `400` | `INVALID_USER_ID`, `INVALID_TASK_NUMBER` | ungültige Kennung im Pfad |
+| `404` | `TASK_NOT_FOUND` | Aufgabe unbekannt, gehört einer anderen Benutzer:in oder läuft beim Abbruch nicht mehr |
+| `409` | `USER_TASK_RUNNING` | für die Benutzer:in läuft bereits eine Aufgabe |
+| `409` | `PENDINGBOX_NOT_EMPTY` | Restdateien einer früheren Aufgabe in der `pendingbox` |
+| `502` | `CLOUD_UNAVAILABLE` | Cloud nicht erreichbar; beim Start wird keine Sandbox angelegt |
+
+## Cloud-Schnittstelle
+
+Der angenommene Vertrag der Cloud-Dienste (Pfade über `pipeline.cloud.*` einstellbar, umgesetzt in
+`WebClientCloudClient`):
+
+| Aufruf | Anfrage | Antwort |
+|---|---|---|
+| Cloud-API 1: BatchgenAuftrag anlegen | `POST /jobs` `{"userId"}` | `{"jobId"}` |
+| Cloud-API 1: Batch übermitteln | `POST /tasks` `{"jobId","items":[{"fileName","content"}]}` | `{"tasks":[{"fileName","taskId"}]}`; fehlt eine Datei, wurde sie nicht umgewandelt |
+| Cloud-API 2: Bulk-Statusabfrage | `POST /tasks/status` `{"taskIds":[…]}` | `{"results":[{"taskId","status"}]}` mit `SUCCESS`, `ERROR` oder `PENDING` |
+| Cloud-API 3: Endzustand setzen | `PUT /jobs/{jobId}/status` `{"status"}` | – |
+| Cloud-API 3: BatchgenAuftrag lesen | `GET /jobs/{jobId}` | `{"jobId","userId","status","counts":{"SUCCESS","ERROR","PENDING"}}`; `404`, wenn es ihn nicht gibt |
+
+Cloud-API 2 und 3 werden bei Netzwerk-, Timeout- und `5xx`-Fehlern bis zu `cloud.retries` Mal wiederholt.
 
 ## Konfiguration
 
@@ -136,63 +142,132 @@ Alle Werte stehen unter `pipeline.*` in [`application.yml`](src/main/resources/a
 |---|---|---|
 | `base-directory` | `./data/users` | Basisverzeichnis der Benutzerordner |
 | `batch-size` | `4` | Dateien je Aufruf an Cloud-API 1 |
-| `pool-resume-threshold` | `2` | Poolgröße, ab der der Producer die nächste Charge liest (kleiner als `batch-size`) |
-| `sweep-interval` | `1s` | Takt des Consumers |
+| `pool-resume-threshold` | `2` | der Producer liest weiter, sobald der Pool so klein ist (kleiner als `batch-size`) |
+| `sweep-interval` | `1s` | Takt des Consumers; erste Wartezeit nach einer nicht verarbeiteten Übermittlung |
 | `poll-interval` | `5s` | Abstand zwischen zwei Statusabfragen derselben TaskId |
-| `status-bulk-size` | `200` | maximale Anzahl TaskIds je Aufruf an Cloud-API 2 |
-| `error-threshold` | `10` | Abbruch nach so vielen fehlerhaften Dateien |
-| `task-timeout` | `30m` | maximale Laufzeit eines Tasks |
-| `task-retention` | `24h` | Aufbewahrungsdauer des Endzustands beendeter Tasks |
+| `status-bulk-size` | `200` | höchstens so viele TaskIds je Aufruf an Cloud-API 2 |
+| `error-threshold` | `10` | Ende mit `ERROR` nach so vielen fehlerhaften Dateien |
+| `task-timeout` | `30m` | Ende mit `TIMEOUT` nach dieser Laufzeit |
+| `submit-retry-max-wait` | `1m` | längste Wartezeit vor einem erneuten Übermittlungsversuch |
 | `cloud.base-url` | `http://localhost:8081` | Basis-URL der Cloud-Dienste |
-| `cloud.submit-path` | `/tasks` | Pfad von Cloud-API 1 |
-| `cloud.status-path` | `/tasks/status` | Pfad von Cloud-API 2 |
-| `cloud.submit-timeout` | `30s` | Timeout je Aufruf an Cloud-API 1 |
-| `cloud.status-timeout` | `30s` | Timeout je Aufruf an Cloud-API 2 |
-| `cloud.submit-retries` | `0` | Wiederholungen bei Cloud-API 1 (nicht idempotent) |
-| `cloud.status-retries` | `2` | Wiederholungen bei Cloud-API 2 |
+| `cloud.job-path` | `/jobs` | BatchgenAufträge (Cloud-API 1 und 3) |
+| `cloud.submit-path` | `/tasks` | Batch übermitteln (Cloud-API 1) |
+| `cloud.status-path` | `/tasks/status` | Bulk-Statusabfrage (Cloud-API 2) |
+| `cloud.submit-timeout` | `30s` | Timeout je Aufruf an Cloud-API 1; danach ist das Ergebnis unklar |
+| `cloud.status-timeout` | `30s` | Timeout je Aufruf an Cloud-API 2 und 3 |
+| `cloud.retries` | `2` | Wiederholungen bei Cloud-API 2 und 3 |
+
+## Bauen und testen
+
+Voraussetzungen: JDK 21 und Maven.
+
+```bash
+mvn test
+```
+
+Die Integrationstests starten die Anwendung in der Test-JVM gegen `FakeCloud`, ein Test-Double im Testcode, das den
+obigen Vertrag nachbildet; es wird kein externer Dienst benötigt. Abgedeckt sind unter anderem alle Endzustände, die
+Fehlerarten von Cloud-API 1, die Abweisungsgründe beim Start und die Isolation der Sandboxen.
+
+```bash
+mvn verify
+```
+
+baut zusätzlich das JAR und führt die Black-Box-Integrationstests (`PipelineBlackBoxIT`) aus: Die Anwendung (JAR) und
+das Fake-Backend laufen dabei als eigene Prozesse; der Test spricht beide nur über HTTP an, übernimmt über die
+Admin-Endpunkte die Rolle der Cloud und prüft die Benutzerordner. Die Ausgaben beider Prozesse stehen in
+`target/it-logs`.
+
+## Fake-Backend für Integrationstests
+
+`FakeCloudBackendApplication` (`de.wwsstl.asynchrone.fakecloud`) ist eine eigenständige Applikation ohne Spring, die
+Cloud-API 1 bis 3 nachbildet, jedoch ohne jede automatische Statuslogik: Jeder BatchgenAuftrag beginnt mit
+`RUNNING`, jeder Datensatz mit `PENDING`, und sein Status ändert sich nur über die Admin-Endpunkte. Alle Daten liegen
+im Speicher.
+
+```bash
+mvn spring-boot:run@fake-backend
+```
+
+Optionale Argumente über `-Dspring-boot.run.arguments="…"` in dieser Reihenfolge: Port (`8081`), Job-Pfad
+(`/jobs`), Submit-Pfad (`/tasks`), Status-Pfad (`/tasks/status`); sie müssen zu `pipeline.cloud.*` passen.
+
+| Anfrage | Wirkung |
+|---|---|
+| `GET /jobs` | alle BatchgenAufträge mit Status und Zahl der Datensätze je Status |
+| `GET /tasks` | alle Datensätze mit BatchgenAuftrag, Dateiname, TaskId und Status |
+| `POST /tasks/{taskId}/status?status=SUCCESS` | Status eines Datensatzes setzen (`SUCCESS`, `ERROR`, `PENDING`) |
+| `POST /tasks/reject?fileName=a.json` | die nächste Übermittlung dieser Datei wird nicht umgewandelt: sie kommt in die `errorbox` |
+| `POST /tasks/next-response?status=503` | die nächste Übermittlung wird nicht verarbeitet: Dateien zurück in die `inbox`, erneuter Versuch |
+| `POST /tasks/next-response?status=500` | die nächste Übermittlung hat ein unklares Ergebnis: Dateien bleiben ohne Marker in der `pendingbox` |
+
+Ist das Fake-Backend beendet, ist die Cloud nicht erreichbar: Ein Start wird dann mit `502` abgewiesen.
+
+## Lokal ausprobieren
+
+Mit dem Fake-Backend lässt sich eine Aufgabe von Hand durchspielen:
+
+1. Fake-Backend starten (Port 8081, eigenes Terminal):
+
+   ```bash
+   mvn spring-boot:run@fake-backend
+   ```
+
+2. Anwendung starten (Port 8080, eigenes Terminal):
+
+   ```bash
+   mvn spring-boot:run
+   ```
+
+3. Dateien ablegen und eine Aufgabe starten; die Antwort enthält die Aufgabennummer:
+
+   ```bash
+   mkdir -p data/users/alice/inbox
+   echo '{"name": "Beispiel"}' > data/users/alice/inbox/a.json
+   curl -X POST http://localhost:8080/api/users/alice/tasks
+   ```
+
+4. Die TaskId des Datensatzes im Fake-Backend nachsehen und ihn entscheiden; nach dem nächsten Abfragezyklus liegt die
+   Datei in der `donebox`, und die Aufgabe ist `COMPLETED`:
+
+   ```bash
+   curl http://localhost:8081/tasks
+   curl -X POST "http://localhost:8081/tasks/<taskId>/status?status=SUCCESS"
+   curl http://localhost:8080/api/users/alice/tasks/<taskNumber>
+   ```
+
+Unter Windows PowerShell ist `curl` ein Alias für `Invoke-WebRequest`; dort `curl.exe` verwenden.
 
 ## Projektstruktur
 
 ```
 src/main/java/de/wwsstl/asynchrone/
-├── api/          REST-Controller und Fehlerabbildung
-├── taskmanager/  Start, Abbruch, Status; baut und meldet Sandboxen ab
-├── registry/     TaskRegistry (laufende Tasks) und TaskHistory (Endzustände)
-├── context/      Sandbox, TaskContext, TaskSnapshot
-├── producer/     InboxProducer
-├── consumer/     StatusConsumer
-├── pool/         Status-Pool je Sandbox
-├── cloud/        CloudClient auf Basis von WebClient
-├── files/        Benutzerordner (NIO.2)
-├── config/       PipelineProperties und Beans
-└── fakecloud/    eigenständiges Fake-Backend für manuelle Tests
+├── api/       REST-Controller und Fehlerabbildung
+├── task/      TaskManager, TaskRegistry, Sandbox, TaskContext, Status und Momentaufnahmen
+├── producer/  InboxProducer
+├── consumer/  StatusConsumer
+├── pool/      Status-Pool je Sandbox
+├── cloud/     CloudClient auf Basis von WebClient
+├── files/     Benutzerordner (NIO.2)
+├── config/    PipelineProperties und Beans
+└── fakecloud/ FakeCloudBackendApplication: eigenständiges Fake-Backend für Integrationstests
 ```
 
 ## Dokumentation
 
-Die Entwurfsdokumente liegen in [`docs/`](docs/); Code-Kommentare verweisen auf sie über den Dateinamen.
-
 | Dokument | Inhalt |
 |---|---|
 | [`anforderungen.md`](docs/architect/anforderungen.md) | funktionale und nicht-funktionale Anforderungen |
-| [`anforderungen_datenverarbeitung.md`](docs/anforderungen_datenverarbeitung.md) | Batch-Verarbeitung und Rückstau zwischen Producer und Consumer |
-| [`anforderungen_integrationtest.md`](docs/anforderungen_integrationtest.md) | Anforderungen an das Fake-Backend |
-| [`loesung.md`](docs/loesung.md) | Lösungsskizze mit Optionsanalyse |
-| [`feedback_loesung.md`](docs/feedback_loesung.md) | Entscheidungen zu den offenen Punkten der Lösungsskizze |
-| [`loesung_final.md`](docs/loesung_final.md) | verbindliche Architekturentscheidungen |
-| [`asynchrone-anwendungsarchitektur_final.mmd`](docs/asynchrone-anwendungsarchitektur_final.mmd) | Architekturdiagramm (Mermaid) |
-| [`fachlicher_kontext.mmd`](docs/fachlicher_kontext.mmd) | fachlicher Kontext (Mermaid) |
-| [`virtuelle_threads_in_java_21.md`](docs/virtuelle_threads_in_java_21.md) | Hintergrund zu Virtual Threads |
-| [`fragestellungen.md`](docs/fragestellungen.md) | Fragen und Antworten zur Thread-Topologie |
-| [`abbruch_im_containerbetrieb.md`](docs/abbruch_im_containerbetrieb.md) | Abbruch von Tasks im Containerbetrieb |
-| [`sandbox_und_containerisierung.md`](docs/sandbox_und_containerisierung.md) | Sandbox-Modell und künftige Containerisierung |
-| [`batchauftrag_verwaltung_durch_cloud_api.md`](docs/batchauftrag_verwaltung_durch_cloud_api.md) | Bewertung einer DB-gestützten Batchauftrag-Verwaltung |
-| [`architekturalternative_abgleichsschleife.md`](docs/architekturalternative_abgleichsschleife.md) | Zustand im Dateisystem und Abgleichsschleifen; was davon umgesetzt ist und was offen bleibt |
+| [`funktionsweise_sequenz.md`](docs/architect/funktionsweise_sequenz.md) | verbindlicher Ablauf einer Aufgabe, Abschnitte 1–7 ([chinesische Fassung](docs/architect/funktionsweise_sequenz_zh.md)) |
+| [`funktionsweise_sequenz.mmd`](docs/architect/funktionsweise_sequenz.mmd) | Sequenzdiagramm des Ablaufs, die Sandbox als Blackbox |
+| [`sandbox_sequenz.mmd`](docs/architect/sandbox_sequenz.mmd) | Sequenzdiagramm innerhalb einer Sandbox |
+| [`anwendungsarchitektur.mmd`](docs/architect/anwendungsarchitektur.mmd) | Anwendungsarchitektur im Überblick |
+| [`anwendungsarchitektur_user.mmd`](docs/architect/anwendungsarchitektur_user.mmd) | Anwendungsarchitektur mit zwei Benutzer:innen |
 | [`prompt.md`](docs/prompt.md) | Verlauf der Arbeitsaufträge |
 
 ## Grenzen der Phase 1
 
-Register und Historie liegen im Speicher und gehen bei einem Neustart verloren. Dateien, die bereits in der
-`pendingbox` liegen, werden vom nächsten Task des Benutzers weiter abgefragt. Die Anwendung ist für einen einzelnen
-Server ausgelegt; Überlegungen zum Betrieb in Containern stehen in
-[`sandbox_und_containerisierung.md`](docs/sandbox_und_containerisierung.md).
+- TaskRegistry und Status-Pools liegen im Speicher; die Anwendung ist für einen einzelnen Server ausgelegt.
+- Kein Fortsetzen: Restdateien in der `pendingbox` bearbeitet die Benutzer:in vor dem nächsten Start von Hand.
+- Nach einem Absturz, wenn der Endzustand nicht geschrieben werden konnte, oder wenn Cloud-API 1 beim Start in ein
+  Timeout lief, den BatchgenAuftrag aber angelegt hat, bleibt dieser `RUNNING` und muss manuell korrigiert werden.

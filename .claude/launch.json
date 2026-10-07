@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "fake-backend",
+      "runtimeExecutable": "mvn.cmd",
+      "runtimeArgs": ["spring-boot:run@fake-backend"],
+      "port": 8081
+    },
+    {
+      "name": "pipeline",
+      "runtimeExecutable": "mvn.cmd",
+      "runtimeArgs": ["spring-boot:run"],
+      "port": 8080
+    }
+  ]
+}
