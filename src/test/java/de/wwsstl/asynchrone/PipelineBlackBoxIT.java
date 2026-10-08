@@ -142,14 +142,14 @@ class PipelineBlackBoxIT {
     }
 
     @Test
-    void batchWithUnclearResultStaysInPendingboxWithoutMarker() {
+    void batchWithUnclearResultStaysInPendingboxWithoutMarkerAndEndsTaskWithTimeout() {
         api.dropFiles("bbunclear", 2, "{}");
         cloud.nextResponse(500);
 
         String taskNumber = api.start("bbunclear").taskNumber();
 
-        assertThat(awaitEnd("bbunclear", taskNumber, JobStatus.COMPLETED).cloud())
-                .isEqualTo(new TaskStatus.Cloud(JobStatus.COMPLETED, 0, 0, 0));
+        assertThat(awaitEnd("bbunclear", taskNumber, JobStatus.TIMEOUT).cloud())
+                .isEqualTo(new TaskStatus.Cloud(JobStatus.TIMEOUT, 0, 0, 0));
         assertThat(api.names("bbunclear", "pendingbox")).containsExactly("bbunclear-0.json", "bbunclear-1.json");
         assertThat(api.markers("bbunclear")).isEmpty();
         assertRejected(api.startResponse("bbunclear"), 409, "PENDINGBOX_NOT_EMPTY");

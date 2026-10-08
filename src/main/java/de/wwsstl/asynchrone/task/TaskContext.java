@@ -26,6 +26,7 @@ public final class TaskContext {
     private final Object transitionLock = new Object();
     private final AtomicReference<TaskState> state = new AtomicReference<>(TaskState.RUNNING);
     private final AtomicReference<Instant> finishedAt = new AtomicReference<>();
+    private final AtomicReference<String> reason = new AtomicReference<>();
     /** Abbruchsignal für Producer und Consumer. */
     private final AtomicBoolean stopRequested = new AtomicBoolean();
     /** Weckt wartende Threads, sobald das Abbruchsignal gesetzt ist. */
@@ -57,11 +58,12 @@ public final class TaskContext {
     // --- Endzustand und Abbruchsignal ------------------------------------------------------------------------
 
     /**
-     * Setzt den Endzustand und das Abbruchsignal, sofern die Aufgabe noch läuft.
+     * Setzt den Endzustand mit seinem Grund und das Abbruchsignal, sofern die Aufgabe noch läuft.
      *
+     * @param reason warum die Aufgabe endet, z. B. welcher Aufruf welcher Cloud-API fehlgeschlagen ist
      * @return {@code true}, wenn dieser Aufruf die Aufgabe beendet hat
      */
-    public boolean finish(TaskState endState) {
+    public boolean finish(TaskState endState, String reason) {
         if (endState == TaskState.RUNNING) {
             throw new IllegalArgumentException("RUNNING ist kein Endzustand");
         }
@@ -70,6 +72,8 @@ public final class TaskContext {
                 return false;
             }
             finishedAt.set(clock.instant());
+            // Vor dem Zustand gesetzt: Wer einen Endzustand liest, sieht auch seinen Grund.
+            this.reason.set(reason);
             state.set(endState);
             stopRequested.set(true);
         }
@@ -83,6 +87,11 @@ public final class TaskContext {
 
     public Instant finishedAt() {
         return finishedAt.get();
+    }
+
+    /** Grund des Endzustands; {@code null}, solange die Aufgabe läuft. */
+    public String reason() {
+        return reason.get();
     }
 
     /** {@code true}, sobald das Abbruchsignal gesetzt ist. */
@@ -100,7 +109,7 @@ public final class TaskContext {
             stopSignal.await(maxWait.toNanos(), TimeUnit.NANOSECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            finish(TaskState.ABORTED);
+            finish(TaskState.ABORTED, "beim Warten unterbrochen");
         }
         return isStopping();
     }
@@ -142,7 +151,7 @@ public final class TaskContext {
     }
 
     public TaskSnapshot snapshot(int pending) {
-        return new TaskSnapshot(taskNumber, userId, state.get(), startedAt, finishedAt.get(), submittedCount.get(),
-                succeededCount.get(), errorCount.get(), pending, unclearCount.get());
+        return new TaskSnapshot(taskNumber, userId, state.get(), reason.get(), startedAt, finishedAt.get(),
+                submittedCount.get(), succeededCount.get(), errorCount.get(), pending, unclearCount.get());
     }
 }

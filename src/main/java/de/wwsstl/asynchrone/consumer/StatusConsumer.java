@@ -16,6 +16,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import de.wwsstl.asynchrone.cloud.CloudClient;
+import de.wwsstl.asynchrone.cloud.CloudErrors;
 import de.wwsstl.asynchrone.cloud.RecordStatus;
 import de.wwsstl.asynchrone.cloud.RecordStatusResult;
 import de.wwsstl.asynchrone.cloud.TaskId;
@@ -34,9 +35,11 @@ import de.wwsstl.asynchrone.task.TaskState;
  *   <li>{@code ERROR}: Datei in die {@code errorbox}, Marker löschen, Fehlerzähler erhöhen</li>
  *   <li>{@code PENDING}: nach {@code poll-interval} erneut prüfen</li>
  * </ul>
- * Außerdem erkennt er, wann die Aufgabe von selbst endet: {@code TIMEOUT} (maximale Laufzeit überschritten),
- * {@code ERROR} (Fehlerschwelle erreicht) oder {@code COMPLETED} (Producer fertig, Status-Pool leer). Dateien ohne
- * Ergebnis bleiben dabei mit ihrem Marker in der {@code pendingbox}.
+ * Schlägt eine Abfrage fehl, behandelt er die TaskIds wie {@code PENDING}; Cloud-API 2 liest nur, eine Wiederholung ist
+ * daher unbedenklich. Außerdem erkennt er, wann die Aufgabe von selbst endet: {@code TIMEOUT} (maximale Laufzeit
+ * überschritten; der Grund nennt ggf. die zuletzt fehlgeschlagene Statusabfrage), {@code ERROR} (Fehlerschwelle
+ * erreicht) oder {@code COMPLETED} (Producer fertig, Status-Pool leer). Dateien ohne Ergebnis bleiben dabei mit ihrem
+ * Marker in der {@code pendingbox}.
  */
 public final class StatusConsumer implements Runnable {
 
@@ -51,6 +54,12 @@ public final class StatusConsumer implements Runnable {
     private final CloudClient cloud;
     private final PipelineProperties properties;
     private final Clock clock;
+
+    /**
+     * Ursache der letzten fehlgeschlagenen Statusabfrage; {@code null}, sobald wieder eine gelingt. Endet die Aufgabe
+     * mit TIMEOUT, ergänzt sie den Grund. Nur der Consumer-Thread greift darauf zu.
+     */
+    private String lastQueryFailure;
 
     public StatusConsumer(TaskContext context, StatusPool pool, UserFolders folders, CloudClient cloud,
             PipelineProperties properties, Clock clock) {
@@ -68,7 +77,7 @@ public final class StatusConsumer implements Runnable {
             loop();
         } catch (Throwable t) {
             log.error("[{}] Consumer von Aufgabe {} ist fehlgeschlagen", context.userId(), context.taskNumber(), t);
-            context.finish(TaskState.ABORTED);
+            context.finish(TaskState.ABORTED, "Consumer fehlgeschlagen: " + t);
         } finally {
             log.info("[{}] Consumer von Aufgabe {} beendet: {}", context.userId(), context.taskNumber(),
                     context.snapshot(pool.size()));
@@ -78,7 +87,7 @@ public final class StatusConsumer implements Runnable {
     private void loop() {
         while (!context.isStopping()) {
             if (context.isTimedOut()) {
-                end(TaskState.TIMEOUT);
+                end(TaskState.TIMEOUT, timeoutReason());
                 return;
             }
             sweep();
@@ -86,21 +95,30 @@ public final class StatusConsumer implements Runnable {
                 return;
             }
             if (context.errorThresholdReached()) {
-                end(TaskState.ERROR);
+                end(TaskState.ERROR, "Fehlerschwelle (error-threshold) erreicht");
                 return;
             }
             if (context.isProducerFinished() && pool.isEmpty()) {
-                end(TaskState.COMPLETED);
+                end(TaskState.COMPLETED, "inbox vollständig übermittelt, alle Ergebnisse verarbeitet");
                 return;
             }
             context.awaitStop(properties.sweepInterval());
         }
     }
 
-    private void end(TaskState endState) {
-        if (context.finish(endState)) {
-            log.info("[{}] Aufgabe {} endet mit {}; {} Dateien ohne Ergebnis bleiben in der pendingbox",
-                    context.userId(), context.taskNumber(), endState, pool.size());
+    /** Grund für TIMEOUT; schlug zuletzt die Statusabfrage fehl, wird der Aufruf mit seiner Ursache genannt. */
+    private String timeoutReason() {
+        String reason = "maximale Laufzeit (task-timeout) überschritten";
+        if (lastQueryFailure == null) {
+            return reason;
+        }
+        return reason + "; letzte Statusabfrage (Cloud-API 2) fehlgeschlagen: " + lastQueryFailure;
+    }
+
+    private void end(TaskState endState, String reason) {
+        if (context.finish(endState, reason)) {
+            log.info("[{}] Aufgabe {} endet mit {} ({}); {} Dateien ohne Ergebnis bleiben in der pendingbox",
+                    context.userId(), context.taskNumber(), endState, reason, pool.size());
         }
     }
 
@@ -124,12 +142,14 @@ public final class StatusConsumer implements Runnable {
             for (RecordStatusResult result : call.get(wait.toMillis(), TimeUnit.MILLISECONDS)) {
                 statusById.put(result.taskId(), result.status());
             }
+            lastQueryFailure = null;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            context.finish(TaskState.ABORTED);
+            context.finish(TaskState.ABORTED, "beim Warten auf Cloud-API 2 (Statusabfrage) unterbrochen");
             return;
         } catch (ExecutionException | TimeoutException | RuntimeException e) {
             call.cancel(true);
+            lastQueryFailure = CloudErrors.describe(e, "status-timeout");
             log.warn("[{}] Statusabfrage für {} TaskIds fehlgeschlagen, nächster Versuch folgt: {}", context.userId(),
                     chunk.size(), e.toString());
         }

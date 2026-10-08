@@ -55,7 +55,8 @@ public record PipelineProperties(
      * @param jobPath       Pfad der BatchgenAufträge: anlegen (Cloud-API 1), lesen und Endzustand setzen (Cloud-API 3)
      * @param submitPath    Pfad zum Übermitteln eines Batches (Cloud-API 1)
      * @param statusPath    Pfad der Bulk-Statusabfrage (Cloud-API 2)
-     * @param submitTimeout Timeout je Aufruf von Cloud-API 1; danach ist das Ergebnis unklar
+     * @param submitTimeout Timeout je Aufruf von Cloud-API 1; danach ist das Ergebnis unklar, und die Aufgabe endet bzw.
+     *                      der Start wird mit {@code TIMEOUT} abgewiesen
      * @param statusTimeout Timeout je Aufruf von Cloud-API 2 und 3
      * @param retries       Wiederholungen bei Cloud-API 2 und 3 (idempotent); Cloud-API 1 wird nie wiederholt
      */

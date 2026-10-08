@@ -26,8 +26,9 @@ sequenceDiagram
             else eindeutig nicht verarbeitet (Verbindungsfehler, abgelehnt)
                 P->>O: Dateien zurück in die inbox
                 Note over P: warten (zunehmend länger), dann erneut lesen und übermitteln
-            else Ergebnis unklar (Timeout, keine Antwort)
+            else Ergebnis unklar (Timeout nach submit-timeout, sonstige 5xx, abgebrochene Verbindung)
                 Note over O: Dateien bleiben ohne Marker in der pendingbox
+                Note over P: kein weiterer Batch, die Aufgabe endet sofort mit TIMEOUT (siehe unten)
             end
             Note over P,Pool: Rückstau: warten, bis Poolgröße ≤ pool-resume-threshold
         end
@@ -43,6 +44,10 @@ sequenceDiagram
             else PENDING
                 C->>Pool: nach poll-interval erneut prüfen
             end
+            opt Abfrage fehlgeschlagen (auch nach cloud.retries)
+                C->>Pool: wie PENDING: nach poll-interval erneut prüfen
+                Note over C: Ursache merken; nach einer gelungenen Abfrage wieder vergessen
+            end
         end
     end
 
@@ -50,22 +55,27 @@ sequenceDiagram
         TM->>P: Abbruchsignal
         TM->>C: Abbruchsignal
         Note over O: übermittelte Dateien bleiben mit Marker in der pendingbox
-        TM->>Cloud: API 3: BatchgenAuftrag = TERMINATED
         P-->>TM: Thread-Ende
         C-->>TM: Thread-Ende
+        TM->>Cloud: API 3: BatchgenAuftrag = TERMINATED
     else 6. Normales Ende
         P-->>TM: Thread-Ende (alle Dateien der inbox übermittelt)
         C->>C: Producer fertig und Pool leer
-        C-->>TM: fertig
+        C-->>TM: Thread-Ende: COMPLETED
         TM->>Cloud: API 3: BatchgenAuftrag = COMPLETED
-        C-->>TM: Thread-Ende
     else 6. Timeout oder Fehlerschwelle
-        C-->>TM: task-timeout überschritten oder error-threshold erreicht
-        TM->>Cloud: API 3: BatchgenAuftrag = TIMEOUT / ERROR
+        C-->>TM: task-timeout überschritten (Grund ggf. mit letzter fehlgeschlagener Statusabfrage) oder error-threshold erreicht
         TM->>P: Abbruchsignal
         Note over O: Dateien ohne Ergebnis bleiben mit Marker in der pendingbox (nicht in der errorbox)
         P-->>TM: Thread-Ende
         C-->>TM: Thread-Ende
+        TM->>Cloud: API 3: BatchgenAuftrag = TIMEOUT / ERROR
+    else 6. Unklares Ergebnis von Cloud-API 1
+        P-->>TM: Thread-Ende: TIMEOUT, Grund nennt Aufruf und Ursache (z. B. keine Antwort innerhalb von submit-timeout)
+        TM->>C: Abbruchsignal
+        Note over O: Batch mit unklarem Ergebnis ohne Marker, übrige übermittelte Dateien mit Marker in der pendingbox, Rest in der inbox
+        C-->>TM: Thread-Ende
+        TM->>Cloud: API 3: BatchgenAuftrag = TIMEOUT
     end
     Note over TM,Cloud: Schreiben des Endzustands fehlgeschlagen → BatchgenAuftrag bleibt RUNNING, manuelle Korrektur
     Note over TM: der zuletzt endende Thread meldet die Sandbox ab: TaskManager entfernt sie aus der TaskRegistry

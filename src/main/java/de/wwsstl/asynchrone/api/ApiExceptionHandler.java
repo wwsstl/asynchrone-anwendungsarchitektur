@@ -7,6 +7,7 @@ import org.springframework.http.ProblemDetail;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
+import de.wwsstl.asynchrone.cloud.CloudTimeoutException;
 import de.wwsstl.asynchrone.cloud.CloudUnavailableException;
 import de.wwsstl.asynchrone.files.InvalidUserIdException;
 import de.wwsstl.asynchrone.task.InvalidTaskNumberException;
@@ -48,6 +49,12 @@ public class ApiExceptionHandler {
     ProblemDetail cloudUnavailable(CloudUnavailableException e) {
         log.warn("Anfrage abgewiesen: {}", e.getMessage());
         return problem(HttpStatus.BAD_GATEWAY, "CLOUD_UNAVAILABLE", e.getMessage());
+    }
+
+    @ExceptionHandler(CloudTimeoutException.class)
+    ProblemDetail cloudTimeout(CloudTimeoutException e) {
+        log.warn("Anfrage abgewiesen: {}", e.getMessage());
+        return problem(HttpStatus.GATEWAY_TIMEOUT, "TIMEOUT", e.getMessage());
     }
 
     private static ProblemDetail problem(HttpStatus status, String code, String detail) {

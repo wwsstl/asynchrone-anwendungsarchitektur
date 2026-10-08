@@ -11,7 +11,10 @@ public enum TaskState {
     RUNNING(null),
     /** Der Producer ist fertig (alle Dateien der inbox sind übermittelt), und der Status-Pool ist leer. */
     COMPLETED(JobStatus.COMPLETED),
-    /** Die maximale Laufzeit ({@code task-timeout}) ist überschritten. */
+    /**
+     * Die maximale Laufzeit ({@code task-timeout}) ist überschritten, oder das Übermitteln eines Batches an Cloud-API 1
+     * hatte ein unklares Ergebnis (z. B. keine Antwort innerhalb von {@code submit-timeout}).
+     */
     TIMEOUT(JobStatus.TIMEOUT),
     /** Der Fehlerzähler hat {@code error-threshold} erreicht. */
     ERROR(JobStatus.ERROR),

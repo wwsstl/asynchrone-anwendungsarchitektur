@@ -7,6 +7,8 @@ import java.time.Instant;
  * Consumer bereits verarbeitet hat, und kann den Zahlen der Cloud etwas hinterherhinken.
  *
  * @param taskNumber Aufgabennummer, zugleich die Nummer des BatchgenAuftrags
+ * @param reason     Grund des Endzustands, z. B. welcher Aufruf welcher Cloud-API fehlgeschlagen ist; {@code null},
+ *                   solange die Aufgabe läuft
  * @param finishedAt Zeitpunkt des Endzustands; {@code null}, solange die Aufgabe läuft
  * @param submitted  Dateien, für die Cloud-API 1 eine TaskId geliefert hat
  * @param succeeded  Dateien, die in die {@code donebox} verschoben wurden
@@ -18,6 +20,7 @@ public record TaskSnapshot(
         String taskNumber,
         String userId,
         TaskState state,
+        String reason,
         Instant startedAt,
         Instant finishedAt,
         int submitted,

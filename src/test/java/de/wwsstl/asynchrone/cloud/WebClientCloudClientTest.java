@@ -94,7 +94,16 @@ class WebClientCloudClientTest {
                 base.submitPath(), base.statusPath(), Duration.ofSeconds(20), base.statusTimeout(), 0));
 
         assertSubmitFails(offline, "BJ-1", SubmitFailedException.Kind.NOT_PROCESSED);
-        assertThatThrownBy(() -> get(offline.createBatchJob("anna"))).isInstanceOf(ExecutionException.class);
+        assertFails(offline.createBatchJob("anna"), SubmitFailedException.Kind.NOT_PROCESSED);
+    }
+
+    @Test
+    void createJobWithoutResponseIsUnclear() {
+        cloud.delayJobCreationFor("slowjob", Duration.ofSeconds(2));
+
+        assertFails(client.createBatchJob("slowjob"), SubmitFailedException.Kind.UNKNOWN);
+        // Der BatchgenAuftrag wurde trotzdem angelegt: genau deshalb ist das Ergebnis unklar.
+        assertThat(cloud.jobsOf("slowjob")).hasSize(1);
     }
 
     @Test
@@ -111,7 +120,11 @@ class WebClientCloudClientTest {
     }
 
     private static void assertSubmitFails(CloudClient client, String jobId, SubmitFailedException.Kind kind) {
-        assertThatThrownBy(() -> get(client.submit(jobId, List.of(new TestdataItem("probe.json", "ok")))))
+        assertFails(client.submit(jobId, List.of(new TestdataItem("probe.json", "ok"))), kind);
+    }
+
+    private static void assertFails(CompletableFuture<?> call, SubmitFailedException.Kind kind) {
+        assertThatThrownBy(() -> get(call))
                 .isInstanceOf(ExecutionException.class)
                 .cause()
                 .isInstanceOfSatisfying(SubmitFailedException.class, e -> assertThat(e.kind()).isEqualTo(kind));

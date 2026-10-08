@@ -87,6 +87,7 @@ public final class FakeCloud implements AutoCloseable {
     private final Map<String, DataRecord> records = new ConcurrentHashMap<>();
     private final Map<String, Queue<SubmitBehavior>> submitBehaviors = new ConcurrentHashMap<>();
     private final Set<String> unavailableUsers = ConcurrentHashMap.newKeySet();
+    private final Map<String, Duration> jobCreationDelays = new ConcurrentHashMap<>();
     private final Set<String> released = ConcurrentHashMap.newKeySet();
     private final List<String> submittedFileNames = new CopyOnWriteArrayList<>();
     private final List<Integer> submitBatchSizes = new CopyOnWriteArrayList<>();
@@ -120,6 +121,11 @@ public final class FakeCloud implements AutoCloseable {
     /** Cloud-API 1 (BatchgenAuftrag anlegen) antwortet für diese Benutzer:in mit 503. */
     public void makeUnavailableFor(String userId) {
         unavailableUsers.add(userId);
+    }
+
+    /** Cloud-API 1 (BatchgenAuftrag anlegen) legt ihn für diese Benutzer:in an, antwortet aber erst verzögert. */
+    public void delayJobCreationFor(String userId, Duration delay) {
+        jobCreationDelays.put(userId, delay);
     }
 
     /** Die nächsten Aufrufe von Cloud-API 1 (Batch übermitteln) dieser Benutzer:in verhalten sich wie angegeben. */
@@ -170,6 +176,14 @@ public final class FakeCloud implements AutoCloseable {
             }
             String jobId = "BJ-" + jobSequence.incrementAndGet();
             jobs.put(jobId, new Job(userId));
+            Duration delay = jobCreationDelays.get(userId);
+            if (delay != null) {
+                try {
+                    Thread.sleep(delay);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            }
             reply(exchange, 200, Map.of("jobId", jobId));
             return;
         }

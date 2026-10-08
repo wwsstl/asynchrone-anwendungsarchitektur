@@ -35,8 +35,8 @@ pipeline:
     # Bulk-Statusabfrage (Cloud-API 2)
     status-path: /tasks/status
     # Timeout je Aufruf von Cloud-API 1; danach ist das Ergebnis unklar
-    submit-timeout: 30s
+    submit-timeout: 15s
     # Timeout je Aufruf von Cloud-API 2 und 3
-    status-timeout: 30s
+    status-timeout: 10s
     # Wiederholungen bei Cloud-API 2 und 3; Cloud-API 1 wird nie wiederholt
     retries: 2

@@ -10,7 +10,11 @@ import java.util.concurrent.CompletableFuture;
  */
 public interface CloudClient {
 
-    /** Cloud-API 1: legt für die Benutzer:in einen BatchgenAuftrag (Status RUNNING) an und liefert seine Nummer. */
+    /**
+     * Cloud-API 1: legt für die Benutzer:in einen BatchgenAuftrag (Status RUNNING) an und liefert seine Nummer.
+     *
+     * <p>Schlägt der Aufruf fehl, endet das Future wie bei {@link #submit} mit einer {@link SubmitFailedException}.
+     */
     CompletableFuture<String> createBatchJob(String userId);
 
     /**

@@ -17,8 +17,11 @@ import org.springframework.stereotype.Service;
 
 import de.wwsstl.asynchrone.cloud.BatchJob;
 import de.wwsstl.asynchrone.cloud.CloudClient;
+import de.wwsstl.asynchrone.cloud.CloudErrors;
+import de.wwsstl.asynchrone.cloud.CloudTimeoutException;
 import de.wwsstl.asynchrone.cloud.CloudUnavailableException;
 import de.wwsstl.asynchrone.cloud.JobStatus;
+import de.wwsstl.asynchrone.cloud.SubmitFailedException;
 import de.wwsstl.asynchrone.config.PipelineProperties;
 import de.wwsstl.asynchrone.consumer.StatusConsumer;
 import de.wwsstl.asynchrone.files.UserFolderResolver;
@@ -84,6 +87,8 @@ public class TaskManager {
      *
      * @throws TaskRejectedException     mit {@code USER_TASK_RUNNING} oder {@code PENDINGBOX_NOT_EMPTY}
      * @throws CloudUnavailableException wenn Cloud-API 1 nicht erreichbar war; es wird keine Sandbox angelegt
+     * @throws CloudTimeoutException     wenn das Ergebnis von Cloud-API 1 unklar ist (z. B. keine Antwort); es wird
+     *                                   keine Sandbox angelegt
      */
     public TaskSnapshot start(String userId) {
         UserFolders folders = folderResolver.resolve(userId);
@@ -144,16 +149,40 @@ public class TaskManager {
         }
     }
 
+    /**
+     * Legt den BatchgenAuftrag an. Wurde die Anfrage eindeutig nicht verarbeitet, ist die Cloud nicht verfügbar; ist das
+     * Ergebnis unklar (z. B. keine Antwort), wird wie bei einer Aufgabe nichts weiter unternommen und der Start mit
+     * TIMEOUT abgewiesen. Ein dabei vielleicht angelegter BatchgenAuftrag bleibt RUNNING (Abschnitt 7).
+     */
     private String createBatchJob(String userId) {
         String operation = "Cloud-API 1 (BatchgenAuftrag anlegen)";
         Duration wait = properties.cloud().submitTimeout().plus(RESULT_GRACE);
-        String taskNumber = await(cloud.createBatchJob(userId), wait, operation);
+        CompletableFuture<String> call = cloud.createBatchJob(userId);
+        String taskNumber;
+        try {
+            taskNumber = call.get(wait.toMillis(), TimeUnit.MILLISECONDS);
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof SubmitFailedException failure
+                    && failure.kind() == SubmitFailedException.Kind.NOT_PROCESSED) {
+                throw new CloudUnavailableException(operation, failure.getCause());
+            }
+            throw unclear(operation, CloudErrors.describe(e.getCause(), "submit-timeout"));
+        } catch (TimeoutException e) {
+            call.cancel(true);
+            throw unclear(operation, CloudErrors.describe(e, "submit-timeout"));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new CloudUnavailableException(operation, e);
+        }
         if (!InvalidTaskNumberException.isValid(taskNumber)) {
-            throw new CloudUnavailableException(operation,
-                    new IllegalStateException("ungültige Nummer des BatchgenAuftrags: '" + taskNumber + "'"));
+            throw unclear(operation, "ungültige Nummer des BatchgenAuftrags: '" + taskNumber + "'");
         }
         log.info("[{}] BatchgenAuftrag {} angelegt", userId, taskNumber);
         return taskNumber;
+    }
+
+    private static CloudTimeoutException unclear(String operation, String detail) {
+        return new CloudTimeoutException(operation + ": Ergebnis unklar, " + detail);
     }
 
     /** Baut die Sandbox auf, trägt sie in die TaskRegistry ein und startet ihre Threads. */
@@ -175,7 +204,7 @@ public class TaskManager {
             sandbox.start();
             supervisor.start();
         } catch (RuntimeException e) {
-            context.finish(TaskState.ABORTED);
+            context.finish(TaskState.ABORTED, "Sandbox konnte nicht gestartet werden: " + e);
             registry.remove(sandbox);
             throw e;
         }
@@ -224,7 +253,7 @@ public class TaskManager {
         InvalidTaskNumberException.requireValid(taskNumber);
         Sandbox sandbox = findLocal(userId, taskNumber)
                 .orElseThrow(() -> new TaskNotFoundException(userId, taskNumber));
-        if (sandbox.context().finish(TaskState.TERMINATED)) {
+        if (sandbox.context().finish(TaskState.TERMINATED, "Abbruch über die REST-API")) {
             log.info("[{}] Aufgabe {} wird von außen abgebrochen", userId, taskNumber);
         } else {
             log.info("[{}] Aufgabe {} ist bereits beendet ({})", userId, taskNumber, sandbox.context().state());
@@ -248,13 +277,14 @@ public class TaskManager {
     /** Schreibt den Endzustand über Cloud-API 3 und entfernt die Sandbox aus der TaskRegistry. */
     private void deregister(Sandbox sandbox, UserSlot slot) {
         TaskContext context = sandbox.context();
-        if (context.finish(TaskState.ABORTED)) {
+        if (context.finish(TaskState.ABORTED, "Threads endeten ohne Endzustand")) {
             log.warn("[{}] Threads von Aufgabe {} endeten ohne Endzustand", context.userId(), context.taskNumber());
         }
         JobStatus endState = context.state().jobStatus();
         if (endState == null) {
-            log.warn("[{}] Aufgabe {} ({}): kein Endzustand geschrieben, der BatchgenAuftrag bleibt RUNNING und muss "
-                    + "manuell korrigiert werden", context.userId(), context.taskNumber(), context.state());
+            log.warn("[{}] Aufgabe {} ({}: {}): kein Endzustand geschrieben, der BatchgenAuftrag bleibt RUNNING und "
+                    + "muss manuell korrigiert werden", context.userId(), context.taskNumber(), context.state(),
+                    context.reason());
         } else {
             writeEndState(context, endState);
         }
@@ -268,7 +298,8 @@ public class TaskManager {
         try {
             await(cloud.setJobStatus(context.taskNumber(), endState), statusWait(),
                     "Cloud-API 3 (Endzustand setzen)");
-            log.info("[{}] BatchgenAuftrag {} auf {} gesetzt", context.userId(), context.taskNumber(), endState);
+            log.info("[{}] BatchgenAuftrag {} auf {} gesetzt ({})", context.userId(), context.taskNumber(), endState,
+                    context.reason());
         } catch (CloudUnavailableException e) {
             log.error("[{}] Endzustand {} für BatchgenAuftrag {} konnte nicht geschrieben werden; er bleibt RUNNING und "
                     + "muss manuell korrigiert werden: {}", context.userId(), endState, context.taskNumber(),
@@ -297,7 +328,7 @@ public class TaskManager {
      */
     @PreDestroy
     void shutdown() {
-        registry.all().forEach(sandbox -> sandbox.context().finish(TaskState.ABORTED));
+        registry.all().forEach(sandbox -> sandbox.context().finish(TaskState.ABORTED, "Anwendung wird beendet"));
         users.values().forEach(slot -> {
             Thread supervisor = slot.supervisor;
             if (supervisor != null) {

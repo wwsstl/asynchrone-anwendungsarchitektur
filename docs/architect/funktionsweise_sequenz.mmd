@@ -20,9 +20,13 @@ sequenceDiagram
         API-->>B: 409 Conflict, PENDINGBOX_NOT_EMPTY
     end
     TM->>Cloud: API 1: BatchgenAuftrag anlegen
-    break Cloud nicht erreichbar
+    break Cloud nicht erreichbar oder Anfrage abgelehnt
         TM-->>API: abgewiesen, keine Sandbox
-        API-->>B: 502 Bad Gateway
+        API-->>B: 502 Bad Gateway, CLOUD_UNAVAILABLE
+    end
+    break Ergebnis unklar (Timeout, sonstige 5xx)
+        TM-->>API: abgewiesen, keine Sandbox, Grund mit Aufruf und Ursache
+        API-->>B: 504 Gateway Timeout, TIMEOUT
     end
     Cloud-->>TM: Aufgabennummer (BatchgenAuftrag RUNNING)
     TM->>Reg: Sandbox eintragen
@@ -37,21 +41,22 @@ sequenceDiagram
             Cloud-->>S: TaskId je umgewandelter Datei, nicht umgewandelte Dateien
             S->>O: TaskId-Marker schreiben, nicht umgewandelte Dateien → errorbox
         end
-        Note over S,Cloud: Aufruf fehlgeschlagen: eindeutig nicht verarbeitet → zurück in die inbox, später erneut<br/>Ergebnis unklar → Dateien bleiben ohne Marker in der pendingbox
+        Note over S,Cloud: Aufruf fehlgeschlagen: eindeutig nicht verarbeitet → zurück in die inbox, später erneut<br/>Ergebnis unklar (Timeout, sonstige 5xx) → Dateien bleiben ohne Marker in der pendingbox, die Aufgabe endet sofort mit TIMEOUT
     and 3. Status verfolgen
         loop je sweep-interval
             S->>Cloud: API 2: fällige TaskIds als eine Anfrage
             Cloud-->>S: SUCCESS / ERROR / PENDING je TaskId
             S->>O: SUCCESS → donebox, ERROR → errorbox
         end
+        Note over S,Cloud: Abfrage fehlgeschlagen → nach poll-interval erneut (API 2 liest nur), die Aufgabe läuft weiter
     end
 
     Note over B,Cloud: 4. Statusabfrage (jederzeit)
     B->>API: Status abfragen (Aufgabennummer)
     API->>TM: status
-    TM->>Cloud: API 3 / API 2: Status des BatchgenAuftrags, Anzahl je Status
+    TM->>Cloud: API 3: Status des BatchgenAuftrags, Anzahl je Status
     opt Aufgabe läuft noch
-        TM->>Reg: lokalen Stand aus der Sandbox lesen
+        TM->>Reg: lokalen Stand aus der Sandbox lesen (mit Grund, sobald ein Endzustand gesetzt ist)
     end
     TM-->>API: Status (auch Endzustand), Summen
     API-->>B: Status
@@ -60,15 +65,16 @@ sequenceDiagram
         B->>API: Aufgabe abbrechen (Aufgabennummer)
         API->>TM: cancel
         TM->>S: Abbruchsignal
+        TM-->>API: TERMINATED, lokaler Stand
+        API-->>B: 202 Accepted
         Note over S,O: übermittelte Dateien bleiben mit Marker in der pendingbox
+        S-->>TM: Threads beendet
         TM->>Cloud: API 3: BatchgenAuftrag = TERMINATED
         TM->>Reg: Sandbox entfernen
-        TM-->>API: abgebrochen
-        API-->>B: abgebrochen
-    else 6. Abschluss (normales Ende, Timeout oder Fehlerschwelle)
-        S-->>TM: beendet: COMPLETED / TIMEOUT / ERROR
+    else 6. Abschluss (normales Ende, Timeout, unklares Ergebnis von API 1 oder Fehlerschwelle)
+        S-->>TM: beendet: COMPLETED / TIMEOUT / ERROR mit Grund
         TM->>Cloud: API 3: BatchgenAuftrag = COMPLETED / TIMEOUT / ERROR
-        Note over S,O: bei TIMEOUT und ERROR bleiben Dateien ohne Ergebnis mit Marker in der pendingbox
+        Note over S,O: bei TIMEOUT und ERROR bleiben Dateien ohne Ergebnis mit Marker in der pendingbox<br/>nach unklarem Ergebnis von API 1 zusätzlich dieser Batch ohne Marker
         TM->>Reg: Sandbox entfernen
     else Absturz der Anwendung
         Note over TM,Cloud: kein Endzustand: BatchgenAuftrag bleibt RUNNING, manuelle Korrektur

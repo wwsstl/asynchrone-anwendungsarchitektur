@@ -21,25 +21,30 @@ class TaskContextTest {
         assertThat(context.state()).isEqualTo(TaskState.RUNNING);
         assertThat(context.isStopping()).isFalse();
 
+        assertThat(context.reason()).isNull();
+
         clock.advance(Duration.ofSeconds(3));
-        assertThat(context.finish(TaskState.TERMINATED)).isTrue();
-        assertThat(context.finish(TaskState.COMPLETED)).isFalse();
+        assertThat(context.finish(TaskState.TERMINATED, "Abbruch")).isTrue();
+        assertThat(context.finish(TaskState.COMPLETED, "fertig")).isFalse();
 
         assertThat(context.state()).isEqualTo(TaskState.TERMINATED);
+        assertThat(context.reason()).isEqualTo("Abbruch");
         assertThat(context.isStopping()).isTrue();
         assertThat(context.finishedAt()).isEqualTo(clock.instant());
+        assertThat(context.snapshot(0).reason()).isEqualTo("Abbruch");
     }
 
     @Test
     void runningIsNoEndState() {
-        assertThatThrownBy(() -> context.finish(TaskState.RUNNING)).isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> context.finish(TaskState.RUNNING, "läuft"))
+                .isInstanceOf(IllegalArgumentException.class);
     }
 
     @Test
     void awaitStopWakesUpOnEndState() throws InterruptedException {
         Thread waiter = Thread.ofVirtual().start(() -> assertThat(context.awaitStop(Duration.ofMinutes(5))).isTrue());
 
-        context.finish(TaskState.ERROR);
+        context.finish(TaskState.ERROR, "Fehlerschwelle");
 
         waiter.join(TimeUnit.SECONDS.toMillis(5));
         assertThat(waiter.isAlive()).isFalse();
@@ -78,7 +83,7 @@ class TaskContextTest {
 
         TaskSnapshot snapshot = context.snapshot(1);
 
-        assertThat(snapshot).isEqualTo(new TaskSnapshot("BJ-1", "anna", TaskState.RUNNING, clock.instant(), null,
+        assertThat(snapshot).isEqualTo(new TaskSnapshot("BJ-1", "anna", TaskState.RUNNING, null, clock.instant(), null,
                 2, 1, 1, 1, 3));
     }
 

@@ -32,13 +32,16 @@ flowchart LR
 
 1. **Start** – Liegen in der `pendingbox` noch Dateien, wird der Start abgewiesen. Sonst legt der TaskManager über
    Cloud-API 1 einen BatchgenAuftrag an (seine Nummer ist die Aufgabennummer), baut die Sandbox auf, trägt sie in die
-   TaskRegistry ein und startet Producer und Consumer. Je Benutzer:in läuft höchstens eine Aufgabe.
+   TaskRegistry ein und startet Producer und Consumer. Je Benutzer:in läuft höchstens eine Aufgabe. Schlägt das
+   Anlegen fehl, wird keine Sandbox angelegt und der Start mit `502` (Cloud nicht verfügbar) bzw. `504` (Ergebnis
+   unklar, z. B. keine Antwort) abgewiesen.
 2. **Producer** – verschiebt bis zu `batch-size` Dateien aus der `inbox` in die `pendingbox` und übermittelt sie
    zusammen mit der Aufgabennummer in einem Aufruf an Cloud-API 1. Die TaskId jeder umgewandelten Datei sichert er als
    Marker und trägt die Datei in den Status-Pool ein; nicht umgewandelte Dateien kommen in die `errorbox`. Danach
    wartet er, bis der Pool auf `pool-resume-threshold` gesunken ist.
 3. **Consumer** – fragt die fälligen TaskIds gebündelt bei Cloud-API 2 ab: `SUCCESS` → `donebox`, `ERROR` →
-   `errorbox`, `PENDING` → nach `poll-interval` erneut.
+   `errorbox`, `PENDING` → nach `poll-interval` erneut. Schlägt die Abfrage fehl, fragt er ebenfalls nach
+   `poll-interval` erneut; Cloud-API 2 liest nur, die Aufgabe läuft weiter.
 4. **Statusabfrage** – aus der Cloud (Cloud-API 3), solange die Aufgabe läuft zusätzlich der lokale Stand der Sandbox.
 5. **Abbruch von außen** – setzt das Abbruchsignal; Producer und Consumer beenden sich, ihre Dateien bleiben liegen.
 6. **Abschluss und Abmeldung** – Sind beide Threads beendet, schreibt der TaskManager den Endzustand über Cloud-API 3
@@ -50,14 +53,14 @@ Fehlers:
 | Fehler | Beispiel | Folge |
 |---|---|---|
 | eindeutig nicht verarbeitet | Verbindung abgelehnt, `4xx`, `503` | Dateien zurück in die `inbox`; erneuter Versuch nach `sweep-interval`, die Wartezeit verdoppelt sich bis `submit-retry-max-wait` |
-| Ergebnis unklar | Timeout, sonstige `5xx`, unlesbare Antwort | Dateien bleiben **ohne Marker** in der `pendingbox` und werden nicht erneut übermittelt |
+| Ergebnis unklar | Timeout nach `cloud.submit-timeout`, sonstige `5xx`, abgebrochene Verbindung, unlesbare Antwort | Dateien bleiben **ohne Marker** in der `pendingbox` und werden nicht erneut übermittelt; die Aufgabe endet sofort mit `TIMEOUT`, es wird kein weiterer Batch gelesen |
 
 ### Endzustände
 
 | Zustand | Auslöser | Was liegen bleibt |
 |---|---|---|
-| `COMPLETED` | `inbox` vollständig übermittelt und Status-Pool leer | nur Dateien mit unklarem Übermittlungsergebnis |
-| `TIMEOUT` | Laufzeit erreicht `task-timeout` | Dateien ohne Ergebnis mit Marker in der `pendingbox`, nicht gelesene in der `inbox` |
+| `COMPLETED` | `inbox` vollständig übermittelt und Status-Pool leer | nichts |
+| `TIMEOUT` | Laufzeit erreicht `task-timeout`, oder eine Übermittlung an Cloud-API 1 hat ein unklares Ergebnis | Dateien ohne Ergebnis mit Marker in der `pendingbox`, nicht gelesene in der `inbox`; nach einem unklaren Ergebnis zusätzlich dieser Batch ohne Marker |
 | `ERROR` | Fehlerzähler erreicht `error-threshold` | wie bei `TIMEOUT` |
 | `TERMINATED` | Abbruch über die REST-API | wie bei `TIMEOUT` |
 
@@ -102,6 +105,7 @@ Der lokale Stand (auch Antwort von Start und Abbruch) enthält:
 | Feld | Bedeutung |
 |---|---|
 | `state` | `RUNNING`, `COMPLETED`, `TIMEOUT`, `ERROR`, `TERMINATED` oder `ABORTED` |
+| `reason` | Grund des Endzustands, z. B. `Cloud-API 1 (Batch übermitteln): Ergebnis unklar, keine Antwort innerhalb von submit-timeout` oder `maximale Laufzeit (task-timeout) überschritten; letzte Statusabfrage (Cloud-API 2) fehlgeschlagen: 503 Service Unavailable from POST …`; `null`, solange die Aufgabe läuft. Er steht nur im lokalen Stand und im Log, nicht in der Cloud |
 | `startedAt`, `finishedAt` | Start und Ende (`finishedAt` ist `null`, solange die Aufgabe läuft) |
 | `submitted` | Dateien, für die Cloud-API 1 eine TaskId geliefert hat |
 | `succeeded`, `failed` | Dateien in der `donebox` bzw. Stand des Fehlerzählers |
@@ -117,7 +121,8 @@ Eigenschaft `code` beantwortet:
 | `404` | `TASK_NOT_FOUND` | Aufgabe unbekannt, gehört einer anderen Benutzer:in oder läuft beim Abbruch nicht mehr |
 | `409` | `USER_TASK_RUNNING` | für die Benutzer:in läuft bereits eine Aufgabe |
 | `409` | `PENDINGBOX_NOT_EMPTY` | Restdateien einer früheren Aufgabe in der `pendingbox` |
-| `502` | `CLOUD_UNAVAILABLE` | Cloud nicht erreichbar; beim Start wird keine Sandbox angelegt |
+| `502` | `CLOUD_UNAVAILABLE` | Cloud nicht erreichbar oder Anfrage abgelehnt; beim Start wird keine Sandbox angelegt |
+| `504` | `TIMEOUT` | Ergebnis von Cloud-API 1 beim Anlegen des BatchgenAuftrags unklar, z. B. keine Antwort innerhalb von `cloud.submit-timeout`; `detail` nennt Aufruf und Ursache. Es wird keine Sandbox angelegt; ein trotzdem angelegter BatchgenAuftrag bleibt `RUNNING` |
 
 ## Cloud-Schnittstelle
 
@@ -153,7 +158,7 @@ Alle Werte stehen unter `pipeline.*` in [`application.yml`](src/main/resources/a
 | `cloud.job-path` | `/jobs` | BatchgenAufträge (Cloud-API 1 und 3) |
 | `cloud.submit-path` | `/tasks` | Batch übermitteln (Cloud-API 1) |
 | `cloud.status-path` | `/tasks/status` | Bulk-Statusabfrage (Cloud-API 2) |
-| `cloud.submit-timeout` | `30s` | Timeout je Aufruf an Cloud-API 1; danach ist das Ergebnis unklar |
+| `cloud.submit-timeout` | `30s` | so lange wartet die Anwendung auf eine Antwort von Cloud-API 1; danach ist das Ergebnis unklar, und die Aufgabe endet mit `TIMEOUT` bzw. der Start wird mit `TIMEOUT` abgewiesen |
 | `cloud.status-timeout` | `30s` | Timeout je Aufruf an Cloud-API 2 und 3 |
 | `cloud.retries` | `2` | Wiederholungen bei Cloud-API 2 und 3 |
 
@@ -199,9 +204,11 @@ Optionale Argumente über `-Dspring-boot.run.arguments="…"` in dieser Reihenfo
 | `POST /tasks/{taskId}/status?status=SUCCESS` | Status eines Datensatzes setzen (`SUCCESS`, `ERROR`, `PENDING`) |
 | `POST /tasks/reject?fileName=a.json` | die nächste Übermittlung dieser Datei wird nicht umgewandelt: sie kommt in die `errorbox` |
 | `POST /tasks/next-response?status=503` | die nächste Übermittlung wird nicht verarbeitet: Dateien zurück in die `inbox`, erneuter Versuch |
-| `POST /tasks/next-response?status=500` | die nächste Übermittlung hat ein unklares Ergebnis: Dateien bleiben ohne Marker in der `pendingbox` |
+| `POST /tasks/next-response?status=500` | die nächste Übermittlung hat ein unklares Ergebnis: Dateien bleiben ohne Marker in der `pendingbox`, die Aufgabe endet mit `TIMEOUT` |
 
-Ist das Fake-Backend beendet, ist die Cloud nicht erreichbar: Ein Start wird dann mit `502` abgewiesen.
+Ist das Fake-Backend beendet, ist die Cloud nicht erreichbar: Ein Start wird dann mit `502` abgewiesen. Hält man es
+dagegen im Debugger an, antwortet es nicht: Nach `cloud.submit-timeout` wird ein Start mit `504 TIMEOUT` abgewiesen
+bzw. endet eine laufende Aufgabe beim nächsten Batch mit `TIMEOUT`.
 
 ## Lokal ausprobieren
 
@@ -269,5 +276,6 @@ src/main/java/de/wwsstl/asynchrone/
 
 - TaskRegistry und Status-Pools liegen im Speicher; die Anwendung ist für einen einzelnen Server ausgelegt.
 - Kein Fortsetzen: Restdateien in der `pendingbox` bearbeitet die Benutzer:in vor dem nächsten Start von Hand.
-- Nach einem Absturz, wenn der Endzustand nicht geschrieben werden konnte, oder wenn Cloud-API 1 beim Start in ein
-  Timeout lief, den BatchgenAuftrag aber angelegt hat, bleibt dieser `RUNNING` und muss manuell korrigiert werden.
+- Nach einem Absturz, wenn der Endzustand nicht geschrieben werden konnte, oder wenn Cloud-API 1 beim Start ein
+  unklares Ergebnis lieferte (z. B. Timeout), den BatchgenAuftrag aber angelegt hat, bleibt dieser `RUNNING` und muss
+  manuell korrigiert werden.

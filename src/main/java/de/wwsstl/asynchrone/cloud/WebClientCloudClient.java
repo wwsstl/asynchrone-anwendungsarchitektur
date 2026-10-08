@@ -62,6 +62,7 @@ public class WebClientCloudClient implements CloudClient {
                 .bodyToMono(CreateJobResponse.class)
                 .timeout(config.submitTimeout())
                 .map(response -> Objects.requireNonNull(response.jobId(), "Cloud-API 1 lieferte keine jobId"))
+                .onErrorMap(error -> new SubmitFailedException(classify(error), error))
                 .toFuture();
     }
 
@@ -130,9 +131,9 @@ public class WebClientCloudClient implements CloudClient {
     }
 
     /**
-     * Eindeutig nicht verarbeitet ist ein Batch nur, wenn die Verbindung gar nicht zustande kam oder Cloud-API 1 die
-     * Anfrage abgelehnt hat (4xx, 503). In allen anderen Fällen (Timeout, abgebrochene Verbindung, sonstige 5xx,
-     * unlesbare Antwort) kann Cloud-API 1 den Batch bereits verarbeitet haben.
+     * Eindeutig nicht verarbeitet ist eine Anfrage an Cloud-API 1 nur, wenn die Verbindung gar nicht zustande kam oder
+     * Cloud-API 1 sie abgelehnt hat (4xx, 503). In allen anderen Fällen (Timeout, abgebrochene Verbindung, sonstige
+     * 5xx, unlesbare Antwort) kann Cloud-API 1 den BatchgenAuftrag bzw. den Batch bereits angelegt haben.
      */
     static SubmitFailedException.Kind classify(Throwable error) {
         if (error instanceof WebClientResponseException response) {

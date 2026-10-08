@@ -98,6 +98,26 @@ class PipelineIntegrationTest extends PipelineTestSupport {
         assertThat(api.names("down", "pendingbox")).isEmpty();
     }
 
+    @Test
+    void startIsRejectedWithTimeoutWhenCreateJobDoesNotAnswer() {
+        api.dropFiles("nojob", 2, "ok");
+        // Cloud-API 1 legt den BatchgenAuftrag an, antwortet aber erst nach dem Timeout des Clients (1 s).
+        cloud.delayJobCreationFor("nojob", Duration.ofSeconds(2));
+
+        PipelineApi.Response response = api.startResponse("nojob");
+
+        assertThat(response.status()).isEqualTo(504);
+        assertThat(response.code()).isEqualTo("TIMEOUT");
+        assertThat(response.body().get("detail")).isEqualTo(
+                "Cloud-API 1 (BatchgenAuftrag anlegen): Ergebnis unklar, keine Antwort innerhalb von submit-timeout");
+        // Es wird nichts weiter unternommen: keine Sandbox, die Dateien bleiben in der inbox. Der BatchgenAuftrag, den
+        // die Cloud trotzdem angelegt hat, bleibt RUNNING und muss manuell korrigiert werden.
+        assertThat(api.names("nojob", "inbox")).hasSize(2);
+        assertThat(api.names("nojob", "pendingbox")).isEmpty();
+        assertThat(cloud.jobsOf("nojob")).hasSize(1)
+                .allSatisfy(jobId -> assertThat(cloud.jobStatus(jobId)).isEqualTo(JobStatus.RUNNING));
+    }
+
     // --- 2. Producer: Fehler von Cloud-API 1 -----------------------------------------------------------------
 
     @Test
@@ -115,21 +135,53 @@ class PipelineIntegrationTest extends PipelineTestSupport {
     }
 
     @Test
-    void filesWithUnclearSubmitResultStayInPendingboxWithoutMarker() {
-        api.dropFiles("unclear", 2, "ok");
-        // Cloud-API 1 verarbeitet den Batch, antwortet aber erst nach dem Timeout des Clients (1 s).
-        cloud.nextSubmitsFor("unclear", new SubmitBehavior.Delay(Duration.ofSeconds(2)));
+    void unclearSubmitResultEndsTaskWithTimeoutAndSubmitsNothingMore() {
+        api.dropFiles("unclear", 10, "SLOW");
+        // Der erste Batch wird normal verarbeitet; auf den zweiten antwortet Cloud-API 1 mit 500 (Ergebnis unklar).
+        cloud.nextSubmitsFor("unclear", new SubmitBehavior.Delay(Duration.ZERO), new SubmitBehavior.Respond(500));
 
         String taskNumber = api.start("unclear").taskNumber();
-        TaskStatus status = awaitEnd("unclear", taskNumber, JobStatus.COMPLETED);
+        awaitPending("unclear", taskNumber, 4);
+        List<String> firstBatch = submittedBy("unclear");
+        // Zwei Dateien des ersten Batches erhalten ihr Ergebnis; der Pool sinkt auf pool-resume-threshold, der zweite
+        // Batch folgt.
+        cloud.release(firstBatch.subList(0, 2));
+        TaskStatus status = awaitEnd("unclear", taskNumber, JobStatus.TIMEOUT);
 
-        // Die Datensätze gibt es in der Cloud, die Anwendung kennt ihre TaskIds aber nicht und übermittelt nicht erneut.
-        assertThat(status.cloud()).isEqualTo(new TaskStatus.Cloud(JobStatus.COMPLETED, 0, 0, 2));
-        assertThat(submittedBy("unclear")).hasSize(2).doesNotHaveDuplicates();
-        assertThat(api.names("unclear", "pendingbox")).containsExactly("unclear-0.json", "unclear-1.json");
-        assertThat(api.markers("unclear")).isEmpty();
+        assertThat(status.cloud()).isEqualTo(new TaskStatus.Cloud(JobStatus.TIMEOUT, 2, 0, 2));
+        assertThat(api.names("unclear", "donebox")).containsExactlyInAnyOrderElementsOf(firstBatch.subList(0, 2));
+        // Die Aufgabe endet sofort: Die offenen Dateien des ersten Batches behalten ihren Marker, der zweite Batch liegt
+        // ohne Marker in der pendingbox, und ein dritter Batch wird nicht mehr gelesen.
+        assertThat(api.markers("unclear")).containsExactlyInAnyOrderElementsOf(firstBatch.subList(2, 4));
+        assertThat(api.names("unclear", "pendingbox")).hasSize(6);
+        assertThat(api.names("unclear", "inbox")).hasSize(2);
+        assertThat(submittedBy("unclear")).isEqualTo(firstBatch);
 
         PipelineApi.Response next = api.startResponse("unclear");
+        assertThat(next.status()).isEqualTo(409);
+        assertThat(next.code()).isEqualTo("PENDINGBOX_NOT_EMPTY");
+    }
+
+    @Test
+    void submitWithoutResponseEndsTaskWithTimeoutAndSubmitsNothingMore() {
+        api.dropFiles("noanswer", 6, "ok");
+        // Cloud-API 1 verarbeitet den ersten Batch, antwortet aber erst nach dem Timeout des Clients (1 s).
+        cloud.nextSubmitsFor("noanswer", new SubmitBehavior.Delay(Duration.ofSeconds(2)));
+
+        String taskNumber = api.start("noanswer").taskNumber();
+        TaskStatus status = awaitEnd("noanswer", taskNumber, JobStatus.TIMEOUT);
+
+        // Die Datensätze gibt es in der Cloud, die Anwendung kennt ihre TaskIds aber nicht und übermittelt nicht erneut.
+        assertThat(status.cloud()).isEqualTo(new TaskStatus.Cloud(JobStatus.TIMEOUT, 0, 0, 4));
+        assertThat(submittedBy("noanswer")).hasSize(4).doesNotHaveDuplicates();
+        assertThat(api.names("noanswer", "pendingbox")).containsExactlyInAnyOrderElementsOf(submittedBy("noanswer"));
+        assertThat(api.markers("noanswer")).isEmpty();
+        // Der zweite Batch wird nicht mehr gelesen.
+        assertThat(api.names("noanswer", "inbox")).hasSize(2);
+        assertThat(api.names("noanswer", "donebox")).isEmpty();
+        assertThat(api.names("noanswer", "errorbox")).isEmpty();
+
+        PipelineApi.Response next = api.startResponse("noanswer");
         assertThat(next.status()).isEqualTo(409);
         assertThat(next.code()).isEqualTo("PENDINGBOX_NOT_EMPTY");
     }

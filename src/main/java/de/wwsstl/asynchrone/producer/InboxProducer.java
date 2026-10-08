@@ -22,6 +22,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import de.wwsstl.asynchrone.cloud.CloudClient;
+import de.wwsstl.asynchrone.cloud.CloudErrors;
 import de.wwsstl.asynchrone.cloud.SubmitFailedException;
 import de.wwsstl.asynchrone.cloud.SubmittedFile;
 import de.wwsstl.asynchrone.cloud.TaskId;
@@ -44,8 +45,9 @@ import de.wwsstl.asynchrone.task.TaskState;
  *   <li>warten, bis der Status-Pool auf {@code pool-resume-threshold} gesunken ist (Rückstau).</li>
  * </ol>
  * Schlägt der Aufruf fehl, entscheidet die Art des Fehlers: Eindeutig nicht verarbeitete Dateien wandern zurück in die
- * {@code inbox} und werden nach einer Wartezeit erneut übermittelt; bei unklarem Ergebnis bleiben sie ohne Marker in
- * der {@code pendingbox}.
+ * {@code inbox} und werden nach einer Wartezeit erneut übermittelt. Bei unklarem Ergebnis (z. B. keine Antwort
+ * innerhalb von {@code submit-timeout}) bleiben sie ohne Marker in der {@code pendingbox}, und die Aufgabe endet
+ * sofort mit {@code TIMEOUT}; es wird kein weiterer Batch übermittelt.
  *
  * <p>Der Producer ist fertig, sobald die {@code inbox} leer ist oder das Abbruchsignal gesetzt wird.
  */
@@ -55,6 +57,8 @@ public final class InboxProducer implements Runnable {
 
     /** Puffer, damit der Timeout des Clients (der eigentliche Grenzwert) vor dem Timeout des Futures greift. */
     private static final Duration RESULT_GRACE = Duration.ofSeconds(5);
+
+    private static final String SUBMIT = "Cloud-API 1 (Batch übermitteln)";
 
     private enum Outcome { SUBMITTED, NOT_PROCESSED, UNCLEAR }
 
@@ -84,7 +88,7 @@ public final class InboxProducer implements Runnable {
             produce();
         } catch (Throwable t) {
             log.error("[{}] Producer von Aufgabe {} ist fehlgeschlagen", context.userId(), context.taskNumber(), t);
-            context.finish(TaskState.ABORTED);
+            context.finish(TaskState.ABORTED, "Producer fehlgeschlagen: " + t);
         } finally {
             context.producerFinished();
             log.info("[{}] Producer von Aufgabe {} beendet", context.userId(), context.taskNumber());
@@ -103,7 +107,11 @@ public final class InboxProducer implements Runnable {
             if (batch.isEmpty()) {
                 continue;
             }
-            if (submit(batch) == Outcome.NOT_PROCESSED) {
+            Outcome outcome = submit(batch);
+            if (outcome == Outcome.UNCLEAR) {
+                return;
+            }
+            if (outcome == Outcome.NOT_PROCESSED) {
                 failedAttempts++;
                 context.awaitStop(retryWait(failedAttempts));
                 continue;
@@ -157,17 +165,13 @@ public final class InboxProducer implements Runnable {
                 returnToInbox(filesByName.values(), failure);
                 return Outcome.NOT_PROCESSED;
             }
-            leaveUnclear(filesByName.size(), e.getCause());
-            return Outcome.UNCLEAR;
+            return leaveUnclear(filesByName.size(), TaskState.TIMEOUT, unclearReason(e.getCause()));
         } catch (TimeoutException e) {
             call.cancel(true);
-            leaveUnclear(filesByName.size(), e);
-            return Outcome.UNCLEAR;
+            return leaveUnclear(filesByName.size(), TaskState.TIMEOUT, unclearReason(e));
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
-            leaveUnclear(filesByName.size(), e);
-            context.finish(TaskState.ABORTED);
-            return Outcome.UNCLEAR;
+            return leaveUnclear(filesByName.size(), TaskState.ABORTED, "beim Warten auf " + SUBMIT + " unterbrochen");
         }
 
         Map<String, TaskId> taskIds = new HashMap<>();
@@ -219,11 +223,22 @@ public final class InboxProducer implements Runnable {
                 context.userId(), context.taskNumber(), returned, failure.getCause().toString());
     }
 
-    /** Ergebnis unklar: Die Dateien bleiben ohne Marker in der pendingbox und werden nicht erneut übermittelt. */
-    private void leaveUnclear(int files, Throwable cause) {
+    /**
+     * Ergebnis unklar: Die Dateien bleiben ohne Marker in der pendingbox und werden nicht erneut übermittelt. Darüber
+     * hinaus geschieht nichts mehr: Die Aufgabe endet sofort mit {@code endState} (TIMEOUT, beim Beenden der Anwendung
+     * ABORTED), und es wird kein weiterer Batch übermittelt.
+     */
+    private Outcome leaveUnclear(int files, TaskState endState, String reason) {
         context.recordUnclear(files);
-        log.warn("[{}] Aufgabe {}: Ergebnis der Übermittlung unklar, {} Dateien bleiben ohne Marker in der pendingbox: {}",
-                context.userId(), context.taskNumber(), files, String.valueOf(cause));
+        context.finish(endState, reason);
+        log.warn("[{}] Aufgabe {} endet mit {} ({}); {} Dateien bleiben ohne Marker in der pendingbox",
+                context.userId(), context.taskNumber(), context.state(), context.reason(), files);
+        return Outcome.UNCLEAR;
+    }
+
+    /** Grund des Endzustands nach einem unklaren Ergebnis: der Aufruf und seine Ursache. */
+    private static String unclearReason(Throwable cause) {
+        return SUBMIT + ": Ergebnis unklar, " + CloudErrors.describe(cause, "submit-timeout");
     }
 
     /** Datei in die errorbox verschieben und als Fehler zählen. */
