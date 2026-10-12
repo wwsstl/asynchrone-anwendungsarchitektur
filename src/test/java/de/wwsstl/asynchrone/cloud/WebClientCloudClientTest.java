@@ -37,13 +37,29 @@ class WebClientCloudClientTest {
     }
 
     @Test
-    void submitReturnsTaskIdsOfConvertedFilesOnly() throws Exception {
+    void submitReturnsTaskIdOrFehlermeldungPerFile() throws Exception {
         String jobId = get(client.createBatchJob("conv"));
 
         List<SubmittedFile> submitted = get(client.submit(jobId,
-                List.of(item("a.json", "ok"), item("b.json", "REJECT"))));
+                List.of(item("a.json", "ok"), item("b.json", "REJECT"), item("c.json", "OMIT"))));
 
-        assertThat(submitted).extracting(SubmittedFile::fileName).containsExactly("a.json");
+        // Umgewandelt: TaskId; abgelehnt: leere TaskId und Fehlermeldung; ganz weggelassen: kein Eintrag.
+        assertThat(submitted).hasSize(2);
+        assertThat(submitted.get(0).fileName()).isEqualTo("a.json");
+        assertThat(submitted.get(0).converted()).isTrue();
+        assertThat(submitted.get(1))
+                .isEqualTo(new SubmittedFile("b.json", null, FakeCloud.REJECT_MESSAGE));
+    }
+
+    @Test
+    void statusQueryReturnsFehlermeldungOfError() throws Exception {
+        String jobId = get(client.createBatchJob("failing"));
+        TaskId taskId = get(client.submit(jobId, List.of(item("fail.json", "FAIL")))).getFirst().taskId();
+
+        get(client.queryStatus(List.of(taskId)));
+
+        assertThat(get(client.queryStatus(List.of(taskId))))
+                .containsExactly(new RecordStatusResult(taskId, RecordStatus.ERROR, FakeCloud.FAIL_MESSAGE));
     }
 
     @Test
@@ -63,9 +79,9 @@ class WebClientCloudClientTest {
         TaskId taskId = get(client.submit(jobId, List.of(item("a.json", "ok")))).getFirst().taskId();
 
         assertThat(get(client.queryStatus(List.of(taskId))))
-                .containsExactly(new RecordStatusResult(taskId, RecordStatus.PENDING));
+                .containsExactly(new RecordStatusResult(taskId, RecordStatus.PENDING, ""));
         assertThat(get(client.queryStatus(List.of(taskId))))
-                .containsExactly(new RecordStatusResult(taskId, RecordStatus.SUCCESS));
+                .containsExactly(new RecordStatusResult(taskId, RecordStatus.SUCCESS, ""));
 
         get(client.setJobStatus(jobId, JobStatus.COMPLETED));
 

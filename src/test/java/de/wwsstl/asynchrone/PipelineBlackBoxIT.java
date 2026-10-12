@@ -103,12 +103,14 @@ class PipelineBlackBoxIT {
 
         cloud.decide(taskIds.get("bbdone-a.json"), "SUCCESS");
         cloud.decide(taskIds.get("bbdone-b.json"), "SUCCESS");
-        cloud.decide(taskIds.get("bbdone-c.json"), "ERROR");
+        cloud.decide(taskIds.get("bbdone-c.json"), "ERROR", "Datenbank nicht erreichbar");
 
         assertThat(awaitEnd("bbdone", taskNumber, JobStatus.COMPLETED).cloud())
                 .isEqualTo(new TaskStatus.Cloud(JobStatus.COMPLETED, 2, 1, 0));
         assertThat(api.names("bbdone", "donebox")).containsExactly("bbdone-a.json", "bbdone-b.json");
         assertThat(api.names("bbdone", "errorbox")).containsExactly("bbdone-c.json");
+        assertThat(api.errorReason("bbdone", "bbdone-c.json"))
+                .contains("ERROR für TaskId " + taskIds.get("bbdone-c.json") + ": Datenbank nicht erreichbar");
         assertThat(api.names("bbdone", "pendingbox")).isEmpty();
         assertThat(api.markers("bbdone")).isEmpty();
     }
@@ -125,6 +127,8 @@ class PipelineBlackBoxIT {
                 .isEqualTo(new TaskStatus.Cloud(JobStatus.COMPLETED, 1, 0, 0));
         assertThat(api.names("bbreject", "donebox")).containsExactly("bbreject-0.json");
         assertThat(api.names("bbreject", "errorbox")).containsExactly("bbreject-1.json");
+        assertThat(api.errorReason("bbreject", "bbreject-1.json"))
+                .contains("nicht umgewandelt: nicht umgewandelt (vorgegeben mit /tasks/reject)");
     }
 
     @Test

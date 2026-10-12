@@ -355,6 +355,7 @@ Consumer 在一轮 `sweep` 之后判断 `isProducerFinished() && pool.isEmpty()`
 | `pendingbox/x`，没有 `.taskids/x` | 已经移出 inbox，提交结果未知（正在提交，或者结果不明） |
 | `pendingbox/x` 加上 `.taskids/x`（内容为 TaskId） | 已提交，云端有记录，等结果 |
 | `donebox/x` / `errorbox/x` | 已有结果 |
+| `errorbox/.fehler/x.txt` | `errorbox/x` 为什么失败：任务号和原因（例如云端的 `fehlermeldung`） |
 
 关键顺序和理由：
 
@@ -1012,7 +1013,7 @@ flowchart TD
 
 - **做什么**：提交一批文件，并按应答处理每个文件。
 - **怎么做**：
-  1. **读文件并转换成 JSON**：逐个调用 `readJson`。读不了的（例如没有权限）、不是合法 JSON 的、空文件，直接调用 `fail` 移进 errorbox 并计一次错误；转换成功的放进 `items` 列表，并在 `filesByName` 里记下"文件名 → 路径"（用 `LinkedHashMap`，保持批次里的顺序）。
+  1. **读文件并转换成 JSON**：逐个调用 `readJson`。读不了的（例如没有权限）、不是合法 JSON 的、空文件，直接调用 `fail` 移进 errorbox（原因是 JSON 解析器给出的错误）并计一次错误；转换成功的放进 `items` 列表，并在 `filesByName` 里记下"文件名 → 路径"（用 `LinkedHashMap`，保持批次里的顺序）。
   2. 一个都没转换成功，就返回 `SUBMITTED`，不调用云端。
   3. **调用** `cloud.submit(任务号, items)`，最多等 `submit-timeout` + 5 秒。
   4. **处理失败**：
@@ -1020,12 +1021,16 @@ flowchart TD
      - 其他失败（结果不明）：`leaveUnclear(…, TIMEOUT, 原因)`。
      - 外层等待超时：取消调用，同样 `leaveUnclear(…, TIMEOUT, …)`。
      - 等待时被中断：`leaveUnclear(…, ABORTED, …)`。
-  5. **处理成功的应答**：应答里列出了成功转换的文件及其 TaskId。对批次中的每个文件：应答里有，就调用 `track`；应答里没有，说明云端没转换，调用 `fail`。
+  5. **处理成功的应答**：应答里每个文件一个条目：转换成功的带 TaskId；没转换的 TaskId 为空，`fehlermeldung` 写着原因。先按文件名把条目放进一个映射，然后对批次中的每个文件：
+     - 有条目并且有 TaskId（`converted()`）：调用 `track`。
+     - 有条目但 TaskId 为空：调用 `fail`，原因是"Cloud-API 1 (Batch übermitteln) hat die Datei nicht umgewandelt: "加上云端的 `fehlermeldung`。
+     - 应答里根本没有这个文件：同样调用 `fail`，原因的后半句是"keine Fehlermeldung der Cloud"（由 `CloudErrors.fehlermeldung` 补上）。
   6. 记一条日志："N 个文件提交，M 个转换，K 个未转换"，返回 `SUBMITTED`。
 - **为什么一批只调用一次**：减少网络往返；云端的接口本身就是按批设计的。
-- **为什么按文件名匹配应答**：应答只告诉我们哪些文件名拿到了 TaskId，`filesByName` 用来从文件名找回 pendingbox 里的路径。
+- **为什么按文件名匹配应答**：应答按文件名告诉我们每个文件的结果，`filesByName` 用来从文件名找回 pendingbox 里的路径。
+- **为什么"应答里没有"也算未转换**：云端约定是每个文件都列出来，但万一漏了，这个文件既没有 TaskId 也查不了状态。当作未转换放进 errorbox，并在原因里写明"云端没有给出错误信息"，比让它悄悄留在 pendingbox 更清楚。
 - **为什么在本地就把非法 JSON 挡下来**：这样的文件云端也处理不了，提交上去只会得到一个"未转换"，还白白占一次调用。在本地拦下来，原因也更清楚（日志里能看到解析错误发生在哪一行、哪个字符）。
-- **例子**：一批 4 个文件 `a`、`b`、`c`、`d`，应答为 `[{a, t1}, {b, t2}, {d, t4}]`。结果：`a`、`b`、`d` 写标记、进 Pool；`c` 进 errorbox，错误数加一。
+- **例子**：一批 4 个文件 `a`、`b`、`c`、`d`，应答为 `[{a, t1, ""}, {b, t2, ""}, {c, "", "Pflichtfeld 'name' fehlt"}]`，`d` 没有出现。结果：`a`、`b` 写标记、进 Pool；`c` 进 errorbox，原因是"…nicht umgewandelt: Pflichtfeld 'name' fehlt"；`d` 也进 errorbox，原因是"…nicht umgewandelt: keine Fehlermeldung der Cloud"；错误数加二。
 
 ##### `readJson(file)`
 
@@ -1077,10 +1082,22 @@ flowchart TD
 - **做什么**：生成结果不明时的原因文字："Cloud-API 1 (Batch übermitteln): Ergebnis unklar, " 加上 `CloudErrors.describe` 给出的具体原因。
 - **例子**：`… keine Antwort innerhalb von submit-timeout`，或 `… 500 Internal Server Error from POST http://localhost:8081/tasks`。
 
-##### `fail(file)`
+##### `fail(file, reason)`
 
-- **做什么**：把文件移进 errorbox，错误数加一。移动失败只记日志，错误照样计入。
-- **用于**：无法读取的文件、云端没有转换的文件。
+- **做什么**：把文件连同原因放进 errorbox，错误数加一。
+- **怎么做**：
+  1. 记一条警告日志："<文件> kommt in die errorbox: <原因>"。
+  2. `folders.moveToError(file)` 移进 errorbox，得到它在 errorbox 里的路径（重名时可能带了随机后缀）。
+  3. `writeErrorReason`：把原因写进 `errorbox/.fehler/<文件名>.txt`。
+  4. 错误数加一。移动失败只记 error 日志，错误照样计入。
+- **用于**：无法读取或不是合法 JSON 的文件、云端没有转换的文件。
+- **为什么原因要写成文件，而不只是写日志**：用户处理 errorbox 时看的是目录，不是服务器日志。原因就放在文件旁边，打开就知道为什么失败、该怎么改。
+- **为什么用移动后的路径来命名原因文件**：如果 errorbox 里已经有同名文件，移进去的文件会带上后缀（例如 `a-1f3c9a2b.json`），原因文件也要对应 `a-1f3c9a2b.json.txt`，否则会对错文件或者覆盖上一次的原因。
+
+##### `writeErrorReason(errorFile, reason)`
+
+- **做什么**：调用 `folders.writeErrorReason` 写原因文件；写失败只记 error 日志。
+- **为什么写失败不影响别的**：文件已经在 errorbox 里了，错误也计数了；原因至少还在日志里。为了一个说明文件中止任务不值得。
 
 ##### `awaitPoolBelowThreshold()`
 
@@ -1159,26 +1176,31 @@ flowchart TD
 - **做什么**：对一块 TaskId 调用一次 Cloud-API 2，并按结果处理每个文件。
 - **怎么做**：
   1. 调用 `cloud.queryStatus`，最多等 `status-timeout` × (`retries` + 1) + 5 秒。
-  2. 成功：把结果放进 `TaskId → 状态` 的映射，清空 `lastQueryFailure`。
+  2. 成功：把结果放进 `TaskId → 结果` 的映射（结果包含状态和 `fehlermeldung`），清空 `lastQueryFailure`。
   3. 失败：取消调用，用 `CloudErrors.describe` 记下原因到 `lastQueryFailure`，记警告日志，然后**照常往下走**，这时映射是空的。
   4. 等待时被中断：以 `ABORTED` 结束，直接返回。
   5. 对块里的每个条目：
-     - `SUCCESS` → `settle(成功)`
-     - `ERROR` → `settle(失败)`
+     - `SUCCESS` → `settle(entry, null)`
+     - `ERROR` → `settle(entry, 原因)`，原因是"Cloud-API 2 (Statusabfrage) meldet ERROR für TaskId <TaskId>: "加上云端的 `fehlermeldung`（为空时是"keine Fehlermeldung der Cloud"）
      - `PENDING`、应答里缺少这个 TaskId、或者查询失败 → `reschedule(现在 + poll-interval)`
 - **为什么查询失败时也走第 5 步**：映射为空，所有条目都按 `PENDING` 处理，也就是过 `poll-interval` 再查。Cloud-API 2 只读不写，再查一次没有任何副作用。
 - **为什么缺少的 TaskId 当作 `PENDING`**：云端没回答，不代表成功，也不代表失败。当作"还没结果"最保守，不会把文件放错地方。
 - **例子**：查询 `t1`、`t2`、`t3`，应答为 `t1 = SUCCESS`、`t2 = PENDING`，`t3` 缺失。结果：`t1` 对应的文件进 donebox；`t2`、`t3` 5 秒后再查。
 
-##### `settle(entry, success)`
+##### `settle(entry, errorReason)`
 
-- **做什么**：处理一个有结果的文件。
+- **做什么**：处理一个有结果的文件。`errorReason` 为 `null` 表示 `SUCCESS`，否则就是 `ERROR` 的原因。
 - **怎么做**：
-  1. 成功就 `moveToDone`，失败就 `moveToError`（`UserFolders` 会在移动后删除标记）。
+  1. 成功就 `moveToDone`。失败就记一条警告日志，`moveToError`，再用 `writeErrorReason` 把原因写进 `errorbox/.fehler/<文件名>.txt`（`UserFolders` 会在移动后删除标记）。
   2. 无论移动是否成功，都从 Pool 移除。
   3. 计数：成功且移动成功，"成功"计数加一；其他情况（`ERROR`，或者移动失败），错误计数加一。
 - **为什么移动失败也从 Pool 移除**：结果已经知道了，继续留在 Pool 里只会被一遍遍重复查询。文件带着标记留在 pendingbox，人工处理时能查到结果。
 - **为什么移动失败算错误**：文件没能到达它应该在的地方，对用户来说就是没处理成功。
+- **为什么原因里带 TaskId**：用户拿着 TaskId 可以直接去云端查这条记录的详细情况。
+
+##### `writeErrorReason(errorFile, reason)`
+
+- **做什么**：和 Producer 里的同名方法一样：写原因文件，写失败只记日志。
 
 ---
 
@@ -1270,14 +1292,14 @@ flowchart TD
 
 ##### `submit(jobId, items)`
 
-- **做什么**：提交一批文件，返回成功转换的文件及其 TaskId。
-- **步骤**：和 `createBatchJob` 类似，请求是 `POST /tasks`，请求体为 `{"jobId", "items":[{"fileName","content"}]}`。`content` 是文件内容转换成的 JSON 值，Jackson 原样写进请求，例如 `{"fileName":"a.json","content":{"name":"Beispiel"}}`，而不是一个转义过的字符串。拿到应答后，只保留文件名和 TaskId 都不为空的条目，转换成 `SubmittedFile` 列表。应答里根本没有 `tasks` 字段时返回空列表，相当于"全部未转换"。错误同样包装成带分类的 `SubmitFailedException`。
-- **为什么过滤不完整的条目**：一个没有 TaskId 的条目没法用来查询，把它当作"未转换"处理（进 errorbox）最清楚。
+- **做什么**：提交一批文件，返回应答里每个文件的结果：转换成功的带 TaskId，没转换的带 `fehlermeldung`。
+- **步骤**：和 `createBatchJob` 类似，请求是 `POST /tasks`，请求体为 `{"jobId", "items":[{"fileName","content"}]}`。`content` 是文件内容转换成的 JSON 值，Jackson 原样写进请求，例如 `{"fileName":"a.json","content":{"name":"Beispiel"}}`，而不是一个转义过的字符串。拿到应答后，把每个有文件名的条目转换成 `SubmittedFile(文件名, TaskId, fehlermeldung)`；TaskId 为空或缺失时记为 `null`（由 `taskIdOrNull` 处理），表示未转换。应答里根本没有 `tasks` 字段时返回空列表，相当于"全部未转换"。错误同样包装成带分类的 `SubmitFailedException`。
+- **为什么不再丢掉没有 TaskId 的条目**：这些条目正是"未转换"的文件，`fehlermeldung` 里有云端给出的原因。保留下来，Producer 才能把原因写进 errorbox。只有连文件名都没有的条目会被丢掉，因为没法对应到文件。
 
 ##### `queryStatus(taskIds)`
 
 - **做什么**：批量查询状态。
-- **步骤**：`POST /tasks/status`，请求体为 `{"taskIds":[…]}`；每次尝试最多 `status-timeout`；用 `withRetry` 包装，遇到临时性错误自动重试；最后把应答里完整的条目转换成 `RecordStatusResult` 列表。
+- **步骤**：`POST /tasks/status`，请求体为 `{"taskIds":[…]}`；每次尝试最多 `status-timeout`；用 `withRetry` 包装，遇到临时性错误自动重试；最后把应答里完整的条目（有非空 TaskId 和状态）转换成 `RecordStatusResult(TaskId, 状态, fehlermeldung)` 列表。
 - **为什么超时设置在重试之前**：这样每一次尝试都有自己的 `status-timeout`，而不是所有尝试共用一个。
 
 ##### `setJobStatus(jobId, status)`
@@ -1288,6 +1310,11 @@ flowchart TD
 
 - **做什么**：读 BatchgenAuftrag：`GET /jobs/{jobId}`。带超时和重试，成功时转换成 `BatchJob`。
 - **云端返回 `404` 时**：转换成空的 `Optional`，表示"没有这个任务"。这是正常情况（例如任务号是用户随便输的），不是错误。`404` 不是临时性错误，不会被重试。
+
+##### `taskIdOrNull(taskId)`
+
+- **做什么**：把应答里的 TaskId 字符串转换成 `TaskId`；为空或缺失时返回 `null`，表示"没有建记录"。
+- **为什么**：`TaskId` 的构造器会拒绝空值。云端用空字符串表示"未转换"，必须在构造之前先判断，否则一个空 TaskId 会让整个应答解析失败。
 
 ##### `toBatchJob(response)`
 
@@ -1329,7 +1356,7 @@ flowchart TD
 
 ##### 内部 record（`CreateJobRequest`、`CreateJobResponse`、`SubmitRequest`、`SubmitResponse`、`SubmitEntry`、`StatusRequest`、`StatusResponse`、`StatusEntry`、`JobStatusRequest`、`JobResponse`）
 
-- **作用**：和云端接口的 JSON 结构一一对应，由 Jackson 自动转换。
+- **作用**：和云端接口的 JSON 结构一一对应，由 Jackson 自动转换。`SubmitEntry` 和 `StatusEntry` 带有 `fehlermeldung` 字段；应答里多出的其他字段会被忽略（Jackson 3 默认如此）。
 - **为什么放在类内部、不公开**：它们只是传输格式的细节。云端格式变了，只需要改这个类，其他代码用的都是 `SubmittedFile`、`BatchJob` 这些稳定的类型。
 
 #### 数据类型
@@ -1338,9 +1365,9 @@ flowchart TD
 |---|---|---|
 | `TaskId` | 子表记录的编号（运单号） | 构造时拒绝空值，不会出现"空运单号"；`toString()` 返回编号本身，日志里显示 `t-123` 而不是 `TaskId[value=t-123]` |
 | `TestdataItem(fileName, content)` | 要提交的一个文件 | `content` 是 `JsonNode`：文件内容转换成的 JSON。用 `JsonNode` 而不是 `String`，Jackson 才会把它作为 JSON 值写进请求，而不是转义成字符串 |
-| `SubmittedFile(fileName, taskId)` | Cloud-API 1 对一个成功转换文件的应答 | |
+| `SubmittedFile(fileName, taskId, fehlermeldung)` | Cloud-API 1 对一个文件的应答 | `taskId` 为 `null` 表示未转换，这时 `fehlermeldung` 是云端给的原因；`converted()` 判断是否转换成功 |
 | `RecordStatus` | `SUCCESS`、`ERROR`、`PENDING` | 记录的状态，由云端自己更新 |
-| `RecordStatusResult(taskId, status)` | Cloud-API 2 对一个 TaskId 的应答 | |
+| `RecordStatusResult(taskId, status, fehlermeldung)` | Cloud-API 2 对一个 TaskId 的应答 | `fehlermeldung` 是 `ERROR` 的原因，其他状态下为空 |
 | `JobStatus` | `RUNNING`、`COMPLETED`、`TIMEOUT`、`ERROR`、`TERMINATED` | BatchgenAuftrag 的状态；云端新建时是 `RUNNING`，结束状态由本应用写入 |
 | `BatchJob(jobId, userId, status, success, error, pending)` | 从 Cloud-API 3 读到的 BatchgenAuftrag | |
 
@@ -1365,6 +1392,11 @@ flowchart TD
 - **何时**：启动时新建 BatchgenAuftrag 的结果不明。
 - **对应**：`504 TIMEOUT`，消息就是原因。
 - **为什么不复用 `CloudUnavailableException`**：两者的含义不同。"不可用"说明可以放心重试；"结果不明"说明云端可能已经建了任务，需要人工核对。不同的异常对应不同的 HTTP 状态和 `code`。
+
+##### `CloudErrors.fehlermeldung(fehlermeldung)`
+
+- **做什么**：把云端的 `fehlermeldung` 整理成原因文字：去掉首尾空格；为空或缺失时返回"keine Fehlermeldung der Cloud"。
+- **为什么**：原因文件和日志里不能出现一个空的"原因："，用户会以为程序出错了。明确写"云端没有给出错误信息"，用户就知道该去问云端。
 
 ##### `CloudErrors.describe(error, timeoutProperty)`
 
@@ -1415,6 +1447,7 @@ flowchart TD
 │   └── .taskids/ 每个文件一个标记，内容是 TaskId
 ├── donebox/      成功
 └── errorbox/     失败
+    └── .fehler/  每个失败文件一个原因文件：<文件名>.txt
 ```
 
 ##### `listInbox(max, excluded)`
@@ -1444,7 +1477,23 @@ flowchart TD
 
 ##### `moveToDone(file)` / `moveToError(file)`
 
-- **做什么**：移到 donebox / errorbox，并删除标记。具体由 `settle` 完成。
+- **做什么**：移到 donebox / errorbox，并删除标记。具体由 `settle` 完成。返回文件在目标目录里的新路径（重名时带后缀）。
+
+##### `writeErrorReason(errorFile, taskNumber, reason)`
+
+- **做什么**：为 errorbox 里的一个文件写原因文件 `errorbox/.fehler/<文件名>.txt`，必要时先创建 `.fehler` 目录。
+- **内容**：两行，`Aufgabe: <任务号>` 和 `Grund: <原因>`。例如：
+
+  ```
+  Aufgabe: BJ-1
+  Grund: Cloud-API 1 (Batch übermitteln) hat die Datei nicht umgewandelt: Pflichtfeld 'name' fehlt
+  ```
+- **为什么带任务号**：errorbox 会积累多次任务的失败文件，任务号说明它来自哪一次，也能用来在云端查对应的 BatchgenAuftrag。
+- **为什么放在子目录里，而不是和文件放在一起**：子目录不是"普通文件"，不会被当成 errorbox 的内容，用户把失败文件挪回 inbox 重试时也不会把原因文件一起带过去。这和 pendingbox 里的 `.taskids` 是同样的做法。
+
+##### `errorReasonOf(errorFile)`
+
+- **做什么**：返回某个 errorbox 文件对应的原因文件路径。这个路径不一定存在，只有写过原因才有。
 
 ##### `settle(file, targetDir)`
 
@@ -1520,7 +1569,7 @@ flowchart TD
 
 **最重要的特点：没有任何自动行为。** 新建的任务一直是 `RUNNING`，新建的记录一直是 `PENDING`，状态只有在你通过管理接口修改时才会变。这样你可以一步一步、精确地制造想要的情况：某个文件成功、某个文件失败、下一次提交返回 500 等。黑盒测试 `PipelineBlackBoxIT` 也是这样用它的。
 
-内部数据：`jobs`（任务号 → 任务）、`records`（TaskId → 记录）、`rejectNext`（下次提交时不转换的文件名）、`nextResponses`（下次提交直接返回的 HTTP 状态码队列）。
+内部数据：`jobs`（任务号 → 任务）、`records`（TaskId → 记录，带状态和 `fehlermeldung`）、`rejectNext`（下次提交时不转换的文件名 → 要返回的 `fehlermeldung`）、`nextResponses`（下次提交直接返回的 HTTP 状态码队列）。
 
 ##### 构造器 `FakeCloudBackendApplication(port, jobPath, submitPath, statusPath)`
 
@@ -1564,8 +1613,8 @@ flowchart TD
 - **怎么做**：
   1. 任务号不存在，返回 `400`。
   2. 如果预设了"下次应答"（`next-response`），直接用那个状态码回答，**不处理**这批文件，然后返回。
-  3. 对每个文件：如果在 `rejectNext` 里，就不转换（应答里不包含它），同时把它从 `rejectNext` 里删掉；否则生成一个 UUID 作为 TaskId，新建 `PENDING` 记录。
-  4. 返回所有转换成功的文件及其 TaskId。控制台为每个文件打印一行。
+  3. 对每个文件：如果在 `rejectNext` 里，就不转换：应答条目的 `taskId` 为空，`fehlermeldung` 是预设的原因，同时把它从 `rejectNext` 里删掉。否则生成一个 UUID 作为 TaskId，新建 `PENDING` 记录，`fehlermeldung` 为空。
+  4. 返回每个文件的条目。控制台为每个文件打印一行。
 
 ##### `handleList(exchange)`
 
@@ -1577,23 +1626,24 @@ flowchart TD
 
 ##### `handleStatus(exchange)`
 
-- **做什么**：模拟批量查询（Cloud-API 2）：对请求里的每个 TaskId 返回当前状态，不认识的直接省略。
+- **做什么**：模拟批量查询（Cloud-API 2）：对请求里的每个 TaskId 返回当前状态和 `fehlermeldung`，不认识的直接省略。
 
 ##### `handleAdminStatusChange(exchange, taskId)`
 
-- **做什么**：管理接口 `POST /tasks/{taskId}/status?status=SUCCESS|ERROR|PENDING`：手动设置一条记录的状态。
+- **做什么**：管理接口 `POST /tasks/{taskId}/status?status=SUCCESS|ERROR|PENDING[&fehlermeldung=…]`：手动设置一条记录的状态。设为 `ERROR` 时可以带一个 `fehlermeldung`，Cloud-API 2 之后就会返回它；设为其他状态会清掉之前的 `fehlermeldung`。
 - **例子**：
 
   ```bash
   curl -X POST "http://localhost:8081/tasks/<taskId>/status?status=SUCCESS"
+  curl -X POST "http://localhost:8081/tasks/<taskId>/status?status=ERROR&fehlermeldung=Datenbank%20nicht%20erreichbar"
   ```
 
-  Pipeline 的 Consumer 下次查询时就会看到 `SUCCESS`，把文件移进 donebox。
+  Pipeline 的 Consumer 下次查询时就会看到结果：`SUCCESS` 时把文件移进 donebox；`ERROR` 时移进 errorbox，原因文件里写着"…meldet ERROR für TaskId <TaskId>: Datenbank nicht erreichbar"。
 
 ##### `handleAdminSubmitBehavior(exchange, reject)`
 
 - **做什么**：预设下一次提交时的异常情况：
-  - `POST /tasks/reject?fileName=a.json`：下次提交时不转换 `a.json`，Pipeline 会把它移进 errorbox。
+  - `POST /tasks/reject?fileName=a.json[&fehlermeldung=…]`：下次提交时不转换 `a.json`，应答里它的 `taskId` 为空，`fehlermeldung` 是给定的原因（不给就是"nicht umgewandelt (vorgegeben mit /tasks/reject)"）。Pipeline 会把它移进 errorbox，并把这个原因写进原因文件。
   - `POST /tasks/next-response?status=503`：下次提交直接返回 503，Pipeline 判为明确未处理，文件回到 inbox 并重试。
   - `POST /tasks/next-response?status=500`：下次提交直接返回 500，Pipeline 判为结果不明，任务以 `TIMEOUT` 结束。
 - **校验**：`fileName` 不能为空；`status` 必须是 400–599 之间的状态码。
@@ -1661,7 +1711,7 @@ flowchart TD
 | `PipelineIntegrationTest`、`PipelineTimeoutIntegrationTest` | 集成（完整 Spring 应用对 `FakeCloud`，同一 JVM） | 所有结束状态、API-1 的错误类型、启动被拒的原因、隔离性 |
 | `PipelineBlackBoxIT` | 黑盒（应用 JAR 和 `FakeCloudBackendApplication` 各自独立运行，只通过 HTTP 交互） | 主要流程，作为外部视角的验收 |
 
-测试辅助类：`FakeCloud`（同一 JVM 里的云端替身，行为由文件内容和预设控制，例如 `REJECT`、`FAIL`、`SLOW`、延迟应答）、`FakeBackendClient`（`FakeCloudBackendApplication` 管理接口的客户端）、`PipelineApi`（REST 接口和用户目录的客户端）、`ExternalProcess`（启动外部进程）、`MutableClock`、`TestProperties`、`PipelineTestSupport`（集成测试的公共配置：短间隔、随机端口）。
+测试辅助类：`FakeCloud`（同一 JVM 里的云端替身，行为由文件内容和预设控制，例如 `REJECT`（未转换并带 `fehlermeldung`）、`OMIT`（应答里不出现）、`FAIL`（`ERROR` 并带 `fehlermeldung`）、`SLOW`、延迟应答）、`FakeBackendClient`（`FakeCloudBackendApplication` 管理接口的客户端）、`PipelineApi`（REST 接口和用户目录的客户端）、`ExternalProcess`（启动外部进程）、`MutableClock`、`TestProperties`、`PipelineTestSupport`（集成测试的公共配置：短间隔、随机端口）。
 
 `mvn test` 运行单元、组件和集成测试；`mvn verify` 另外打包 JAR 并运行黑盒测试，两个进程的输出在 `target/it-logs`。
 

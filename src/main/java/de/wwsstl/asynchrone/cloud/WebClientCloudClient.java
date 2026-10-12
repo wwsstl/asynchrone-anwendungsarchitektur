@@ -28,11 +28,13 @@ import reactor.util.retry.Retry;
  * <ul>
  *   <li>Cloud-API 1, BatchgenAuftrag anlegen: {@code POST job-path} mit {@code {"userId"}} → {@code {"jobId"}}</li>
  *   <li>Cloud-API 1, Batch übermitteln: {@code POST submit-path} mit
- *       {@code {"jobId","items":[{"fileName","content"}]}} → {@code {"tasks":[{"fileName","taskId"}]}};
- *       {@code content} ist der Inhalt der Datei als JSON-Wert (keine Zeichenkette); Dateien ohne Eintrag in
- *       {@code tasks} wurden nicht umgewandelt</li>
+ *       {@code {"jobId","items":[{"fileName","content"}]}} → {@code {"tasks":[{"fileName","taskId","fehlermeldung"}]}};
+ *       {@code content} ist der Inhalt der Datei als JSON-Wert (keine Zeichenkette). Eine nicht umgewandelte Datei
+ *       hat eine leere {@code taskId} und in {@code fehlermeldung} den Grund; fehlt sie ganz in {@code tasks}, gilt
+ *       sie ebenfalls als nicht umgewandelt</li>
  *   <li>Cloud-API 2: {@code POST status-path} mit {@code {"taskIds":[…]}} →
- *       {@code {"results":[{"taskId","status":"SUCCESS|ERROR|PENDING"}]}}</li>
+ *       {@code {"results":[{"taskId","status":"SUCCESS|ERROR|PENDING","fehlermeldung"}]}}; {@code fehlermeldung}
+ *       begründet ein {@code ERROR}</li>
  *   <li>Cloud-API 3, Endzustand setzen: {@code PUT job-path/{jobId}/status} mit {@code {"status"}}</li>
  *   <li>Cloud-API 3, BatchgenAuftrag lesen: {@code GET job-path/{jobId}} →
  *       {@code {"jobId","userId","status","counts":{"SUCCESS":n,"ERROR":n,"PENDING":n}}}; {@code 404}, wenn es ihn
@@ -76,8 +78,9 @@ public class WebClientCloudClient implements CloudClient {
                 .bodyToMono(SubmitResponse.class)
                 .timeout(config.submitTimeout())
                 .map(response -> response.tasks() == null ? List.<SubmittedFile>of() : response.tasks().stream()
-                        .filter(entry -> entry.fileName() != null && entry.taskId() != null && !entry.taskId().isBlank())
-                        .map(entry -> new SubmittedFile(entry.fileName(), new TaskId(entry.taskId())))
+                        .filter(entry -> entry.fileName() != null)
+                        .map(entry -> new SubmittedFile(entry.fileName(), taskIdOrNull(entry.taskId()),
+                                entry.fehlermeldung()))
                         .toList())
                 .onErrorMap(error -> new SubmitFailedException(classify(error), error))
                 .toFuture();
@@ -93,10 +96,16 @@ public class WebClientCloudClient implements CloudClient {
                 .timeout(config.statusTimeout());
         return withRetry(call)
                 .map(response -> response.results() == null ? List.<RecordStatusResult>of() : response.results().stream()
-                        .filter(entry -> entry.taskId() != null && entry.status() != null)
-                        .map(entry -> new RecordStatusResult(new TaskId(entry.taskId()), entry.status()))
+                        .filter(entry -> taskIdOrNull(entry.taskId()) != null && entry.status() != null)
+                        .map(entry -> new RecordStatusResult(new TaskId(entry.taskId()), entry.status(),
+                                entry.fehlermeldung()))
                         .toList())
                 .toFuture();
+    }
+
+    /** Eine leere oder fehlende TaskId bedeutet: kein Datensatz angelegt. */
+    private static TaskId taskIdOrNull(String taskId) {
+        return taskId == null || taskId.isBlank() ? null : new TaskId(taskId);
     }
 
     @Override
@@ -188,7 +197,7 @@ public class WebClientCloudClient implements CloudClient {
     record SubmitResponse(List<SubmitEntry> tasks) {
     }
 
-    record SubmitEntry(String fileName, String taskId) {
+    record SubmitEntry(String fileName, String taskId, String fehlermeldung) {
     }
 
     record StatusRequest(List<String> taskIds) {
@@ -197,7 +206,7 @@ public class WebClientCloudClient implements CloudClient {
     record StatusResponse(List<StatusEntry> results) {
     }
 
-    record StatusEntry(String taskId, RecordStatus status) {
+    record StatusEntry(String taskId, RecordStatus status, String fehlermeldung) {
     }
 
     record JobStatusRequest(JobStatus status) {

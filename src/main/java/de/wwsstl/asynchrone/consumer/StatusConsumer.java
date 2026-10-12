@@ -1,6 +1,7 @@
 package de.wwsstl.asynchrone.consumer;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -32,7 +33,8 @@ import de.wwsstl.asynchrone.task.TaskState;
  * fragt er die fälligen TaskIds seines Status-Pools gebündelt bei Cloud-API 2 ab:
  * <ul>
  *   <li>{@code SUCCESS}: Datei in die {@code donebox}, Marker löschen</li>
- *   <li>{@code ERROR}: Datei in die {@code errorbox}, Marker löschen, Fehlerzähler erhöhen</li>
+ *   <li>{@code ERROR}: Datei in die {@code errorbox}, Marker löschen, Fehlermeldung der Cloud als Grund ablegen,
+ *       Fehlerzähler erhöhen</li>
  *   <li>{@code PENDING}: nach {@code poll-interval} erneut prüfen</li>
  * </ul>
  * Schlägt eine Abfrage fehl, behandelt er die TaskIds wie {@code PENDING}; Cloud-API 2 liest nur, eine Wiederholung ist
@@ -134,13 +136,13 @@ public final class StatusConsumer implements Runnable {
 
     /** Eine Anfrage an Cloud-API 2 für alle übergebenen TaskIds dieser Sandbox. */
     private void queryAndRoute(List<PoolEntry> chunk) {
-        Map<TaskId, RecordStatus> statusById = new HashMap<>();
+        Map<TaskId, RecordStatusResult> resultById = new HashMap<>();
         Future<List<RecordStatusResult>> call = cloud.queryStatus(chunk.stream().map(PoolEntry::taskId).toList());
         try {
             Duration timeout = properties.cloud().statusTimeout();
             Duration wait = timeout.multipliedBy(properties.cloud().retries() + 1L).plus(RESULT_GRACE);
             for (RecordStatusResult result : call.get(wait.toMillis(), TimeUnit.MILLISECONDS)) {
-                statusById.put(result.taskId(), result.status());
+                resultById.put(result.taskId(), result);
             }
             lastQueryFailure = null;
         } catch (InterruptedException e) {
@@ -156,21 +158,32 @@ public final class StatusConsumer implements Runnable {
 
         Instant nextCheck = clock.instant().plus(properties.pollInterval());
         for (PoolEntry entry : chunk) {
-            switch (statusById.getOrDefault(entry.taskId(), RecordStatus.PENDING)) {
-                case SUCCESS -> settle(entry, true);
-                case ERROR -> settle(entry, false);
+            RecordStatusResult result = resultById.get(entry.taskId());
+            switch (result == null ? RecordStatus.PENDING : result.status()) {
+                case SUCCESS -> settle(entry, null);
+                case ERROR -> settle(entry, "Cloud-API 2 (Statusabfrage) meldet ERROR für TaskId " + entry.taskId()
+                        + ": " + CloudErrors.fehlermeldung(result.fehlermeldung()));
                 case PENDING -> pool.reschedule(entry.taskId(), nextCheck);
             }
         }
     }
 
-    private void settle(PoolEntry entry, boolean success) {
+    /**
+     * Verschiebt eine Datei mit Ergebnis: ohne Grund ({@code SUCCESS}) in die donebox, mit Grund ({@code ERROR}) in die
+     * errorbox, wo der Grund neben ihr abgelegt wird.
+     *
+     * @param errorReason Grund des Fehlers; {@code null} bei {@code SUCCESS}
+     */
+    private void settle(PoolEntry entry, String errorReason) {
+        boolean success = errorReason == null;
         boolean moved = true;
         try {
             if (success) {
                 folders.moveToDone(entry.file());
             } else {
-                folders.moveToError(entry.file());
+                log.warn("[{}] Aufgabe {}: {} kommt in die errorbox: {}", context.userId(), context.taskNumber(),
+                        entry.file().getFileName(), errorReason);
+                writeErrorReason(folders.moveToError(entry.file()), errorReason);
             }
         } catch (IOException e) {
             moved = false;
@@ -181,6 +194,16 @@ public final class StatusConsumer implements Runnable {
             context.recordSucceeded();
         } else {
             context.recordError();
+        }
+    }
+
+    /** Legt den Grund neben der Datei in der errorbox ab; scheitert das, bleibt er nur im Log. */
+    private void writeErrorReason(Path errorFile, String reason) {
+        try {
+            folders.writeErrorReason(errorFile, context.taskNumber(), reason);
+        } catch (IOException e) {
+            log.error("[{}] Grund für {} konnte nicht in der errorbox abgelegt werden", context.userId(),
+                    errorFile.getFileName(), e);
         }
     }
 }

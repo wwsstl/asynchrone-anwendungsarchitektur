@@ -85,6 +85,21 @@ class UserFoldersTest {
     }
 
     @Test
+    void errorReasonLiesNextToTheFileInTheErrorbox() throws IOException {
+        Path error = folders.moveToError(folders.moveToPending(inboxFile("a.json")));
+
+        folders.writeErrorReason(error, "BJ-7", "Pflichtfeld 'name' fehlt");
+
+        assertThat(folders.errorReasonOf(error)).isEqualTo(folders.errorbox().resolve(".fehler").resolve("a.json.txt"))
+                .hasContent("Aufgabe: BJ-7" + System.lineSeparator() + "Grund: Pflichtfeld 'name' fehlt");
+        // Der Unterordner zählt nicht als Datei der errorbox.
+        try (var files = Files.list(folders.errorbox())) {
+            assertThat(files.filter(Files::isRegularFile).map(path -> path.getFileName().toString()))
+                    .containsExactly("a.json");
+        }
+    }
+
+    @Test
     void moveBackToInboxRestoresTheFile() throws IOException {
         Path pending = folders.moveToPending(inboxFile("a.json"));
 

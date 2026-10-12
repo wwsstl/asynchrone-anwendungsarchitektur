@@ -15,7 +15,7 @@
 | `inbox` | 等待提交的文件 |
 | `pendingbox` | 已经交给Cloud-API 1、还没有结果的文件 |
 | `donebox` | 生成成功的文件 |
-| `errorbox` | 没有转换成功或生成出错的文件 |
+| `errorbox` | 没有转换成功或生成出错的文件；每个文件的原因写在`errorbox/.fehler/<文件名>.txt`里 |
 
 ## 1. 启动
 
@@ -35,10 +35,10 @@ TaskManager按以下步骤启动任务：
 Producer分批处理`inbox`中的文件。每一批：
 
 1. 把最多`batch-size`个文件移到`pendingbox`。Cloud-API 1不是幂等的，每个文件最多只提交一次，所以文件在调用之前就移出`inbox`。
-2. 把每个文件的内容转换成JSON，再把这些文件的JSON数据连同任务号，通过一次请求提交给Cloud-API 1。请求里每个文件是一个条目，包含文件名和内容；内容作为JSON值提交，而不是字符串。无法读取或者不是合法JSON的文件（包括空文件）不会被提交：直接移到`errorbox`，并计入错误阈值。
-3. Cloud-API 1返回的JSON数据说明哪些文件已经成功转换为数据生成任务，哪些没有。每个成功转换的文件都带有子表里生成的数据的编号，也就是该文件的TaskId。
+2. 把每个文件的内容转换成JSON，再把这些文件的JSON数据连同任务号，通过一次请求提交给Cloud-API 1。请求里每个文件是一个条目，包含文件名和内容；内容作为JSON值提交，而不是字符串。无法读取或者不是合法JSON的文件（包括空文件）不会被提交：直接移到`errorbox`，原因放在旁边，并计入错误阈值。
+3. Cloud-API 1返回的JSON数据说明哪些文件已经成功转换为数据生成任务，哪些没有。每个成功转换的文件都带有子表里生成的数据的编号，也就是该文件的TaskId；每个没有转换成功的文件，云端给出空的TaskId，并在`fehlermeldung`里写明原因。
 4. 成功转换的文件：把TaskId保存为标记，并把它登记到Status-Pool中。
-5. 没有转换成功的文件：直接移到`errorbox`，错误计数加一；它们和第3节中状态为`ERROR`的文件一样，都计入错误阈值。
+5. 没有转换成功的文件：直接移到`errorbox`，云端给出的错误信息作为原因放在旁边（`errorbox/.fehler/<文件名>.txt`，同时写入日志），错误计数加一；它们和第3节中状态为`ERROR`的文件一样，都计入错误阈值。
 6. 等到Status-Pool中的数量降到`pool-resume-threshold`或更低（反压），再读取下一批。
 
 Producer等待Cloud-API 1的应答时是阻塞的，但时间很短：应答只说明哪些文件可以开始轮询，哪些直接转到`errorbox`。Producer运行在虚拟线程上，这段等待不占用平台线程。即使应答很慢，Producer也会在`submit-timeout`之内一直等到应答回来，之后才继续处理这一批并读取下一批。
@@ -57,7 +57,7 @@ Producer等待Cloud-API 1的应答时是阻塞的，但时间很短：应答只�
 | 状态 | 结果 |
 |---|---|
 | `SUCCESS` | 文件从`pendingbox`移到`donebox`；标记被删除。 |
-| `ERROR` | 文件移到`errorbox`；标记被删除，错误计数加一。 |
+| `ERROR` | 文件移到`errorbox`；标记被删除，云端给出的错误信息（`fehlermeldung`）作为原因放在旁边（`errorbox/.fehler/<文件名>.txt`，同时写入日志），错误计数加一。 |
 | `PENDING` | 条目留在Status-Pool中，`poll-interval`之后再次检查。 |
 
 状态查询失败时（`cloud.retries`次重试之后仍然失败），这些条目按`PENDING`处理，`poll-interval`之后再次查询。Cloud-API 2只读不写，重试没有副作用，所以任务继续运行。如果Cloud-API 2一直不可用，任务以`TIMEOUT`结束（第6节）；如果最后一次状态查询失败了，结束原因里会写明这次调用及其原因。

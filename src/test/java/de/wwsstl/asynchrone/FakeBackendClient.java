@@ -50,6 +50,12 @@ final class FakeBackendClient {
         client.post().uri("/tasks/{taskId}/status?status={status}", taskId, status).retrieve().toBodilessEntity();
     }
 
+    /** Setzt den Status eines Datensatzes mit Fehlermeldung, die Cloud-API 2 dann liefert. */
+    void decide(String taskId, String status, String fehlermeldung) {
+        client.post().uri("/tasks/{taskId}/status?status={status}&fehlermeldung={fehlermeldung}", taskId, status,
+                fehlermeldung).retrieve().toBodilessEntity();
+    }
+
     /** Die nächste Übermittlung dieser Datei wird nicht umgewandelt. */
     void rejectNext(String fileName) {
         client.post().uri("/tasks/reject?fileName={fileName}", fileName).retrieve().toBodilessEntity();

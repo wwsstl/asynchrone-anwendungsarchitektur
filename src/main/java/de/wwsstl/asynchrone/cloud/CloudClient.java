@@ -19,7 +19,8 @@ public interface CloudClient {
 
     /**
      * Cloud-API 1: übermittelt einen Batch zum BatchgenAuftrag. Die Antwort enthält je erfolgreich umgewandelter Datei
-     * die TaskId; Dateien ohne TaskId wurden nicht umgewandelt.
+     * die TaskId und je abgelehnter Datei, soweit die Cloud sie nennt, die Fehlermeldung. Dateien ohne TaskId wurden
+     * nicht umgewandelt, auch wenn sie in der Antwort ganz fehlen.
      *
      * <p>Schlägt der Aufruf fehl, endet das Future mit einer {@link SubmitFailedException}, die angibt, ob der Batch
      * eindeutig nicht verarbeitet wurde oder ob das Ergebnis unklar ist. Der Aufruf wird nie wiederholt, weil Cloud-API 1

@@ -12,6 +12,12 @@
       "content": {
         "test_2": "test_2"
       }
+    },
+    {
+      "fileName": "test_3.json",
+      "content": {
+        "test_3": "test_3"
+      }
     }
   ]
 }

@@ -60,6 +60,28 @@ class PipelineIntegrationTest extends PipelineTestSupport {
         assertThat(api.names("mixed", "errorbox")).containsExactly("mixed-4.json", "mixed-5.json");
         assertThat(api.names("mixed", "pendingbox")).isEmpty();
         assertThat(api.markers("mixed")).isEmpty();
+        // Neben jeder Datei der errorbox liegt der Grund mit der Fehlermeldung der Cloud.
+        assertThat(api.errorReason("mixed", "mixed-4.json"))
+                .contains("Aufgabe: " + taskNumber)
+                .contains("Cloud-API 1 (Batch übermitteln) hat die Datei nicht umgewandelt: "
+                        + FakeCloud.REJECT_MESSAGE);
+        assertThat(api.errorReason("mixed", "mixed-5.json"))
+                .contains("Cloud-API 2 (Statusabfrage) meldet ERROR für TaskId ")
+                .contains(": " + FakeCloud.FAIL_MESSAGE);
+        assertThat(api.errorReason("mixed", "mixed-1.json")).isNull();
+    }
+
+    @Test
+    void fileMissingInSubmitResponseGoesToErrorboxWithHint() {
+        api.drop("omit", "omit-1.json", "ok");
+        api.drop("omit", "omit-2.json", "OMIT");
+
+        String taskNumber = api.start("omit").taskNumber();
+        awaitEnd("omit", taskNumber, JobStatus.COMPLETED);
+
+        assertThat(api.names("omit", "errorbox")).containsExactly("omit-2.json");
+        assertThat(api.errorReason("omit", "omit-2.json"))
+                .contains("hat die Datei nicht umgewandelt: keine Fehlermeldung der Cloud");
     }
 
     @Test
@@ -77,6 +99,8 @@ class PipelineIntegrationTest extends PipelineTestSupport {
         assertThat(status.cloud()).isEqualTo(new TaskStatus.Cloud(JobStatus.COMPLETED, 1, 0, 0));
         assertThat(api.names("json", "donebox")).containsExactly("json-1.json");
         assertThat(api.names("json", "errorbox")).containsExactly("json-2.json", "json-3.json");
+        assertThat(api.errorReason("json", "json-2.json")).contains("Datei nicht lesbar oder kein gültiges JSON: ");
+        assertThat(api.errorReason("json", "json-3.json")).contains("Datei ist leer");
     }
 
     @Test

@@ -99,6 +99,16 @@ final class PipelineApi {
         }
     }
 
+    /** Inhalt der Datei mit dem Grund zu einer Datei der errorbox; {@code null}, wenn es keinen gibt. */
+    String errorReason(String user, String fileName) {
+        Path reason = box(user, "errorbox").resolve(".fehler").resolve(fileName + ".txt");
+        try {
+            return Files.exists(reason) ? Files.readString(reason) : null;
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
     /** Die regulären Dateien eines Ordners (ohne den Marker-Ordner der pendingbox). */
     List<String> names(String user, String box) {
         return list(box(user, box));

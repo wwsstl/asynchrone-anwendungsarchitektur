@@ -3,10 +3,21 @@ package de.wwsstl.asynchrone.cloud;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
 
-/** Kurze Beschreibung fehlgeschlagener Aufrufe der Cloud-Dienste für den Grund eines Endzustands. */
+/** Kurze Beschreibungen von Fehlern der Cloud-Dienste für Gründe und Protokolle. */
 public final class CloudErrors {
 
+    /** Steht im Grund, wenn die Cloud zu einer abgelehnten oder fehlerhaften Datei keine Fehlermeldung liefert. */
+    static final String NO_FEHLERMELDUNG = "keine Fehlermeldung der Cloud";
+
     private CloudErrors() {
+    }
+
+    /**
+     * Die Fehlermeldung der Cloud (Feld {@code fehlermeldung}) ohne Leerzeichen am Rand; fehlt sie oder ist sie leer,
+     * ein Hinweis darauf.
+     */
+    public static String fehlermeldung(String fehlermeldung) {
+        return fehlermeldung == null || fehlermeldung.isBlank() ? NO_FEHLERMELDUNG : fehlermeldung.strip();
     }
 
     /**

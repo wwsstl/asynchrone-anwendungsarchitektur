@@ -33,14 +33,23 @@ import tools.jackson.databind.json.JsonMapper;
  * Lokaler HTTP-Server, der die Cloud-Dienste nach dem Vertrag von {@code WebClientCloudClient} nachbildet. Das
  * Verhalten eines Datensatzes steuert der Dateiinhalt:
  * <ul>
- *   <li>{@code REJECT}: Cloud-API 1 wandelt die Datei nicht um (keine TaskId)</li>
- *   <li>{@code FAIL}: Cloud-API 2 meldet beim ersten Mal {@code PENDING}, danach {@code ERROR}</li>
+ *   <li>{@code REJECT}: Cloud-API 1 wandelt die Datei nicht um: leere TaskId und {@link #REJECT_MESSAGE} als
+ *       Fehlermeldung</li>
+ *   <li>{@code OMIT}: Cloud-API 1 wandelt die Datei nicht um und lässt sie in der Antwort ganz weg</li>
+ *   <li>{@code FAIL}: Cloud-API 2 meldet beim ersten Mal {@code PENDING}, danach {@code ERROR} mit
+ *       {@link #FAIL_MESSAGE} als Fehlermeldung</li>
  *   <li>{@code SLOW}: {@code PENDING}, bis die Datei mit {@link #release} freigegeben wird, danach {@code SUCCESS}</li>
  *   <li>sonst: beim ersten Mal {@code PENDING}, danach {@code SUCCESS}</li>
  * </ul>
  * Mit {@link #nextSubmitsFor} lassen sich Fehler von Cloud-API 1 für eine Benutzer:in vorgeben.
  */
 public final class FakeCloud implements AutoCloseable {
+
+    /** Fehlermeldung von Cloud-API 1 zu einer Datei mit {@code REJECT}. */
+    public static final String REJECT_MESSAGE = "Pflichtfeld 'name' fehlt";
+
+    /** Fehlermeldung von Cloud-API 2 zu einem Datensatz mit {@code FAIL}. */
+    public static final String FAIL_MESSAGE = "Erzeugung in der Untertabelle fehlgeschlagen";
 
     /** Vorgegebenes Verhalten des nächsten Aufrufs von Cloud-API 1 (Batch übermitteln). */
     public sealed interface SubmitBehavior {
@@ -249,12 +258,16 @@ public final class FakeCloud implements AutoCloseable {
             // Der Inhalt kommt als JSON-Wert an; für die Marker (REJECT, FAIL, SLOW) genügt sein JSON-Text.
             String content = item.path("content").toString();
             submittedFileNames.add(fileName);
+            if (content.contains("OMIT")) {
+                continue;
+            }
             if (content.contains("REJECT")) {
+                tasks.add(Map.of("fileName", fileName, "taskId", "", "fehlermeldung", REJECT_MESSAGE));
                 continue;
             }
             String taskId = UUID.randomUUID().toString();
             records.put(taskId, new DataRecord(jobId, fileName, content));
-            tasks.add(Map.of("fileName", fileName, "taskId", taskId));
+            tasks.add(Map.of("fileName", fileName, "taskId", taskId, "fehlermeldung", ""));
         }
         if (behavior instanceof SubmitBehavior.Delay delay) {
             try {
@@ -288,7 +301,9 @@ public final class FakeCloud implements AutoCloseable {
                 continue;
             }
             fileNames.add(record.fileName);
-            results.add(Map.of("taskId", taskId, "status", advance(record).name()));
+            RecordStatus status = advance(record);
+            results.add(Map.of("taskId", taskId, "status", status.name(), "fehlermeldung",
+                    status == RecordStatus.ERROR ? FAIL_MESSAGE : ""));
         }
         statusCalls.add(new StatusCall(List.copyOf(fileNames)));
         reply(exchange, 200, Map.of("results", results));

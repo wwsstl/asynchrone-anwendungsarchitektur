@@ -13,7 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Queue;
-import java.util.Set;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -62,9 +62,10 @@ import tools.jackson.databind.json.JsonMapper;
  *   <li>{@code GET /jobs/{jobId}}, {@code PUT /jobs/{jobId}/status} – Cloud-API 3</li>
  *   <li>{@code GET /jobs} – alle BatchgenAufträge mit Status und Zahl der Datensätze je Status</li>
  *   <li>{@code GET /tasks} – alle Datensätze mit BatchgenAuftrag, Dateiname, TaskId und Status</li>
- *   <li>{@code POST /tasks/{taskId}/status?status=SUCCESS|ERROR|PENDING} – Status manuell setzen</li>
- *   <li>{@code POST /tasks/reject?fileName=…} – die nächste Übermittlung dieser Datei wird nicht umgewandelt (keine
- *       TaskId)</li>
+ *   <li>{@code POST /tasks/{taskId}/status?status=SUCCESS|ERROR|PENDING[&fehlermeldung=…]} – Status manuell setzen;
+ *       bei {@code ERROR} optional mit Fehlermeldung, die Cloud-API 2 dann im Feld {@code fehlermeldung} liefert</li>
+ *   <li>{@code POST /tasks/reject?fileName=…[&fehlermeldung=…]} – die nächste Übermittlung dieser Datei wird nicht
+ *       umgewandelt: leere TaskId und die Fehlermeldung (sonst ein Standardtext) in der Antwort</li>
  *   <li>{@code POST /tasks/next-response?status=…} – die nächste Übermittlung antwortet mit diesem HTTP-Status, ohne
  *       den Batch zu verarbeiten: {@code 503} gilt als eindeutig nicht verarbeitet, {@code 500} als unklar</li>
  * </ul>
@@ -96,6 +97,7 @@ public final class FakeCloudBackendApplication {
         private final String fileName;
         private final long sequence;
         private volatile RecordStatus status = RecordStatus.PENDING;
+        private volatile String fehlermeldung = "";
 
         DataRecord(String taskId, String jobId, String fileName, long sequence) {
             this.taskId = taskId;
@@ -110,8 +112,11 @@ public final class FakeCloudBackendApplication {
     private final Map<String, DataRecord> records = new ConcurrentHashMap<>();
     private final AtomicInteger jobSequence = new AtomicInteger();
     private final AtomicLong recordSequence = new AtomicLong();
-    /** Dateinamen, deren nächste Übermittlung nicht umgewandelt wird. */
-    private final Set<String> rejectNext = ConcurrentHashMap.newKeySet();
+    /** Fehlermeldung, wenn {@code /tasks/reject} keine vorgibt. */
+    private static final String DEFAULT_REJECT_MESSAGE = "nicht umgewandelt (vorgegeben mit /tasks/reject)";
+
+    /** Dateinamen, deren nächste Übermittlung nicht umgewandelt wird, mit der Fehlermeldung dafür. */
+    private final Map<String, String> rejectNext = new ConcurrentHashMap<>();
     /** HTTP-Status, mit denen die nächsten Übermittlungen ohne Verarbeitung antworten. */
     private final Queue<Integer> nextResponses = new ConcurrentLinkedQueue<>();
     private final String jobPath;
@@ -244,13 +249,16 @@ public final class FakeCloudBackendApplication {
         List<Map<String, String>> tasks = new ArrayList<>();
         for (JsonNode item : request.path("items")) {
             String fileName = item.path("fileName").asString("");
-            if (rejectNext.remove(fileName)) {
-                System.out.printf("[submit] %s: %s nicht umgewandelt%n", jobId, fileName);
+            String rejection = rejectNext.remove(fileName);
+            if (rejection != null) {
+                // Nicht umgewandelt: leere TaskId und der Grund in fehlermeldung.
+                tasks.add(Map.of("fileName", fileName, "taskId", "", "fehlermeldung", rejection));
+                System.out.printf("[submit] %s: %s nicht umgewandelt: %s%n", jobId, fileName, rejection);
                 continue;
             }
             String taskId = UUID.randomUUID().toString();
             records.put(taskId, new DataRecord(taskId, jobId, fileName, recordSequence.incrementAndGet()));
-            tasks.add(Map.of("fileName", fileName, "taskId", taskId));
+            tasks.add(Map.of("fileName", fileName, "taskId", taskId, "fehlermeldung", ""));
             System.out.printf("[submit] %s: %s -> %s (PENDING)%n", jobId, fileName, taskId);
         }
         reply(exchange, 200, Map.of("tasks", tasks));
@@ -261,13 +269,13 @@ public final class FakeCloudBackendApplication {
                 .sorted(Comparator.comparingLong(record -> record.sequence))
                 .map(FakeCloudBackendApplication::view)
                 .toList();
-        reply(exchange, 200, Map.of("tasks", all, "rejectNext", rejectNext.stream().sorted().toList(),
+        reply(exchange, 200, Map.of("tasks", all, "rejectNext", new TreeMap<>(rejectNext),
                 "nextResponses", List.copyOf(nextResponses)));
     }
 
     private static Map<String, String> view(DataRecord record) {
         return Map.of("taskId", record.taskId, "jobId", record.jobId, "fileName", record.fileName, "status",
-                record.status.name());
+                record.status.name(), "fehlermeldung", record.fehlermeldung);
     }
 
     // --- Cloud-API 2: Bulk-Statusabfrage -----------------------------------------------------------------------
@@ -281,7 +289,8 @@ public final class FakeCloudBackendApplication {
         for (JsonNode id : readJson(exchange).path("taskIds")) {
             DataRecord record = records.get(id.asString(""));
             if (record != null) {
-                results.add(Map.of("taskId", record.taskId, "status", record.status.name()));
+                results.add(Map.of("taskId", record.taskId, "status", record.status.name(), "fehlermeldung",
+                        record.fehlermeldung));
             }
         }
         reply(exchange, 200, Map.of("results", results));
@@ -311,8 +320,12 @@ public final class FakeCloudBackendApplication {
                     "Query-Parameter 'status' muss SUCCESS, ERROR oder PENDING sein, war: " + requested));
             return;
         }
+        // Eine Fehlermeldung gibt es nur zu ERROR; jeder andere Status löscht sie.
+        String fehlermeldung = queryParam(exchange, "fehlermeldung");
+        record.fehlermeldung = status == RecordStatus.ERROR && fehlermeldung != null ? fehlermeldung : "";
         record.status = status;
-        System.out.printf("[admin] %s (%s, %s) -> %s%n", taskId, record.jobId, record.fileName, status);
+        System.out.printf("[admin] %s (%s, %s) -> %s %s%n", taskId, record.jobId, record.fileName, status,
+                record.fehlermeldung);
         reply(exchange, 200, view(record));
     }
 
@@ -328,9 +341,12 @@ public final class FakeCloudBackendApplication {
                 reply(exchange, 400, Map.of("error", "Query-Parameter 'fileName' fehlt"));
                 return;
             }
-            rejectNext.add(fileName);
-            System.out.printf("[admin] naechste Uebermittlung von %s wird nicht umgewandelt%n", fileName);
-            reply(exchange, 200, Map.of("rejectNext", rejectNext.stream().sorted().toList()));
+            String fehlermeldung = queryParam(exchange, "fehlermeldung");
+            rejectNext.put(fileName, fehlermeldung == null || fehlermeldung.isBlank() ? DEFAULT_REJECT_MESSAGE
+                    : fehlermeldung);
+            System.out.printf("[admin] naechste Uebermittlung von %s wird nicht umgewandelt: %s%n", fileName,
+                    rejectNext.get(fileName));
+            reply(exchange, 200, Map.of("rejectNext", new TreeMap<>(rejectNext)));
             return;
         }
         String status = queryParam(exchange, "status");
@@ -412,8 +428,8 @@ public final class FakeCloudBackendApplication {
                   PUT  %2$s/{jobId}/status     Cloud-API 3 (Endzustand setzen)
                   GET  %2$s                    alle BatchgenAuftraege auflisten
                   GET  %3$s                   alle Datensaetze auflisten
-                  POST %3$s/{taskId}/status?status=SUCCESS|ERROR|PENDING   Status manuell setzen
-                  POST %3$s/reject?fileName=...          naechste Uebermittlung der Datei nicht umwandeln
+                  POST %3$s/{taskId}/status?status=SUCCESS|ERROR|PENDING[&fehlermeldung=...]   Status manuell setzen
+                  POST %3$s/reject?fileName=...[&fehlermeldung=...]  naechste Uebermittlung der Datei nicht umwandeln
                   POST %3$s/next-response?status=503|500 naechste Uebermittlung nicht verarbeiten
 
                 In der Pipeline-Applikation muss pipeline.cloud.base-url auf http://localhost:%1$d zeigen.

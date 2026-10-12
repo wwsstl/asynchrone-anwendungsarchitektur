@@ -21,13 +21,17 @@ import de.wwsstl.asynchrone.cloud.TaskId;
  *       einer Datei steht als Marker in {@code pendingbox/.taskids/<Dateiname>}; Dateien ohne Marker haben ein
  *       unklares Übermittlungsergebnis.</li>
  *   <li>{@code donebox}: erfolgreich erzeugte Dateien</li>
- *   <li>{@code errorbox}: Dateien, die nicht umgewandelt werden konnten oder bei deren Erzeugung ein Fehler auftrat</li>
+ *   <li>{@code errorbox}: Dateien, die nicht umgewandelt werden konnten oder bei deren Erzeugung ein Fehler auftrat.
+ *       Der Grund steht in {@code errorbox/.fehler/<Dateiname>.txt}.</li>
  * </ul>
  */
 public record UserFolders(String userId, Path inbox, Path pendingbox, Path donebox, Path errorbox) {
 
     /** Unterordner der {@code pendingbox} für die TaskId-Marker. */
     static final String MARKER_DIR = ".taskids";
+
+    /** Unterordner der {@code errorbox} für die Gründe, warum eine Datei dort liegt. */
+    static final String REASON_DIR = ".fehler";
 
     /** Bis zu {@code max} reguläre Dateien der {@code inbox}, ohne die übergebenen. */
     public List<Path> listInbox(int max, Set<Path> excluded) throws IOException {
@@ -80,6 +84,24 @@ public record UserFolders(String userId, Path inbox, Path pendingbox, Path doneb
 
     public Path moveToError(Path file) throws IOException {
         return settle(file, errorbox);
+    }
+
+    /**
+     * Legt den Grund für eine Datei der {@code errorbox} in {@code errorbox/.fehler/<Dateiname>.txt} ab, damit die
+     * Benutzer:in beim Bearbeiten der {@code errorbox} sieht, warum die Datei dort liegt.
+     *
+     * @param errorFile die Datei in der {@code errorbox}, wie {@link #moveToError} sie geliefert hat
+     */
+    public void writeErrorReason(Path errorFile, String taskNumber, String reason) throws IOException {
+        Path reasonFile = errorReasonOf(errorFile);
+        Files.createDirectories(reasonFile.getParent());
+        Files.writeString(reasonFile, "Aufgabe: " + taskNumber + System.lineSeparator()
+                + "Grund: " + reason + System.lineSeparator());
+    }
+
+    /** Datei mit dem Grund zu einer Datei der {@code errorbox}; sie existiert nur, wenn ein Grund geschrieben wurde. */
+    public Path errorReasonOf(Path errorFile) {
+        return errorbox.resolve(REASON_DIR).resolve(errorFile.getFileName() + ".txt");
     }
 
     /** Verschiebt in einen Endordner und entfernt danach den Marker, falls die Datei aus der {@code pendingbox} kam. */

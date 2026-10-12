@@ -15,7 +15,7 @@ Die Anwendung veranlasst nur, dass die Cloud Daten erzeugt, und verarbeitet die 
 | `inbox` | Dateien, die auf die Übermittlung warten |
 | `pendingbox` | Dateien, die an Cloud-API 1 übergeben wurden und noch kein Ergebnis haben |
 | `donebox` | erfolgreich erzeugte Dateien |
-| `errorbox` | Dateien, die nicht umgewandelt werden konnten oder bei deren Erzeugung ein Fehler auftrat |
+| `errorbox` | Dateien, die nicht umgewandelt werden konnten oder bei deren Erzeugung ein Fehler auftrat; der Grund steht je Datei in `errorbox/.fehler/<Dateiname>.txt` |
 
 ## 1. Start
 
@@ -35,10 +35,10 @@ Der TaskManager startet die Aufgabe in folgenden Schritten:
 Der Producer arbeitet die `inbox` batchweise ab. Für jeden Batch:
 
 1. Bis zu `batch-size` Dateien in die `pendingbox` verschieben. Cloud-API 1 ist nicht idempotent, und jede Datei wird höchstens einmal übermittelt; deshalb verlassen die Dateien die `inbox` schon vor dem Aufruf.
-2. Den Inhalt jeder Datei in JSON umwandeln und die JSON-Daten dieser Dateien zusammen mit der Aufgabennummer in einer einzigen Anfrage an Cloud-API 1 übermitteln. Jede Datei ist darin ein Eintrag aus Dateiname und Inhalt; der Inhalt wird als JSON-Wert übermittelt, nicht als Zeichenkette. Eine Datei, die sich nicht lesen lässt oder kein gültiges JSON enthält (auch eine leere Datei), wird nicht übermittelt: Sie kommt direkt in die `errorbox` und zählt zur Fehlerschwelle.
-3. Die JSON-Antwort von Cloud-API 1 gibt an, welche Dateien erfolgreich in Datenerzeugungsaufträge umgewandelt wurden und welche nicht. Jede erfolgreich umgewandelte Datei erhält die Nummer des in der Untertabelle erzeugten Datensatzes, also ihre TaskId.
+2. Den Inhalt jeder Datei in JSON umwandeln und die JSON-Daten dieser Dateien zusammen mit der Aufgabennummer in einer einzigen Anfrage an Cloud-API 1 übermitteln. Jede Datei ist darin ein Eintrag aus Dateiname und Inhalt; der Inhalt wird als JSON-Wert übermittelt, nicht als Zeichenkette. Eine Datei, die sich nicht lesen lässt oder kein gültiges JSON enthält (auch eine leere Datei), wird nicht übermittelt: Sie kommt direkt in die `errorbox`, der Grund wird daneben abgelegt, und sie zählt zur Fehlerschwelle.
+3. Die JSON-Antwort von Cloud-API 1 gibt an, welche Dateien erfolgreich in Datenerzeugungsaufträge umgewandelt wurden und welche nicht. Jede erfolgreich umgewandelte Datei erhält die Nummer des in der Untertabelle erzeugten Datensatzes, also ihre TaskId; zu jeder nicht umgewandelten liefert die Cloud eine leere TaskId und in `fehlermeldung` den Grund.
 4. Erfolgreich umgewandelte Dateien: Die TaskId wird als Marker gesichert und in den Status-Pool eingetragen.
-5. Nicht umgewandelte Dateien: Sie werden direkt in die `errorbox` verschoben, und der Fehlerzähler steigt um eins; sie zählen wie Dateien mit dem Status `ERROR` aus Abschnitt 3 zur Fehlerschwelle.
+5. Nicht umgewandelte Dateien: Sie werden direkt in die `errorbox` verschoben, die Fehlermeldung der Cloud wird als Grund daneben abgelegt (`errorbox/.fehler/<Dateiname>.txt`, außerdem im Log), und der Fehlerzähler steigt um eins; sie zählen wie Dateien mit dem Status `ERROR` aus Abschnitt 3 zur Fehlerschwelle.
 6. Warten, bis der Status-Pool auf `pool-resume-threshold` oder darunter gesunken ist (Rückstau), und erst dann den nächsten Batch lesen.
 
 Während der Producer auf die Antwort von Cloud-API 1 wartet, ist er blockiert, aber nur kurz: Die Antwort gibt nur an, welche Dateien abgefragt werden können und welche direkt in die `errorbox` gehen. Der Producer läuft auf einem Virtual Thread; das Warten belegt keinen Plattform-Thread. Auch eine langsame Antwort wartet er bis zu `submit-timeout` ab; erst danach verarbeitet er den Batch weiter und liest den nächsten.
@@ -57,7 +57,7 @@ Parallel zum Producer holt der Consumer in jedem `sweep-interval` die fälligen 
 | Status | Folge |
 |---|---|
 | `SUCCESS` | Datei wandert von der `pendingbox` in die `donebox`; der Marker wird gelöscht. |
-| `ERROR` | Datei wandert in die `errorbox`; der Marker wird gelöscht, der Fehlerzähler steigt um eins. |
+| `ERROR` | Datei wandert in die `errorbox`; der Marker wird gelöscht, die Fehlermeldung der Cloud (`fehlermeldung`) wird als Grund daneben abgelegt (`errorbox/.fehler/<Dateiname>.txt`, außerdem im Log), der Fehlerzähler steigt um eins. |
 | `PENDING` | Der Eintrag bleibt im Status-Pool und wird nach `poll-interval` erneut geprüft. |
 
 Schlägt die Statusabfrage fehl (auch nach den Wiederholungen von `cloud.retries`), werden die Einträge wie `PENDING` behandelt und nach `poll-interval` erneut abgefragt. Cloud-API 2 liest nur; eine Wiederholung ist daher unbedenklich, und die Aufgabe läuft weiter. Bleibt Cloud-API 2 nicht verfügbar, endet die Aufgabe mit `TIMEOUT` (Abschnitt 6); ist die letzte Statusabfrage fehlgeschlagen, nennt der Grund des Endzustands sie mit ihrer Ursache.

@@ -329,7 +329,7 @@ class TaskManagerTest {
                 () -> CompletableFuture.completedFuture("BJ-" + createdJobs.incrementAndGet());
         volatile Function<List<TestdataItem>, CompletableFuture<List<SubmittedFile>>> submit =
                 items -> CompletableFuture.completedFuture(items.stream()
-                        .map(item -> new SubmittedFile(item.fileName(), new TaskId("t-" + item.fileName())))
+                        .map(item -> new SubmittedFile(item.fileName(), new TaskId("t-" + item.fileName()), ""))
                         .toList());
         volatile RecordStatus status = RecordStatus.PENDING;
         /** So viele Aufrufe von Cloud-API 2 schlagen noch mit 503 fehl; negativ: alle. */
@@ -354,7 +354,7 @@ class TaskManagerTest {
                         new IOException("503 Service Unavailable from POST http://cloud/tasks/status"));
             }
             return CompletableFuture.completedFuture(
-                    taskIds.stream().map(taskId -> new RecordStatusResult(taskId, status)).toList());
+                    taskIds.stream().map(taskId -> new RecordStatusResult(taskId, status, "")).toList());
         }
 
         @Override

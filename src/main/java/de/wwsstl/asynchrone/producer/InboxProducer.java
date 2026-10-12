@@ -47,7 +47,8 @@ import tools.jackson.databind.json.JsonMapper;
  *       übermitteln; Dateien, die sich nicht lesen lassen oder kein gültiges JSON enthalten, kommen in die
  *       {@code errorbox};</li>
  *   <li>für erfolgreich umgewandelte Dateien die TaskId als Marker sichern und in den Status-Pool eintragen;</li>
- *   <li>nicht umgewandelte Dateien in die {@code errorbox} verschieben und als Fehler zählen;</li>
+ *   <li>nicht umgewandelte Dateien in die {@code errorbox} verschieben, die Fehlermeldung der Cloud als Grund ablegen
+ *       und als Fehler zählen;</li>
  *   <li>warten, bis der Status-Pool auf {@code pool-resume-threshold} gesunken ist (Rückstau).</li>
  * </ol>
  * Schlägt der Aufruf fehl, entscheidet die Art des Fehlers: Eindeutig nicht verarbeitete Dateien wandern zurück in die
@@ -159,9 +160,7 @@ public final class InboxProducer implements Runnable {
                 items.add(new TestdataItem(name, readJson(file)));
                 filesByName.put(name, file);
             } catch (IOException | UncheckedIOException | JacksonException e) {
-                log.warn("[{}] Datei {} ist nicht lesbar oder kein gültiges JSON und kommt in die errorbox: {}",
-                        context.userId(), name, e.toString());
-                fail(file);
+                fail(file, "Datei nicht lesbar oder kein gültiges JSON: " + e.getMessage());
             }
         }
         if (items.isEmpty()) {
@@ -188,16 +187,18 @@ public final class InboxProducer implements Runnable {
             return leaveUnclear(filesByName.size(), TaskState.ABORTED, "beim Warten auf " + SUBMIT + " unterbrochen");
         }
 
-        Map<String, TaskId> taskIds = new HashMap<>();
-        accepted.forEach(file -> taskIds.put(file.fileName(), file.taskId()));
+        Map<String, SubmittedFile> answers = new HashMap<>();
+        accepted.forEach(file -> answers.put(file.fileName(), file));
         int rejected = 0;
         for (Map.Entry<String, Path> entry : filesByName.entrySet()) {
-            TaskId taskId = taskIds.get(entry.getKey());
-            if (taskId == null) {
-                fail(entry.getValue());
-                rejected++;
+            SubmittedFile answer = answers.get(entry.getKey());
+            if (answer != null && answer.converted()) {
+                track(entry.getValue(), answer.taskId());
             } else {
-                track(entry.getValue(), taskId);
+                // Nicht umgewandelt: ausdrücklich mit Fehlermeldung oder gar nicht in der Antwort.
+                fail(entry.getValue(), SUBMIT + " hat die Datei nicht umgewandelt: "
+                        + CloudErrors.fehlermeldung(answer == null ? null : answer.fehlermeldung()));
+                rejected++;
             }
         }
         log.info("[{}] Aufgabe {}: Batch mit {} Dateien übermittelt, {} umgewandelt, {} nicht umgewandelt",
@@ -269,15 +270,28 @@ public final class InboxProducer implements Runnable {
         return SUBMIT + ": Ergebnis unklar, " + CloudErrors.describe(cause, "submit-timeout");
     }
 
-    /** Datei in die errorbox verschieben und als Fehler zählen. */
-    private void fail(Path file) {
+    /** Datei mit ihrem Grund in die errorbox verschieben und als Fehler zählen. */
+    private void fail(Path file, String reason) {
+        log.warn("[{}] Aufgabe {}: {} kommt in die errorbox: {}", context.userId(), context.taskNumber(),
+                file.getFileName(), reason);
         try {
-            folders.moveToError(file);
+            Path errorFile = folders.moveToError(file);
+            writeErrorReason(errorFile, reason);
         } catch (IOException e) {
             log.error("[{}] Datei {} konnte nicht in die errorbox verschoben werden", context.userId(),
                     file.getFileName(), e);
         }
         context.recordError();
+    }
+
+    /** Legt den Grund neben der Datei in der errorbox ab; scheitert das, bleibt er nur im Log. */
+    private void writeErrorReason(Path errorFile, String reason) {
+        try {
+            folders.writeErrorReason(errorFile, context.taskNumber(), reason);
+        } catch (IOException e) {
+            log.error("[{}] Grund für {} konnte nicht in der errorbox abgelegt werden", context.userId(),
+                    errorFile.getFileName(), e);
+        }
     }
 
     /** Rückstau: erst weiterlesen, wenn der Status-Pool auf {@code pool-resume-threshold} gesunken ist. */
