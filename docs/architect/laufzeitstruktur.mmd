@@ -1,7 +1,9 @@
 flowchart TB
 
     %% Laufzeitstruktur (Übersetzung von implementierung_zh.md, Abschnitt 1.4)
-    %% Oben die Objekte, die es über die gesamte Laufzeit genau einmal gibt; unten die Sandbox, die je Aufgabe entsteht
+    %% Oben die Objekte, die es über die gesamte Laufzeit genau einmal gibt; unten, was je Aufgabe entsteht.
+    %% Der Supervisor-Thread gehört zum TaskManager (er führt TaskManager.supervise aus) und ist nicht Teil der
+    %% Sandbox; TaskManager.launch startet aber je Aufgabe einen eigenen.
 
     subgraph Singletons["Einmal je Anwendung, über die gesamte Laufzeit"]
         API["TaskController<br/>+ ApiExceptionHandler"]
@@ -10,23 +12,28 @@ flowchart TB
         Users[("users: je Benutzer:in ein UserSlot")]
         Cloud["CloudClient<br/>(WebClientCloudClient)"]
     end
-    subgraph SB["Sandbox je Aufgabe"]
-        Ctx["TaskContext<br/>Zustand · Grund · Abbruchsignal · Zähler"]
-        Pool[("StatusPool")]
-        P["Producer<br/>(Virtual Thread)"]
-        C["Consumer<br/>(Virtual Thread)"]
-        Sup["Supervisor<br/>(Virtual Thread)"]
+    subgraph PerTask["Je Aufgabe, angelegt von TaskManager.launch"]
+        subgraph SB["Sandbox"]
+            Ctx["TaskContext<br/>Zustand · Grund · Abbruchsignal · Zähler"]
+            Pool[("StatusPool")]
+            P["Producer<br/>(Virtual Thread)"]
+            C["Consumer<br/>(Virtual Thread)"]
+        end
+        Sup["Supervisor<br/>(Virtual Thread, gehört zum TaskManager,<br/>führt TaskManager.supervise aus)"]
     end
     API -->|"Aufruf auf einem Virtual Thread"| TM
     TM --> Reg
     TM --> Users
     TM -->|"baut auf, trägt ein, startet"| SB
+    TM -->|"startet für diese Aufgabe"| Sup
     P <--> Ctx
     C <--> Ctx
     P -->|"add"| Pool
     C -->|"due / reschedule / remove"| Pool
     Pool -.->|"size: Rückstau"| P
-    Sup -->|"join P und C, Endzustand schreiben, abmelden"| TM
+    Sup -.->|"join"| P
+    Sup -.->|"join"| C
+    Sup -->|"deregister: Endzustand schreiben, abmelden"| TM
     P --> Cloud
     C --> Cloud
     TM --> Cloud

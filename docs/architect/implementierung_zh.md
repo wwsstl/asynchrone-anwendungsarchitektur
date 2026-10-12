@@ -78,23 +78,28 @@ flowchart TB
         Users[("users：每个用户一个 UserSlot")]
         Cloud["CloudClient<br/>(WebClientCloudClient)"]
     end
-    subgraph SB["每项任务一个 Sandbox"]
-        Ctx["TaskContext<br/>状态 · 原因 · 中止信号 · 计数器"]
-        Pool[("StatusPool")]
-        P["Producer<br/>(虚拟线程)"]
-        C["Consumer<br/>(虚拟线程)"]
-        Sup["Supervisor<br/>(虚拟线程)"]
+    subgraph PerTask["每项任务一份，由 TaskManager.launch 创建"]
+        subgraph SB["Sandbox"]
+            Ctx["TaskContext<br/>状态 · 原因 · 中止信号 · 计数器"]
+            Pool[("StatusPool")]
+            P["Producer<br/>(虚拟线程)"]
+            C["Consumer<br/>(虚拟线程)"]
+        end
+        Sup["Supervisor<br/>(虚拟线程，属于 TaskManager，<br/>执行 TaskManager.supervise)"]
     end
     API -->|在虚拟线程上调用| TM
     TM --> Reg
     TM --> Users
     TM -->|构建、登记、启动| SB
+    TM -->|为这项任务启动| Sup
     P <--> Ctx
     C <--> Ctx
     P -->|add| Pool
     C -->|due / reschedule / remove| Pool
     Pool -.->|size：反压| P
-    Sup -->|join P、C，写结束状态，注销| TM
+    Sup -.->|join| P
+    Sup -.->|join| C
+    Sup -->|deregister：写结束状态，注销| TM
     P --> Cloud
     C --> Cloud
     TM --> Cloud
@@ -108,10 +113,15 @@ flowchart TB
 | `task-manager` 调度器线程 | 每个 REST 请求一个虚拟线程 | `PipelineConfiguration.taskManagerScheduler` | 执行 `TaskManager.start/status/cancel`，这些方法会阻塞（文件系统、等待 Cloud） |
 | `producer-<任务号>` | 每个 Sandbox 一个 | `TaskManager.launch` | 读 inbox、提交批次、写标记、填 Pool |
 | `consumer-<任务号>` | 每个 Sandbox 一个 | `TaskManager.launch` | 轮询状态、移动文件、判定 `COMPLETED`/`TIMEOUT`/`ERROR` |
-| `sandbox-<任务号>`（Supervisor） | 每个 Sandbox 一个 | `TaskManager.launch` | 等 Producer 和 Consumer 都结束，写结束状态，注销 Sandbox |
+| `sandbox-<任务号>`（Supervisor） | 每项任务一个（不在 Sandbox 里） | `TaskManager.launch` | 执行 `TaskManager.supervise`：等 Producer 和 Consumer 都结束，写结束状态，注销 Sandbox |
 | Reactor/Netty 客户端线程 | 少量 | WebClient | 执行 HTTP 调用和 `timeout` 计时；虚拟线程在 `Future.get` 上等待结果 |
 
-所以每个 Sandbox 实际有 **3 个虚拟线程**：干活的 Producer 和 Consumer，加上只负责收尾的 Supervisor。
+所以每项任务实际有 **3 个虚拟线程**：Sandbox 里干活的 Producer 和 Consumer，以及 TaskManager 为这项任务启动、只负责收尾的 Supervisor。
+
+要分清两个层面：
+
+- **代码上**，Supervisor 属于 TaskManager。它执行的 `supervise`、`deregister` 都是 TaskManager 的方法；`Sandbox` 这个 record 里只有 `context`、`pool`、`producer`、`consumer`，没有 Supervisor。
+- **运行时**，Supervisor 线程和任务一一对应。每次启动任务，`launch` 都会新建一个线程来执行 `supervise`，线程名带着任务号（`sandbox-BJ-7`），并记在该用户的号牌 `UserSlot` 上。TaskManager 只有一个，但它的 `supervise` 方法同时在多个线程上运行，每项任务一个。
 
 ---
 
@@ -417,7 +427,7 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 | **TaskContext** | 这单任务的控制面板：当前状态、"停止"按钮、各种计数器 |
 | **Sandbox** | 每单任务独立的工位：一个寄件员、一个查件员、一块追踪板、一块控制面板 |
 | **TaskManager** | 前台经理：接单（启动）、回答查询、处理取消，给每单任务安排工位 |
-| **Supervisor** | 收尾员：等寄件员和查件员都下班，向总部报告结果，然后撤掉工位 |
+| **Supervisor** | 收尾员：前台经理为每单任务派一个，等寄件员和查件员都下班，向总部报告结果，然后撤掉工位。收尾员听前台经理的，不属于工位本身 |
 | **TaskRegistry** | 前台的登记簿：现在有哪些工位在运作 |
 
 "柜台不能重复办理"是理解很多设计的关键：包裹在去柜台**之前**就放到货架上；柜台没给回音时，宁可停下来等人工核对，也不再办一次。
@@ -690,6 +700,7 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 - **做什么**：等 Producer 和 Consumer 都结束，然后收尾。
 - **怎么做**：`joinQuietly(producer)` → `joinQuietly(consumer)` → `deregister`。
 - **为什么要一个专门的线程**：总得有人在两个线程都停下之后做收尾，而 Producer 和 Consumer 都不知道对方什么时候停。专门的收尾员只做"等"这一件事，虚拟线程等待几乎没有开销。
+- **为什么每项任务一个线程，而不是 TaskManager 只用一个**：`Thread.join()` 一次只能等一个线程。只有一个 Supervisor 的话，要同时看着许多任务的 Producer 和 Consumer，就得改成轮询或回调。每项任务一个虚拟线程，写法最简单。这些线程执行的都是同一个方法 `supervise`，只是参数（哪个 Sandbox、哪个号牌）不同。
 
 ##### `deregister(sandbox, slot)`
 
@@ -815,6 +826,8 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 #### `Sandbox`（record）
 
 一项任务的工位，把四样东西打包在一起：`context`（控制面板）、`pool`（追踪板）、`producer` 和 `consumer`（两个线程）。
+
+Supervisor 线程**不在**这里面：它是 TaskManager 的收尾职责，由 `TaskManager.launch` 单独创建，记在用户号牌 `UserSlot` 上。这样 Sandbox 只包含"干活"的部分，收尾逻辑全部留在 TaskManager 里。
 
 **为什么用 record**：工位的组成一旦确定就不再变，record 天然不可变，也不需要手写构造器、getter、equals。
 

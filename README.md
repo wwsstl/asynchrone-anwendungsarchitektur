@@ -267,7 +267,7 @@ src/main/java/de/wwsstl/asynchrone/
 | [`anforderungen.md`](docs/architect/anforderungen.md) | funktionale und nicht-funktionale Anforderungen |
 | [`funktionsweise_sequenz.md`](docs/architect/funktionsweise_sequenz.md) | verbindlicher Ablauf einer Aufgabe, Abschnitte 1–7 ([chinesische Fassung](docs/architect/funktionsweise_sequenz_zh.md)) |
 | [`implementierung_zh.md`](docs/architect/implementierung_zh.md) | ausführliche Implementierungsbeschreibung (chinesisch): jedes Paket, jede Klasse und Methode mit Begründung, Zusammenspiel von Producer, Consumer, TaskManager und TaskContext |
-| [`laufzeitstruktur.mmd`](docs/architect/laufzeitstruktur.mmd) | Laufzeitstruktur: Singletons und Sandbox je Aufgabe mit ihren drei Virtual Threads |
+| [`laufzeitstruktur.mmd`](docs/architect/laufzeitstruktur.mmd) | Laufzeitstruktur: Singletons, je Aufgabe eine Sandbox (Producer, Consumer) und ein Supervisor-Thread des TaskManagers |
 | [`zustandsuebergang.md`](docs/architect/zustandsuebergang.md) | einmaliger Zustandsübergang im TaskContext: Zustandsdiagramm und wer die Aufgabe mit welchem Grund beenden kann |
 | [`funktionsweise_sequenz.mmd`](docs/architect/funktionsweise_sequenz.mmd) | Sequenzdiagramm des Ablaufs, die Sandbox als Blackbox |
 | [`sandbox_sequenz.mmd`](docs/architect/sandbox_sequenz.mmd) | Sequenzdiagramm innerhalb einer Sandbox |
