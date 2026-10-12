@@ -63,6 +63,23 @@ class PipelineIntegrationTest extends PipelineTestSupport {
     }
 
     @Test
+    void fileContentIsSubmittedAsJsonAndInvalidJsonGoesToErrorbox() {
+        api.drop("json", "json-1.json", "ok");
+        api.dropRaw("json", "json-2.json", "kein JSON");
+        api.dropRaw("json", "json-3.json", "");
+
+        String taskNumber = api.start("json").taskNumber();
+        TaskStatus status = awaitEnd("json", taskNumber, JobStatus.COMPLETED);
+
+        // Der Inhalt der Datei kommt als JSON-Objekt an; Dateien ohne gültiges JSON werden nicht übermittelt.
+        assertThat(cloud.contentOf("json-1.json")).isEqualTo("{\"data\":\"ok\"}");
+        assertThat(submittedBy("json")).containsExactly("json-1.json");
+        assertThat(status.cloud()).isEqualTo(new TaskStatus.Cloud(JobStatus.COMPLETED, 1, 0, 0));
+        assertThat(api.names("json", "donebox")).containsExactly("json-1.json");
+        assertThat(api.names("json", "errorbox")).containsExactly("json-2.json", "json-3.json");
+    }
+
+    @Test
     void secondStartOfSameUserIsRejectedWhileRunning() {
         api.drop("busy", "busy-1.json", "SLOW");
         String taskNumber = api.start("busy").taskNumber();

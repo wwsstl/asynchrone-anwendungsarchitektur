@@ -1012,8 +1012,8 @@ flowchart TD
 
 - **做什么**：提交一批文件，并按应答处理每个文件。
 - **怎么做**：
-  1. **读文件内容**：逐个读取（UTF-8 文本）。读不了的（例如没有权限，或者不是合法的 UTF-8）直接调用 `fail` 移进 errorbox 并计一次错误；读得了的放进 `items` 列表，并在 `filesByName` 里记下"文件名 → 路径"（用 `LinkedHashMap`，保持批次里的顺序）。
-  2. 一个都没读成，就返回 `SUBMITTED`，不调用云端。
+  1. **读文件并转换成 JSON**：逐个调用 `readJson`。读不了的（例如没有权限）、不是合法 JSON 的、空文件，直接调用 `fail` 移进 errorbox 并计一次错误；转换成功的放进 `items` 列表，并在 `filesByName` 里记下"文件名 → 路径"（用 `LinkedHashMap`，保持批次里的顺序）。
+  2. 一个都没转换成功，就返回 `SUBMITTED`，不调用云端。
   3. **调用** `cloud.submit(任务号, items)`，最多等 `submit-timeout` + 5 秒。
   4. **处理失败**：
      - 分类为"明确未处理"：`returnToInbox`，返回 `NOT_PROCESSED`。
@@ -1024,7 +1024,28 @@ flowchart TD
   6. 记一条日志："N 个文件提交，M 个转换，K 个未转换"，返回 `SUBMITTED`。
 - **为什么一批只调用一次**：减少网络往返；云端的接口本身就是按批设计的。
 - **为什么按文件名匹配应答**：应答只告诉我们哪些文件名拿到了 TaskId，`filesByName` 用来从文件名找回 pendingbox 里的路径。
+- **为什么在本地就把非法 JSON 挡下来**：这样的文件云端也处理不了，提交上去只会得到一个"未转换"，还白白占一次调用。在本地拦下来，原因也更清楚（日志里能看到解析错误发生在哪一行、哪个字符）。
 - **例子**：一批 4 个文件 `a`、`b`、`c`、`d`，应答为 `[{a, t1}, {b, t2}, {d, t4}]`。结果：`a`、`b`、`d` 写标记、进 Pool；`c` 进 errorbox，错误数加一。
+
+##### `readJson(file)`
+
+- **做什么**：读一个文件，把它的内容转换成 JSON（Jackson 的 `JsonNode`）。
+- **怎么做**：
+  1. `Files.readAllBytes` 读出文件的全部字节。
+  2. 交给 Jackson 解析成 `JsonNode`。Jackson 会自己识别 UTF-8、UTF-16、UTF-32 编码。
+  3. 文件为空时 Jackson 返回一个"缺失节点"（`MissingNode`），这里当作错误，抛 `IOException("Datei ist leer")`。
+- **为什么用 `JsonNode`，而不是把文本原样当字符串提交**：当字符串提交的话，Jackson 会把它转义成一个 JSON 字符串，云端收到的是 `"content":"{\"name\":\"Beispiel\"}"`，还得自己再解析一次。用 `JsonNode`，云端收到的直接就是 JSON 对象 `"content":{"name":"Beispiel"}`。顺带也在本地检查了文件是不是合法 JSON。
+- **为什么显式开启 `FAIL_ON_TRAILING_TOKENS`**：关闭这个选项时，Jackson 读完第一个完整的 JSON 值就停下，后面多出来的内容会被忽略。例如 `{"a":1} 垃圾` 会被当成 `{"a":1}`，后半截悄悄丢掉。Jackson 3（本项目用的是 3.1.5）默认已经开启，Jackson 2 默认是关闭的。这里显式写出来，是为了让这条规则不依赖版本的默认值，读代码的人也一眼能看到。
+- **为什么解析器是一个静态常量**：Jackson 的 `JsonMapper` 创建开销较大，但创建好之后是线程安全的，所有 Producer 共用一个即可。
+- **例子**：
+
+  | 文件内容 | 结果 |
+  |---|---|
+  | `{"name": "Beispiel"}` | `content` 为 JSON 对象 `{"name":"Beispiel"}` |
+  | `[1, 2, 3]` | `content` 为 JSON 数组（任何合法的 JSON 值都可以） |
+  | `kein JSON` | 不合法，进 errorbox |
+  | 空文件 | 不合法，进 errorbox |
+  | `{"a":1} 垃圾` | 不合法，进 errorbox |
 
 ##### `track(file, taskId)`
 
@@ -1250,7 +1271,7 @@ flowchart TD
 ##### `submit(jobId, items)`
 
 - **做什么**：提交一批文件，返回成功转换的文件及其 TaskId。
-- **步骤**：和 `createBatchJob` 类似，请求是 `POST /tasks`，请求体为 `{"jobId", "items":[{"fileName","content"}]}`。拿到应答后，只保留文件名和 TaskId 都不为空的条目，转换成 `SubmittedFile` 列表。应答里根本没有 `tasks` 字段时返回空列表，相当于"全部未转换"。错误同样包装成带分类的 `SubmitFailedException`。
+- **步骤**：和 `createBatchJob` 类似，请求是 `POST /tasks`，请求体为 `{"jobId", "items":[{"fileName","content"}]}`。`content` 是文件内容转换成的 JSON 值，Jackson 原样写进请求，例如 `{"fileName":"a.json","content":{"name":"Beispiel"}}`，而不是一个转义过的字符串。拿到应答后，只保留文件名和 TaskId 都不为空的条目，转换成 `SubmittedFile` 列表。应答里根本没有 `tasks` 字段时返回空列表，相当于"全部未转换"。错误同样包装成带分类的 `SubmitFailedException`。
 - **为什么过滤不完整的条目**：一个没有 TaskId 的条目没法用来查询，把它当作"未转换"处理（进 errorbox）最清楚。
 
 ##### `queryStatus(taskIds)`
@@ -1316,7 +1337,7 @@ flowchart TD
 | 类型 | 含义 | 补充 |
 |---|---|---|
 | `TaskId` | 子表记录的编号（运单号） | 构造时拒绝空值，不会出现"空运单号"；`toString()` 返回编号本身，日志里显示 `t-123` 而不是 `TaskId[value=t-123]` |
-| `TestdataItem(fileName, content)` | 要提交的一个文件 | |
+| `TestdataItem(fileName, content)` | 要提交的一个文件 | `content` 是 `JsonNode`：文件内容转换成的 JSON。用 `JsonNode` 而不是 `String`，Jackson 才会把它作为 JSON 值写进请求，而不是转义成字符串 |
 | `SubmittedFile(fileName, taskId)` | Cloud-API 1 对一个成功转换文件的应答 | |
 | `RecordStatus` | `SUCCESS`、`ERROR`、`PENDING` | 记录的状态，由云端自己更新 |
 | `RecordStatusResult(taskId, status)` | Cloud-API 2 对一个 TaskId 的应答 | |

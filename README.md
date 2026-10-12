@@ -35,10 +35,11 @@ flowchart LR
    TaskRegistry ein und startet Producer und Consumer. Je Benutzer:in läuft höchstens eine Aufgabe. Schlägt das
    Anlegen fehl, wird keine Sandbox angelegt und der Start mit `502` (Cloud nicht verfügbar) bzw. `504` (Ergebnis
    unklar, z. B. keine Antwort) abgewiesen.
-2. **Producer** – verschiebt bis zu `batch-size` Dateien aus der `inbox` in die `pendingbox` und übermittelt sie
-   zusammen mit der Aufgabennummer in einem Aufruf an Cloud-API 1. Die TaskId jeder umgewandelten Datei sichert er als
-   Marker und trägt die Datei in den Status-Pool ein; nicht umgewandelte Dateien kommen in die `errorbox`. Danach
-   wartet er, bis der Pool auf `pool-resume-threshold` gesunken ist.
+2. **Producer** – verschiebt bis zu `batch-size` Dateien aus der `inbox` in die `pendingbox`, wandelt ihren Inhalt in
+   JSON um und übermittelt sie zusammen mit der Aufgabennummer in einem Aufruf an Cloud-API 1; Dateien ohne gültiges
+   JSON kommen sofort in die `errorbox`. Die TaskId jeder umgewandelten Datei sichert er als Marker und trägt die Datei
+   in den Status-Pool ein; nicht umgewandelte Dateien kommen in die `errorbox`. Danach wartet er, bis der Pool auf
+   `pool-resume-threshold` gesunken ist.
 3. **Consumer** – fragt die fälligen TaskIds gebündelt bei Cloud-API 2 ab: `SUCCESS` → `donebox`, `ERROR` →
    `errorbox`, `PENDING` → nach `poll-interval` erneut. Schlägt die Abfrage fehl, fragt er ebenfalls nach
    `poll-interval` erneut; Cloud-API 2 liest nur, die Aufgabe läuft weiter.
@@ -76,7 +77,7 @@ ein unerwarteter Fehler die Sandbox, wird wie bei einem Absturz nichts geschrieb
 ├── pendingbox/   an Cloud-API 1 übergeben, Ergebnis steht aus
 │   └── .taskids/ TaskId je Datei als Marker; eine Datei ohne Marker hat ein unklares Übermittlungsergebnis
 ├── donebox/      erfolgreich erzeugt
-└── errorbox/     nicht umgewandelt, fehlerhaft erzeugt oder unlesbar
+└── errorbox/     nicht umgewandelt, fehlerhaft erzeugt, unlesbar oder kein gültiges JSON
 ```
 
 Die Ordner werden beim ersten Start angelegt. Gültige Benutzerkennungen: `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
@@ -132,7 +133,7 @@ Der angenommene Vertrag der Cloud-Dienste (Pfade über `pipeline.cloud.*` einste
 | Aufruf | Anfrage | Antwort |
 |---|---|---|
 | Cloud-API 1: BatchgenAuftrag anlegen | `POST /jobs` `{"userId"}` | `{"jobId"}` |
-| Cloud-API 1: Batch übermitteln | `POST /tasks` `{"jobId","items":[{"fileName","content"}]}` | `{"tasks":[{"fileName","taskId"}]}`; fehlt eine Datei, wurde sie nicht umgewandelt |
+| Cloud-API 1: Batch übermitteln | `POST /tasks` `{"jobId","items":[{"fileName","content"}]}`; `content` ist der Inhalt der Datei als JSON-Wert, z. B. `{"fileName":"a.json","content":{"name":"Beispiel"}}` | `{"tasks":[{"fileName","taskId"}]}`; fehlt eine Datei, wurde sie nicht umgewandelt |
 | Cloud-API 2: Bulk-Statusabfrage | `POST /tasks/status` `{"taskIds":[…]}` | `{"results":[{"taskId","status"}]}` mit `SUCCESS`, `ERROR` oder `PENDING` |
 | Cloud-API 3: Endzustand setzen | `PUT /jobs/{jobId}/status` `{"status"}` | – |
 | Cloud-API 3: BatchgenAuftrag lesen | `GET /jobs/{jobId}` | `{"jobId","userId","status","counts":{"SUCCESS","ERROR","PENDING"}}`; `404`, wenn es ihn nicht gibt |
@@ -267,6 +268,8 @@ src/main/java/de/wwsstl/asynchrone/
 | [`anforderungen.md`](docs/architect/anforderungen.md) | funktionale und nicht-funktionale Anforderungen |
 | [`funktionsweise_sequenz.md`](docs/architect/funktionsweise_sequenz.md) | verbindlicher Ablauf einer Aufgabe, Abschnitte 1–7 ([chinesische Fassung](docs/architect/funktionsweise_sequenz_zh.md)) |
 | [`implementierung_zh.md`](docs/architect/implementierung_zh.md) | ausführliche Implementierungsbeschreibung (chinesisch): jedes Paket, jede Klasse und Methode mit Begründung, Zusammenspiel von Producer, Consumer, TaskManager und TaskContext |
+| [`cloud_api1_submit.md`](docs/architect/cloud_api1_submit.md) | Anfragedokumentation Cloud-API 1 (Batch übermitteln): Felder, JSON-Beispiele für Anfrage ([`cloud_api1_submit_request.json`](docs/architect/cloud_api1_submit_request.json)) und Antwort ([`cloud_api1_submit_response.json`](docs/architect/cloud_api1_submit_response.json)), Fehlerbehandlung |
+| [`cloud_api2_status.md`](docs/architect/cloud_api2_status.md) | Anfragedokumentation Cloud-API 2 (Bulk-Statusabfrage): Felder, JSON-Beispiele für Anfrage ([`cloud_api2_status_request.json`](docs/architect/cloud_api2_status_request.json)) und Antwort ([`cloud_api2_status_response.json`](docs/architect/cloud_api2_status_response.json)), Fehlerbehandlung |
 | [`laufzeitstruktur.mmd`](docs/architect/laufzeitstruktur.mmd) | Laufzeitstruktur: Singletons, je Aufgabe eine Sandbox (Producer, Consumer) und ein Supervisor-Thread des TaskManagers |
 | [`zustandsuebergang.md`](docs/architect/zustandsuebergang.md) | einmaliger Zustandsübergang im TaskContext: Zustandsdiagramm und wer die Aufgabe mit welchem Grund beenden kann |
 | [`funktionsweise_sequenz.mmd`](docs/architect/funktionsweise_sequenz.mmd) | Sequenzdiagramm des Ablaufs, die Sandbox als Blackbox |

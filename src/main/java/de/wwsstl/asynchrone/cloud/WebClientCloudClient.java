@@ -29,7 +29,8 @@ import reactor.util.retry.Retry;
  *   <li>Cloud-API 1, BatchgenAuftrag anlegen: {@code POST job-path} mit {@code {"userId"}} → {@code {"jobId"}}</li>
  *   <li>Cloud-API 1, Batch übermitteln: {@code POST submit-path} mit
  *       {@code {"jobId","items":[{"fileName","content"}]}} → {@code {"tasks":[{"fileName","taskId"}]}};
- *       Dateien ohne Eintrag in {@code tasks} wurden nicht umgewandelt</li>
+ *       {@code content} ist der Inhalt der Datei als JSON-Wert (keine Zeichenkette); Dateien ohne Eintrag in
+ *       {@code tasks} wurden nicht umgewandelt</li>
  *   <li>Cloud-API 2: {@code POST status-path} mit {@code {"taskIds":[…]}} →
  *       {@code {"results":[{"taskId","status":"SUCCESS|ERROR|PENDING"}]}}</li>
  *   <li>Cloud-API 3, Endzustand setzen: {@code PUT job-path/{jobId}/status} mit {@code {"status"}}</li>

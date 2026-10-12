@@ -74,7 +74,16 @@ final class PipelineApi {
         return base.resolve(user).resolve(box);
     }
 
-    void drop(String user, String fileName, String content) {
+    /**
+     * Legt eine Datei mit dem JSON-Inhalt {@code {"data":"<marker>"}} in die inbox; der Marker steuert die
+     * {@link FakeCloud} ({@code REJECT}, {@code FAIL}, {@code SLOW}).
+     */
+    void drop(String user, String fileName, String marker) {
+        dropRaw(user, fileName, "{\"data\":\"" + marker + "\"}");
+    }
+
+    /** Legt eine Datei mit genau diesem Inhalt in die inbox, z. B. ungültiges JSON. */
+    void dropRaw(String user, String fileName, String content) {
         try {
             Files.createDirectories(box(user, "inbox"));
             Files.writeString(box(user, "inbox").resolve(fileName), content);
@@ -83,10 +92,10 @@ final class PipelineApi {
         }
     }
 
-    /** Legt {@code count} Dateien {@code <user>-<n>.json} mit dem angegebenen Inhalt in die inbox. */
-    void dropFiles(String user, int count, String content) {
+    /** Legt {@code count} Dateien {@code <user>-<n>.json} mit dem angegebenen Marker in die inbox. */
+    void dropFiles(String user, int count, String marker) {
         for (int i = 0; i < count; i++) {
-            drop(user, user + "-" + i + ".json", "{\"data\":\"" + content + "\"}");
+            drop(user, user + "-" + i + ".json", marker);
         }
     }
 

@@ -35,7 +35,7 @@ Der TaskManager startet die Aufgabe in folgenden Schritten:
 Der Producer arbeitet die `inbox` batchweise ab. Für jeden Batch:
 
 1. Bis zu `batch-size` Dateien in die `pendingbox` verschieben. Cloud-API 1 ist nicht idempotent, und jede Datei wird höchstens einmal übermittelt; deshalb verlassen die Dateien die `inbox` schon vor dem Aufruf.
-2. Die JSON-Daten dieser Dateien zusammen mit der Aufgabennummer in einer einzigen Anfrage an Cloud-API 1 übermitteln.
+2. Den Inhalt jeder Datei in JSON umwandeln und die JSON-Daten dieser Dateien zusammen mit der Aufgabennummer in einer einzigen Anfrage an Cloud-API 1 übermitteln. Jede Datei ist darin ein Eintrag aus Dateiname und Inhalt; der Inhalt wird als JSON-Wert übermittelt, nicht als Zeichenkette. Eine Datei, die sich nicht lesen lässt oder kein gültiges JSON enthält (auch eine leere Datei), wird nicht übermittelt: Sie kommt direkt in die `errorbox` und zählt zur Fehlerschwelle.
 3. Die JSON-Antwort von Cloud-API 1 gibt an, welche Dateien erfolgreich in Datenerzeugungsaufträge umgewandelt wurden und welche nicht. Jede erfolgreich umgewandelte Datei erhält die Nummer des in der Untertabelle erzeugten Datensatzes, also ihre TaskId.
 4. Erfolgreich umgewandelte Dateien: Die TaskId wird als Marker gesichert und in den Status-Pool eingetragen.
 5. Nicht umgewandelte Dateien: Sie werden direkt in die `errorbox` verschoben, und der Fehlerzähler steigt um eins; sie zählen wie Dateien mit dem Status `ERROR` aus Abschnitt 3 zur Fehlerschwelle.

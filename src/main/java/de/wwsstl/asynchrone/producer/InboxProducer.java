@@ -32,6 +32,10 @@ import de.wwsstl.asynchrone.files.UserFolders;
 import de.wwsstl.asynchrone.pool.StatusPool;
 import de.wwsstl.asynchrone.task.TaskContext;
 import de.wwsstl.asynchrone.task.TaskState;
+import tools.jackson.core.JacksonException;
+import tools.jackson.databind.DeserializationFeature;
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.json.JsonMapper;
 
 /**
  * Producer-Thread einer Sandbox (funktionsweise_sequenz.md, Abschnitt 2). Er arbeitet die {@code inbox} batchweise
@@ -39,7 +43,9 @@ import de.wwsstl.asynchrone.task.TaskState;
  * <ol>
  *   <li>bis zu {@code batch-size} Dateien in die {@code pendingbox} verschieben, noch vor dem Aufruf von Cloud-API 1,
  *       damit keine Datei doppelt übermittelt wird (Cloud-API 1 ist nicht idempotent);</li>
- *   <li>ihre Daten zusammen mit der Aufgabennummer in einer Anfrage an Cloud-API 1 übermitteln;</li>
+ *   <li>ihren Inhalt in JSON umwandeln und zusammen mit der Aufgabennummer in einer Anfrage an Cloud-API 1
+ *       übermitteln; Dateien, die sich nicht lesen lassen oder kein gültiges JSON enthalten, kommen in die
+ *       {@code errorbox};</li>
  *   <li>für erfolgreich umgewandelte Dateien die TaskId als Marker sichern und in den Status-Pool eintragen;</li>
  *   <li>nicht umgewandelte Dateien in die {@code errorbox} verschieben und als Fehler zählen;</li>
  *   <li>warten, bis der Status-Pool auf {@code pool-resume-threshold} gesunken ist (Rückstau).</li>
@@ -59,6 +65,14 @@ public final class InboxProducer implements Runnable {
     private static final Duration RESULT_GRACE = Duration.ofSeconds(5);
 
     private static final String SUBMIT = "Cloud-API 1 (Batch übermitteln)";
+
+    /**
+     * Wandelt den Inhalt der Dateien in JSON um; Text nach dem JSON-Wert gilt als ungültig. In Jackson 3 ist das bereits
+     * der Standard, es wird hier ausdrücklich gesetzt, damit es nicht vom Standardwert abhängt.
+     */
+    private static final JsonMapper JSON = JsonMapper.builder()
+            .enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+            .build();
 
     private enum Outcome { SUBMITTED, NOT_PROCESSED, UNCLEAR }
 
@@ -142,11 +156,11 @@ public final class InboxProducer implements Runnable {
         for (Path file : batch) {
             String name = file.getFileName().toString();
             try {
-                items.add(new TestdataItem(name, Files.readString(file)));
+                items.add(new TestdataItem(name, readJson(file)));
                 filesByName.put(name, file);
-            } catch (IOException | UncheckedIOException e) {
-                log.warn("[{}] Datei {} ist nicht lesbar und kommt in die errorbox: {}", context.userId(), name,
-                        e.toString());
+            } catch (IOException | UncheckedIOException | JacksonException e) {
+                log.warn("[{}] Datei {} ist nicht lesbar oder kein gültiges JSON und kommt in die errorbox: {}",
+                        context.userId(), name, e.toString());
                 fail(file);
             }
         }
@@ -189,6 +203,20 @@ public final class InboxProducer implements Runnable {
         log.info("[{}] Aufgabe {}: Batch mit {} Dateien übermittelt, {} umgewandelt, {} nicht umgewandelt",
                 context.userId(), context.taskNumber(), filesByName.size(), filesByName.size() - rejected, rejected);
         return Outcome.SUBMITTED;
+    }
+
+    /**
+     * Liest eine Datei und wandelt ihren Inhalt in JSON um; die Kodierung (UTF-8, UTF-16, UTF-32) erkennt Jackson.
+     *
+     * @throws JacksonException wenn der Inhalt kein gültiges JSON ist
+     * @throws IOException      wenn die Datei nicht lesbar oder leer ist
+     */
+    private static JsonNode readJson(Path file) throws IOException {
+        JsonNode content = JSON.readTree(Files.readAllBytes(file));
+        if (content == null || content.isMissingNode()) {
+            throw new IOException("Datei ist leer");
+        }
+        return content;
     }
 
     /** Sichert die TaskId als Marker und trägt die Datei in den Status-Pool ein. */

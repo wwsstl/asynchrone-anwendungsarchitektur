@@ -21,6 +21,8 @@ import de.wwsstl.asynchrone.FakeCloud;
 import de.wwsstl.asynchrone.FakeCloud.SubmitBehavior;
 import de.wwsstl.asynchrone.TestProperties;
 import de.wwsstl.asynchrone.config.PipelineProperties;
+import tools.jackson.databind.node.JsonNodeFactory;
+import tools.jackson.databind.node.ObjectNode;
 
 /** Der Vertrag mit den Cloud-Diensten und die Einordnung der Fehler von Cloud-API 1. */
 class WebClientCloudClientTest {
@@ -39,15 +41,26 @@ class WebClientCloudClientTest {
         String jobId = get(client.createBatchJob("conv"));
 
         List<SubmittedFile> submitted = get(client.submit(jobId,
-                List.of(new TestdataItem("a.json", "ok"), new TestdataItem("b.json", "REJECT"))));
+                List.of(item("a.json", "ok"), item("b.json", "REJECT"))));
 
         assertThat(submitted).extracting(SubmittedFile::fileName).containsExactly("a.json");
     }
 
     @Test
+    void submitSendsFileContentAsJson() throws Exception {
+        String jobId = get(client.createBatchJob("json"));
+        ObjectNode content = JsonNodeFactory.instance.objectNode().put("data", "ok").put("count", 2);
+
+        get(client.submit(jobId, List.of(new TestdataItem("json.json", content))));
+
+        // Als JSON-Objekt, nicht als Zeichenkette mit maskiertem JSON ("{\"data\":…}").
+        assertThat(cloud.contentOf("json.json")).isEqualTo("{\"data\":\"ok\",\"count\":2}");
+    }
+
+    @Test
     void statusAndJobFollowTheCloud() throws Exception {
         String jobId = get(client.createBatchJob("flow"));
-        TaskId taskId = get(client.submit(jobId, List.of(new TestdataItem("a.json", "ok")))).getFirst().taskId();
+        TaskId taskId = get(client.submit(jobId, List.of(item("a.json", "ok")))).getFirst().taskId();
 
         assertThat(get(client.queryStatus(List.of(taskId))))
                 .containsExactly(new RecordStatusResult(taskId, RecordStatus.PENDING));
@@ -120,7 +133,7 @@ class WebClientCloudClientTest {
     }
 
     private static void assertSubmitFails(CloudClient client, String jobId, SubmitFailedException.Kind kind) {
-        assertFails(client.submit(jobId, List.of(new TestdataItem("probe.json", "ok"))), kind);
+        assertFails(client.submit(jobId, List.of(item("probe.json", "ok"))), kind);
     }
 
     private static void assertFails(CompletableFuture<?> call, SubmitFailedException.Kind kind) {
@@ -128,6 +141,11 @@ class WebClientCloudClientTest {
                 .isInstanceOf(ExecutionException.class)
                 .cause()
                 .isInstanceOfSatisfying(SubmitFailedException.class, e -> assertThat(e.kind()).isEqualTo(kind));
+    }
+
+    /** Eine Datei mit dem JSON-Inhalt {@code {"data":"<marker>"}}; der Marker steuert die {@link FakeCloud}. */
+    private static TestdataItem item(String fileName, String marker) {
+        return new TestdataItem(fileName, JsonNodeFactory.instance.objectNode().put("data", marker));
     }
 
     private static CloudClient client(URI baseUrl, PipelineProperties.Cloud config) {

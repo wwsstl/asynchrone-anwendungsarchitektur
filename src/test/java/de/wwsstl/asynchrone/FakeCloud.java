@@ -159,6 +159,12 @@ public final class FakeCloud implements AutoCloseable {
         return List.copyOf(submitBatchSizes);
     }
 
+    /** Der übermittelte Inhalt einer umgewandelten Datei als JSON-Text; {@code null}, wenn es keinen Datensatz gibt. */
+    public String contentOf(String fileName) {
+        return records.values().stream().filter(record -> record.fileName.equals(fileName))
+                .map(record -> record.content).findFirst().orElse(null);
+    }
+
     public List<StatusCall> statusCalls() {
         return List.copyOf(statusCalls);
     }
@@ -240,7 +246,8 @@ public final class FakeCloud implements AutoCloseable {
         List<Map<String, String>> tasks = new ArrayList<>();
         for (JsonNode item : items) {
             String fileName = item.path("fileName").asString();
-            String content = item.path("content").asString();
+            // Der Inhalt kommt als JSON-Wert an; für die Marker (REJECT, FAIL, SLOW) genügt sein JSON-Text.
+            String content = item.path("content").toString();
             submittedFileNames.add(fileName);
             if (content.contains("REJECT")) {
                 continue;
