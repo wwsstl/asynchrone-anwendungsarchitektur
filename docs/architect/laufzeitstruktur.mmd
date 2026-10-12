@@ -1,0 +1,32 @@
+flowchart TB
+
+    %% Laufzeitstruktur (Übersetzung von implementierung_zh.md, Abschnitt 1.4)
+    %% Oben die Objekte, die es über die gesamte Laufzeit genau einmal gibt; unten die Sandbox, die je Aufgabe entsteht
+
+    subgraph Singletons["Einmal je Anwendung, über die gesamte Laufzeit"]
+        API["TaskController<br/>+ ApiExceptionHandler"]
+        TM["TaskManager"]
+        Reg[("TaskRegistry")]
+        Users[("users: je Benutzer:in ein UserSlot")]
+        Cloud["CloudClient<br/>(WebClientCloudClient)"]
+    end
+    subgraph SB["Sandbox je Aufgabe"]
+        Ctx["TaskContext<br/>Zustand · Grund · Abbruchsignal · Zähler"]
+        Pool[("StatusPool")]
+        P["Producer<br/>(Virtual Thread)"]
+        C["Consumer<br/>(Virtual Thread)"]
+        Sup["Supervisor<br/>(Virtual Thread)"]
+    end
+    API -->|"Aufruf auf einem Virtual Thread"| TM
+    TM --> Reg
+    TM --> Users
+    TM -->|"baut auf, trägt ein, startet"| SB
+    P <--> Ctx
+    C <--> Ctx
+    P -->|"add"| Pool
+    C -->|"due / reschedule / remove"| Pool
+    Pool -.->|"size: Rückstau"| P
+    Sup -->|"join P und C, Endzustand schreiben, abmelden"| TM
+    P --> Cloud
+    C --> Cloud
+    TM --> Cloud
