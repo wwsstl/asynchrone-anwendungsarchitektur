@@ -5,6 +5,7 @@
 - 业务流程的规范是 [`funktionsweise_sequenz_zh.md`](funktionsweise_sequenz_zh.md)（德文版 [`funktionsweise_sequenz.md`](funktionsweise_sequenz.md)），代码注释里的"Abschnitt n"指的就是那份文档的第 n 节。本文描述的是代码层面的实现。
 - 使用说明、REST 接口和配置的速查见 [`README.md`](../../README.md)。
 - 类名、方法名和德文领域术语（BatchgenAuftrag、inbox、pendingbox、donebox、errorbox 等）保持原样。
+- 德文版见 [`implementierung.md`](implementierung.md)。
 
 ## 目录
 
@@ -1704,11 +1705,11 @@ flowchart TD
 |---|---|---|
 | `TaskContextTest` | 单元 | 先到先得、中止信号、超时、错误阈值、快照、状态映射 |
 | `InMemoryStatusPoolTest` | 单元 | 到期查询、重新排期、已移除条目不会被加回 |
-| `UserFoldersTest` | 单元 | 目录创建、用户名校验、列表、标记、移动、重名 |
+| `UserFoldersTest` | 单元 | 目录创建、用户名校验、列表、标记、移动、重名、原因文件 |
 | `PipelinePropertiesTest` | 单元 | 默认值和校验 |
-| `WebClientCloudClientTest` | 组件（对 `FakeCloud`） | 约定、API-1 的错误分类、重试 |
+| `WebClientCloudClientTest` | 组件（对 `FakeCloud`） | 约定、API-1 的错误分类、重试、`fehlermeldung` |
 | `TaskManagerTest` | 组件（桩 Cloud，无 HTTP） | 启动、拒绝、中止、注销、关闭、各种结束原因 |
-| `PipelineIntegrationTest`、`PipelineTimeoutIntegrationTest` | 集成（完整 Spring 应用对 `FakeCloud`，同一 JVM） | 所有结束状态、API-1 的错误类型、启动被拒的原因、隔离性 |
+| `PipelineIntegrationTest`、`PipelineTimeoutIntegrationTest` | 集成（完整 Spring 应用对 `FakeCloud`，同一 JVM） | 所有结束状态、API-1 的错误类型、启动被拒的原因、隔离性、errorbox 里的原因文件 |
 | `PipelineBlackBoxIT` | 黑盒（应用 JAR 和 `FakeCloudBackendApplication` 各自独立运行，只通过 HTTP 交互） | 主要流程，作为外部视角的验收 |
 
 测试辅助类：`FakeCloud`（同一 JVM 里的云端替身，行为由文件内容和预设控制，例如 `REJECT`（未转换并带 `fehlermeldung`）、`OMIT`（应答里不出现）、`FAIL`（`ERROR` 并带 `fehlermeldung`）、`SLOW`、延迟应答）、`FakeBackendClient`（`FakeCloudBackendApplication` 管理接口的客户端）、`PipelineApi`（REST 接口和用户目录的客户端）、`ExternalProcess`（启动外部进程）、`MutableClock`、`TestProperties`、`PipelineTestSupport`（集成测试的公共配置：短间隔、随机端口）。
