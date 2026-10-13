@@ -18,6 +18,7 @@ public final class TaskContext {
 
     private final String userId;
     private final String taskNumber;
+    private final JobDefinition job;
     private final Instant startedAt;
     private final Duration timeout;
     private final int errorThreshold;
@@ -38,9 +39,11 @@ public final class TaskContext {
     private final AtomicInteger unclearCount = new AtomicInteger();
     private final AtomicBoolean producerFinished = new AtomicBoolean();
 
-    public TaskContext(String userId, String taskNumber, Duration timeout, int errorThreshold, Clock clock) {
+    public TaskContext(String userId, String taskNumber, JobDefinition job, Duration timeout, int errorThreshold,
+            Clock clock) {
         this.userId = userId;
         this.taskNumber = taskNumber;
+        this.job = job;
         this.timeout = timeout;
         this.errorThreshold = errorThreshold;
         this.clock = clock;
@@ -151,7 +154,8 @@ public final class TaskContext {
     }
 
     public TaskSnapshot snapshot(int pending) {
-        return new TaskSnapshot(taskNumber, userId, state.get(), reason.get(), startedAt, finishedAt.get(),
-                submittedCount.get(), succeededCount.get(), errorCount.get(), pending, unclearCount.get());
+        return new TaskSnapshot(taskNumber, userId, job.jobType(), job.jobName(), state.get(), reason.get(), startedAt,
+                finishedAt.get(), submittedCount.get(), succeededCount.get(), errorCount.get(), pending,
+                unclearCount.get());
     }
 }

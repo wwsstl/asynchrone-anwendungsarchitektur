@@ -2,11 +2,15 @@ package de.wwsstl.asynchrone.task;
 
 import java.time.Instant;
 
+import de.wwsstl.asynchrone.cloud.JobType;
+
 /**
  * Lokaler Stand einer laufenden Aufgabe (funktionsweise_sequenz.md, Abschnitt 4). Er enthält nur Ergebnisse, die der
  * Consumer bereits verarbeitet hat, und kann den Zahlen der Cloud etwas hinterherhinken.
  *
  * @param taskNumber Aufgabennummer, zugleich die Nummer des BatchgenAuftrags
+ * @param jobType    Art des BatchgenAuftrags
+ * @param jobName    Name des BatchgenAuftrags
  * @param reason     Grund des Endzustands, z. B. welcher Aufruf welcher Cloud-API fehlgeschlagen ist; {@code null},
  *                   solange die Aufgabe läuft
  * @param finishedAt Zeitpunkt des Endzustands; {@code null}, solange die Aufgabe läuft
@@ -19,6 +23,8 @@ import java.time.Instant;
 public record TaskSnapshot(
         String taskNumber,
         String userId,
+        JobType jobType,
+        String jobName,
         TaskState state,
         String reason,
         Instant startedAt,

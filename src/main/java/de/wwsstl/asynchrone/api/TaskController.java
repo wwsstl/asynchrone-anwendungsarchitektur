@@ -7,6 +7,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -33,10 +34,17 @@ public class TaskController {
         this.taskManagerScheduler = taskManagerScheduler;
     }
 
-    /** Startet eine Aufgabe: {@code 202 Accepted} mit dem lokalen Stand und der Adresse für die Statusabfrage. */
+    /**
+     * Startet eine Aufgabe: {@code 202 Accepted} mit dem lokalen Stand und der Adresse für die Statusabfrage. Der Rumpf
+     * nennt Art und Name des BatchgenAuftrags, z. B. {@code {"jobType":"KUNDENDATEN","jobName":"Testlauf Oktober"}};
+     * {@code jobName} ist optional. Geprüft werden die Angaben im {@link TaskManager}.
+     */
     @PostMapping
-    public Mono<ResponseEntity<TaskSnapshot>> start(@PathVariable String userId) {
-        return offload(() -> taskManager.start(userId)).map(snapshot -> ResponseEntity
+    public Mono<ResponseEntity<TaskSnapshot>> start(@PathVariable String userId,
+            @RequestBody(required = false) StartRequest request) {
+        String jobType = request == null ? null : request.jobType();
+        String jobName = request == null ? null : request.jobName();
+        return offload(() -> taskManager.start(userId, jobType, jobName)).map(snapshot -> ResponseEntity
                 .accepted()
                 .location(URI.create("/api/users/" + userId + "/tasks/" + snapshot.taskNumber()))
                 .body(snapshot));
@@ -53,6 +61,10 @@ public class TaskController {
     public Mono<ResponseEntity<TaskSnapshot>> cancel(@PathVariable String userId, @PathVariable String taskNumber) {
         return offload(() -> taskManager.cancel(userId, taskNumber))
                 .map(snapshot -> ResponseEntity.accepted().body(snapshot));
+    }
+
+    /** Rumpf der Startanfrage; die Werte werden ungeprüft an den {@link TaskManager} weitergereicht. */
+    record StartRequest(String jobType, String jobName) {
     }
 
     private <T> Mono<T> offload(Callable<T> call) {

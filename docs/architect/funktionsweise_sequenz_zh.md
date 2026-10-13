@@ -19,12 +19,12 @@
 
 ## 1. 启动
 
-用户通过REST-API启动一项任务。REST-API用Spring WebFlux实现，它在一个虚拟线程上把调用转交给TaskManager，以免阻塞事件循环（Event-Loop）。每个用户同一时间最多只运行一项任务。
+用户通过REST-API启动一项任务，同时给出BatchgenAuftrag的类型（`jobType`：`KUNDENDATEN`或`VERTRAGSDATEN`），名称可选（`jobName`，最多200个字符；不填则等于类型）。类型缺失、未知或名称过长时，启动立即被拒绝，返回`400 Bad Request`和原因代码`INVALID_JOB_TYPE`或`INVALID_JOB_NAME`；不新建任何东西，也不移动任何文件。REST-API用Spring WebFlux实现，它在一个虚拟线程上把调用转交给TaskManager，以免阻塞事件循环（Event-Loop）。每个用户同一时间最多只运行一项任务。
 
 TaskManager按以下步骤启动任务：
 
 1. **检查`pendingbox`：** 不为空说明还留有之前的任务没有处理完的文件（见第7节）。这时不新建BatchgenAuftrag，启动被拒绝，返回`409 Conflict`和原因代码`PENDINGBOX_NOT_EMPTY`，提示用户先处理这些文件。
-2. **新建BatchgenAuftrag：** 通过Cloud-API 1在云端数据库中新建一个BatchgenAuftrag，初始状态为RUNNING，它的编号就是任务号。第一阶段云端不限制同一用户拥有的BatchgenAuftrag数量，即使之前的BatchgenAuftrag仍处于RUNNING，也可以新建。
+2. **新建BatchgenAuftrag：** 通过Cloud-API 1在云端数据库中新建一个BatchgenAuftrag，带上类型和名称，初始状态为RUNNING，它的编号就是任务号。第一阶段云端不限制同一用户拥有的BatchgenAuftrag数量，即使之前的BatchgenAuftrag仍处于RUNNING，也可以新建。
    调用失败时不创建Sandbox，失败按第2节的方式分类：
    - **明确没有被处理**（连接失败、请求被拒绝）：云端不可用，启动被拒绝，返回`502 Bad Gateway`和原因代码`CLOUD_UNAVAILABLE`。
    - **结果不明**（超时：在`submit-timeout`之内没有应答、其他`5xx`、连接中断、应答无法解析或无效）：不再做任何操作，启动被拒绝，返回`504 Gateway Timeout`和原因代码`TIMEOUT`。原因里写明是哪个调用、出了什么问题，例如`Cloud-API 1 (BatchgenAuftrag anlegen): Ergebnis unklar, keine Antwort innerhalb von submit-timeout`。如果云端实际上已经新建了BatchgenAuftrag，它会保持RUNNING，需要人工修正（见第7节）。
@@ -66,7 +66,7 @@ Producer等待Cloud-API 1的应答时是阻塞的，但时间很短：应答只�
 
 用户可以随时查询状态，不需要TaskHistory组件：
 
-- **云端（随时可查）：** BatchgenAuftrag的状态，以及子记录的状态（SUCCESS、ERROR、PENDING各有多少）。BatchgenAuftrag的状态也包括应用写入的结束状态`COMPLETED`、`TIMEOUT`、`ERROR`和`TERMINATED`（见第5、6节），因此任务结束后也能查到它是怎样结束的。
+- **云端（随时可查）：** BatchgenAuftrag的类型、名称和状态，以及子记录的状态（SUCCESS、ERROR、PENDING各有多少）。BatchgenAuftrag的状态也包括应用写入的结束状态`COMPLETED`、`TIMEOUT`、`ERROR`和`TERMINATED`（见第5、6节），因此任务结束后也能查到它是怎样结束的。
 - **本地（只在任务运行期间，即Sandbox还在TaskRegistry中）：** 内存中的状态，包括各状态的数量；设置了结束状态之后还包括结束原因（例如哪个Cloud-API的哪次调用出了问题；原因同时写入日志，但不写入云端）。它只包括Consumer已经处理过的结果，可能比云端的数字稍晚一些。任务结束后，只能从云端查询。
 
 ## 5. 外部中止

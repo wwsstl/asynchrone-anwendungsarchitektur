@@ -2,6 +2,7 @@ package de.wwsstl.asynchrone;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.http.HttpClient;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
@@ -9,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Stream;
 
+import org.springframework.http.MediaType;
 import org.springframework.http.client.JdkClientHttpRequestFactory;
 import org.springframework.web.client.RestClient;
 
@@ -31,7 +33,10 @@ final class PipelineApi {
     private final Path base;
 
     PipelineApi(int port, Path base) {
-        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory();
+        // Nur HTTP/1.1: sonst versucht der JDK-Client auf jeder neuen Verbindung ein Upgrade auf h2c, und eine
+        // POST-Anfrage mit Rumpf bleibt dabei hängen, weil der Server kein HTTP/2 spricht.
+        JdkClientHttpRequestFactory requestFactory = new JdkClientHttpRequestFactory(
+                HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build());
         requestFactory.setReadTimeout(Duration.ofSeconds(60));
         this.client = RestClient.builder().baseUrl("http://localhost:" + port).requestFactory(requestFactory).build();
         this.base = base;
@@ -39,13 +44,27 @@ final class PipelineApi {
 
     // --- REST ------------------------------------------------------------------------------------------------
 
+    /** Rumpf der Startanfrage, wenn ein Test nichts anderes angibt. */
+    static final Map<String, String> DEFAULT_START = Map.of("jobType", "KUNDENDATEN");
+
     TaskSnapshot start(String user) {
-        return client.post().uri("/api/users/{u}/tasks", user).retrieve().body(TaskSnapshot.class);
+        return client.post().uri("/api/users/{u}/tasks", user).contentType(MediaType.APPLICATION_JSON)
+                .body(DEFAULT_START).retrieve().body(TaskSnapshot.class);
     }
 
     Response startResponse(String user) {
-        return client.post().uri("/api/users/{u}/tasks", user).exchange((request, response) -> new Response(
-                response.getStatusCode().value(), response.getHeaders().getFirst("Location"), body(response)));
+        return startResponse(user, DEFAULT_START);
+    }
+
+    /** Startanfrage mit diesem Rumpf: ein Objekt, das als JSON geschrieben wird, oder ein String als roher Rumpf. */
+    Response startResponse(String user, Object body) {
+        RestClient.RequestBodySpec request = client.post().uri("/api/users/{u}/tasks", user)
+                .contentType(MediaType.APPLICATION_JSON);
+        if (body != null) {
+            request.body(body);
+        }
+        return request.exchange((req, response) -> new Response(response.getStatusCode().value(),
+                response.getHeaders().getFirst("Location"), body(response)));
     }
 
     TaskStatus status(String user, String taskNumber) {

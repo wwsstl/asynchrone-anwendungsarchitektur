@@ -19,12 +19,12 @@ Die Anwendung veranlasst nur, dass die Cloud Daten erzeugt, und verarbeitet die 
 
 ## 1. Start
 
-Die Benutzer:in startet über die REST-API eine Aufgabe. Die REST-API ist mit Spring WebFlux umgesetzt und reicht den Aufruf auf einem Virtual Thread an den TaskManager weiter, damit der Event-Loop nicht blockiert. Je Benutzer:in läuft höchstens eine Aufgabe gleichzeitig.
+Die Benutzer:in startet über die REST-API eine Aufgabe und gibt dabei die Art des BatchgenAuftrags an (`jobType`: `KUNDENDATEN` oder `VERTRAGSDATEN`), optional auch seinen Namen (`jobName`, höchstens 200 Zeichen; ohne Angabe gleich der Art). Fehlt die Art, ist sie unbekannt oder ist der Name zu lang, wird der Start sofort mit `400 Bad Request` und dem Ursachencode `INVALID_JOB_TYPE` bzw. `INVALID_JOB_NAME` abgewiesen; es wird nichts angelegt und keine Datei bewegt. Die REST-API ist mit Spring WebFlux umgesetzt und reicht den Aufruf auf einem Virtual Thread an den TaskManager weiter, damit der Event-Loop nicht blockiert. Je Benutzer:in läuft höchstens eine Aufgabe gleichzeitig.
 
 Der TaskManager startet die Aufgabe in folgenden Schritten:
 
 1. **`pendingbox` prüfen:** Ist sie nicht leer, liegen dort noch Dateien einer früheren Aufgabe, die nicht abgeschlossen wurden (siehe Abschnitt 7). Dann legt der TaskManager keinen BatchgenAuftrag an; der Start wird mit `409 Conflict` und dem Ursachencode `PENDINGBOX_NOT_EMPTY` abgewiesen, und die Benutzer:in wird aufgefordert, zuerst diese Dateien zu bearbeiten.
-2. **BatchgenAuftrag anlegen:** Über Cloud-API 1 wird in der Cloud-Datenbank ein neuer BatchgenAuftrag mit dem Anfangsstatus RUNNING angelegt; seine Nummer ist die Aufgabennummer. In Phase 1 begrenzt die Cloud die Zahl der BatchgenAufträge je Benutzer:in nicht; ein neuer kann auch dann angelegt werden, wenn ein früherer noch auf RUNNING steht.
+2. **BatchgenAuftrag anlegen:** Über Cloud-API 1 wird in der Cloud-Datenbank ein neuer BatchgenAuftrag mit Art, Name und dem Anfangsstatus RUNNING angelegt; seine Nummer ist die Aufgabennummer. In Phase 1 begrenzt die Cloud die Zahl der BatchgenAufträge je Benutzer:in nicht; ein neuer kann auch dann angelegt werden, wenn ein früherer noch auf RUNNING steht.
    Schlägt der Aufruf fehl, wird keine Sandbox angelegt; die Fehler werden wie in Abschnitt 2 eingeordnet:
    - **Eindeutig nicht verarbeitet** (Verbindungsfehler, Anfrage abgelehnt): Die Cloud ist nicht verfügbar; der Start wird mit `502 Bad Gateway` und dem Ursachencode `CLOUD_UNAVAILABLE` abgewiesen.
    - **Ergebnis unklar** (Timeout: innerhalb von `submit-timeout` keine Antwort, sonstige `5xx`, abgebrochene Verbindung, unlesbare oder ungültige Antwort): Es wird nichts weiter unternommen, und der Start wird mit `504 Gateway Timeout` und dem Ursachencode `TIMEOUT` abgewiesen. Der Grund nennt den Aufruf und seine Ursache, z. B. `Cloud-API 1 (BatchgenAuftrag anlegen): Ergebnis unklar, keine Antwort innerhalb von submit-timeout`. Hat die Cloud den BatchgenAuftrag trotzdem angelegt, bleibt er auf RUNNING und muss manuell korrigiert werden (siehe Abschnitt 7).
@@ -66,7 +66,7 @@ Schlägt die Statusabfrage fehl (auch nach den Wiederholungen von `cloud.retries
 
 Die Benutzer:in kann den Status jederzeit abfragen; eine TaskHistory ist nicht nötig:
 
-- **Cloud (jederzeit abfragbar):** Status des BatchgenAuftrags und Status seiner Datensätze (wie viele `SUCCESS`, `ERROR` und `PENDING`). Zum Status des BatchgenAuftrags gehören auch die von der Anwendung geschriebenen Endzustände `COMPLETED`, `TIMEOUT`, `ERROR` und `TERMINATED` (siehe Abschnitte 5 und 6); auch nach dem Ende einer Aufgabe ist also abfragbar, wie sie geendet hat.
+- **Cloud (jederzeit abfragbar):** Art, Name und Status des BatchgenAuftrags sowie Status seiner Datensätze (wie viele `SUCCESS`, `ERROR` und `PENDING`). Zum Status des BatchgenAuftrags gehören auch die von der Anwendung geschriebenen Endzustände `COMPLETED`, `TIMEOUT`, `ERROR` und `TERMINATED` (siehe Abschnitte 5 und 6); auch nach dem Ende einer Aufgabe ist also abfragbar, wie sie geendet hat.
 - **Lokal (nur während die Aufgabe läuft, also solange die Sandbox in der TaskRegistry steht):** der Stand im Speicher, einschließlich der Anzahl je Status und, sobald ein Endzustand gesetzt ist, seines Grundes (z. B. welcher Aufruf welcher Cloud-API fehlgeschlagen ist; der Grund steht außerdem im Log, aber nicht in der Cloud). Er enthält nur Ergebnisse, die der Consumer bereits verarbeitet hat, und kann den Zahlen der Cloud etwas hinterherhinken. Nach dem Ende der Aufgabe ist nur noch die Abfrage in der Cloud möglich.
 
 ## 5. Abbruch von außen

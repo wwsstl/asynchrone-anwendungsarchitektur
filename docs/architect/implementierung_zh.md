@@ -56,7 +56,7 @@
 de.wwsstl.asynchrone
 ├── TestdatenPipelineApplication   Spring-Boot 入口
 ├── api/        REST 控制器和错误映射：只做转发，不含业务逻辑
-├── task/       TaskManager、TaskRegistry、Sandbox、TaskContext、状态和快照
+├── task/       TaskManager、TaskRegistry、Sandbox、TaskContext、状态、快照、任务的类型和名称
 ├── producer/   InboxProducer：读取 inbox，提交给 Cloud-API 1
 ├── consumer/   StatusConsumer：轮询 Cloud-API 2，移动文件，判定任务结束
 ├── pool/       Status-Pool：Producer 和 Consumer 之间的交接区
@@ -140,10 +140,11 @@ sequenceDiagram
     participant S as Supervisor
     participant Cl as Cloud
 
-    R->>TM: start(userId)
+    R->>TM: start(userId, jobType, jobName)
+    TM->>TM: JobDefinition.of（校验类型和名称）
     TM->>TM: claimUser（占用户名额）
     TM->>TM: pendingbox 为空？
-    TM->>Cl: API 1：新建 BatchgenAuftrag
+    TM->>Cl: API 1：新建 BatchgenAuftrag（带类型和名称）
     Cl-->>TM: 任务号
     TM->>TM: launch：Context、Pool、3 个线程，登记到 Registry
     TM-->>R: 快照（RUNNING）→ 202
@@ -315,10 +316,11 @@ Consumer 在一轮 `sweep` 之后判断 `isProducerFinished() && pool.isEmpty()`
 | 步骤 | 方法 | 为什么在这个位置 |
 |---|---|---|
 | 1. 解析并创建目录 | `folderResolver.resolve` | 用户名不合法时直接 `400`，不占名额 |
-| 2. 占名额 | `claimUser` | 必须在任何检查和云端调用之前，见上文 |
-| 3. 检查 pendingbox | `hasPendingFiles` | 在新建 BatchgenAuftrag **之前**拒绝，不会在云端留下空任务 |
-| 4. 新建 BatchgenAuftrag | `createBatchJob` | 同步进行，因为任务号是 Sandbox 和 Registry 的键，也要放进 `Location` 头；失败时还没有创建任何本地对象 |
-| 5. 构建并启动 | `launch` | 先在 `UserSlot` 里记下 Sandbox 和 Supervisor，再登记、再启动线程，见下文 |
+| 2. 校验类型和名称 | `JobDefinition.of` | 类型缺失或未知、名称过长时直接 `400`，不占名额，也不调用云端 |
+| 3. 占名额 | `claimUser` | 必须在任何状态检查和云端调用之前，见上文 |
+| 4. 检查 pendingbox | `hasPendingFiles` | 在新建 BatchgenAuftrag **之前**拒绝，不会在云端留下空任务 |
+| 5. 带类型和名称新建 BatchgenAuftrag | `createBatchJob` | 同步进行，因为任务号是 Sandbox 和 Registry 的键，也要放进 `Location` 头；失败时还没有创建任何本地对象 |
+| 6. 构建并启动 | `launch` | 先在 `UserSlot` 里记下 Sandbox 和 Supervisor，再登记、再启动线程，见下文 |
 | 失败时 | `finally` | 没有成功启动的话释放名额（`users.remove(userId, slot)` 只删除自己的名额） |
 
 `launch` 先把所有对象都构建好，Producer、Consumer、Supervisor 三个线程都处于 `unstarted` 状态。然后依次：记入 `UserSlot` → `registry.register` → `sandbox.start()` → `supervisor.start()`。先登记再启动，是为了线程一启动，查询和中止就能找到这个 Sandbox。启动失败时以 `ABORTED` 结束并从 Registry 移除。
@@ -438,7 +440,7 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 
 - 3.1 [根包](#31-根包-dewwsstlasynchrone)
 - 3.2 [`api`](#32-apirest-接口)：`TaskController`、`ApiExceptionHandler`
-- 3.3 [`task`](#33-task任务管理)：`TaskManager`、`TaskContext`、`Sandbox`、`TaskRegistry`、`TaskState`、`TaskSnapshot`、`TaskStatus`、异常
+- 3.3 [`task`](#33-task任务管理)：`TaskManager`、`TaskContext`、`Sandbox`、`TaskRegistry`、`TaskState`、`TaskSnapshot`、`TaskStatus`、`JobDefinition`、异常
 - 3.4 [`producer`](#34-producer)：`InboxProducer`
 - 3.5 [`consumer`](#35-consumer)：`StatusConsumer`
 - 3.6 [`pool`](#36-pool)：`StatusPool`、`InMemoryStatusPool`、`PoolEntry`
@@ -476,25 +478,31 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 
 三个接口，都在路径 `/api/users/{userId}/tasks` 下。构造器注入 `TaskManager` 和一个专用的调度器 `taskManagerScheduler`（见 `offload`）。
 
-##### `start(userId)`：`POST /api/users/{userId}/tasks`
+##### `start(userId, request)`：`POST /api/users/{userId}/tasks`
 
-- **做什么**：为用户启动一项任务。
+- **做什么**：为用户启动一项任务，BatchgenAuftrag 的类型和名称来自 JSON 请求体。
 - **怎么做**：
-  1. 通过 `offload` 在虚拟线程上调用 `taskManager.start(userId)`，得到本地快照 `TaskSnapshot`。
-  2. 返回 `202 Accepted`，`Location` 头为 `/api/users/{userId}/tasks/{任务号}`，正文是快照。
+  1. `@RequestBody(required = false) StartRequest request`：Spring 把请求体读进内部 record `StartRequest(jobType, jobName)`，两个字段都是字符串。没有请求体时 `request` 为 `null`，两个值都按"没填"处理。
+  2. 通过 `offload` 在虚拟线程上调用 `taskManager.start(userId, jobType, jobName)`，得到本地快照 `TaskSnapshot`。
+  3. 返回 `202 Accepted`，`Location` 头为 `/api/users/{userId}/tasks/{任务号}`，正文是快照。
+- **为什么 `jobType` 用 `String` 而不是 `JobType`**：如果让 Jackson 直接转换成枚举，未知的值在读请求体时就失败了，只能得到笼统的 `INVALID_REQUEST_BODY`。现在由 `JobDefinition.of` 校验，返回精确的 `INVALID_JOB_TYPE` 并列出允许的值。另外规则放在 `task` 包里，不经过 HTTP 的调用同样适用。
+- **为什么 `required = false`**：否则没有请求体的启动会被 Spring 用它自己的错误信息拒绝。现在它和"请求体里没有 `jobType`"走同一个校验：`400 INVALID_JOB_TYPE`，信息为"jobType fehlt"。
 - **为什么返回 202 而不是 200**：202 的意思是"已受理，正在处理"。任务要跑几分钟甚至更久，这个请求结束时任务远没有完成。
 - **为什么带 Location**：告诉客户端"进度去这个地址查"，这是 REST 处理异步任务的惯例，客户端不用自己拼地址。
 - **例子**：
 
   ```
   POST /api/users/alice/tasks
+  Content-Type: application/json
+  {"jobType":"VERTRAGSDATEN","jobName":"Testlauf Oktober"}
   → 202 Accepted
     Location: /api/users/alice/tasks/BJ-7
-    {"taskNumber":"BJ-7","userId":"alice","state":"RUNNING","reason":null, ...}
+    {"taskNumber":"BJ-7","userId":"alice","jobType":"VERTRAGSDATEN","jobName":"Testlauf Oktober","state":"RUNNING",
+     "reason":null, ...}
   ```
 
   快照里的状态通常是 `RUNNING`。如果 inbox 是空的，任务可能瞬间就结束了，这时看到的也可能已经是 `COMPLETED`。
-- **失败时**：`TaskManager` 抛出的异常（`409`、`502`、`504`、`400`）由 `ApiExceptionHandler` 统一转换。
+- **失败时**：`TaskManager` 抛出的异常（`400`、`409`、`502`、`504`）和无法读取的请求体（`400`）由 `ApiExceptionHandler` 统一转换。
 
 ##### `status(userId, taskNumber)`：`GET /api/users/{userId}/tasks/{taskNumber}`
 
@@ -537,6 +545,16 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 
 - **何时**：路径里的用户名或任务号格式不合法。
 - **为什么是 400**：这是客户端的输入错误，换个合法的值重试就行，和服务器状态无关。
+
+##### `invalidJobType` → `400 INVALID_JOB_TYPE`，`invalidJobName` → `400 INVALID_JOB_NAME`
+
+- **何时**：启动请求体里没有 `jobType`（或者根本没有请求体），或者它不是允许的类型之一；`jobName` 超过 200 个字符。类型错误时信息里列出允许的值，名称过长时给出长度。
+- **为什么分成两个代码**：界面可以标出是哪个输入框有问题。
+
+##### `invalidRequestBody` → `400 INVALID_REQUEST_BODY`
+
+- **何时**：Spring 读不了请求体（`ServerWebInputException`），例如 JSON 被截断或格式不对。`detail` 以"Rumpf der Anfrage nicht lesbar:"开头，后面是 Spring 给出的原因。
+- **为什么单独处理**：Spring 自己也会返回 `400`，但没有 `code`；那样它就成了唯一一种界面拿不到原因代码的错误应答。
 
 ##### `notFound` → `404 TASK_NOT_FOUND`
 
@@ -589,19 +607,21 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 
 内部类 `UserSlot`：一个用户的号牌，记着这个用户当前的 Sandbox 和 Supervisor 线程。两个字段是 `volatile`，因为写入它们的线程（启动请求的线程）和读取它们的线程（另一个启动请求、应用关闭）可能不同，`volatile` 保证读的线程能看到最新的值。
 
-##### `start(userId)`
+##### `start(userId, jobType, jobName)`
 
 - **做什么**：为用户启动一项任务，返回本地快照。
 - **怎么做**：
   1. `folderResolver.resolve(userId)`：校验用户名并找到（必要时创建）目录。用户名不合法会直接抛异常，这时还没占号牌。
-  2. `claimUser(userId)`：占用户号牌，被占就拒绝（`409 USER_TASK_RUNNING`）。
-  3. `hasPendingFiles`：pendingbox 里还有文件就拒绝（`409 PENDINGBOX_NOT_EMPTY`）。
-  4. `createBatchJob`：在云端新建 BatchgenAuftrag，拿到任务号。
-  5. `launch`：构建 Sandbox 并启动三个线程。
-  6. 返回快照。
-  7. 第 2 步之后，无论哪一步失败，`finally` 都会把号牌还回去（`users.remove(userId, slot)`，只还自己拿到的这一块）。
+  2. `JobDefinition.of(jobType, jobName)`：校验类型和名称，名称没填时用类型名代替。不合法直接返回 `400 INVALID_JOB_TYPE` 或 `400 INVALID_JOB_NAME`，这时同样还没占号牌。
+  3. `claimUser(userId)`：占用户号牌，被占就拒绝（`409 USER_TASK_RUNNING`）。
+  4. `hasPendingFiles`：pendingbox 里还有文件就拒绝（`409 PENDINGBOX_NOT_EMPTY`）。
+  5. `createBatchJob`：在云端带类型和名称新建 BatchgenAuftrag，拿到任务号。
+  6. `launch`：构建 Sandbox（类型和名称放进 `TaskContext`）并启动三个线程。
+  7. 返回快照；日志里记下任务号、类型和名称。
+  8. 第 3 步之后，无论哪一步失败，`finally` 都会把号牌还回去（`users.remove(userId, slot)`，只还自己拿到的这一块）。
 - **为什么是这个顺序**：
-  - **先占号牌，再做检查**：假设同一用户几乎同时发出两个启动请求。如果先检查 pendingbox 再占号牌，两个请求都会看到"pendingbox 为空"，然后各自在云端新建一个 BatchgenAuftrag。先占号牌，第二个请求在第 2 步就被拒绝了。
+  - **最先校验输入**：类型错误或名称过长是请求本身的错误，和服务器状态无关。它们既不应该占号牌，也不应该去读 pendingbox 或调用云端。
+  - **先占号牌，再做检查**：假设同一用户几乎同时发出两个启动请求。如果先检查 pendingbox 再占号牌，两个请求都会看到"pendingbox 为空"，然后各自在云端新建一个 BatchgenAuftrag。先占号牌，第二个请求在第 3 步就被拒绝了。
   - **先检查 pendingbox，再调用云端**：被拒绝时云端不会多出一个空的 BatchgenAuftrag。
   - **新建 BatchgenAuftrag 是同步的**：任务号是 Sandbox 在登记簿里的键，也要放进 `Location` 头，必须先拿到；而且云端失败时本地还什么都没创建，不需要清理。
 - **如果不还号牌**：一次失败的启动（例如云端不可达）会让这个用户永远无法再启动任务。
@@ -629,11 +649,11 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 - **做什么**：问用户目录"pendingbox 里有没有文件"。
 - **为什么要包一层**：`UserFolders.hasPendingFiles` 会抛出受检异常 `IOException`，`start` 的签名里没有声明它。这里把它转成 `UncheckedIOException`，最终由 Spring 返回 `500`，因为读不了磁盘属于本应用的故障。
 
-##### `createBatchJob(userId)`
+##### `createBatchJob(userId, job)`
 
-- **做什么**：调用 Cloud-API 1 新建 BatchgenAuftrag，返回任务号；失败时按失败类型抛出不同的异常。
+- **做什么**：调用 Cloud-API 1 新建 BatchgenAuftrag（带 `job` 里的类型和名称），返回任务号；失败时按失败类型抛出不同的异常。
 - **怎么做**：
-  1. 调用 `cloud.createBatchJob(userId)`，得到一个 `CompletableFuture`。
+  1. 调用 `cloud.createBatchJob(userId, job.jobType(), job.jobName())`，得到一个 `CompletableFuture`。
   2. 最多等 `submit-timeout` + 5 秒（`RESULT_GRACE`）。
   3. 按结果分情况处理：
 
@@ -654,11 +674,11 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 - **做什么**：生成"结果不明"的异常，消息格式统一为"调用：Ergebnis unklar, 原因"。
 - **例子**：`Cloud-API 1 (BatchgenAuftrag anlegen): Ergebnis unklar, keine Antwort innerhalb von submit-timeout`。
 
-##### `launch(folders, taskNumber, slot)`
+##### `launch(folders, taskNumber, job, slot)`
 
 - **做什么**：搭好一个 Sandbox（工位），登记，然后让三个线程开始工作。
 - **怎么做**：
-  1. 新建 `TaskContext`（控制面板）和 `InMemoryStatusPool`（追踪板）。
+  1. 新建 `TaskContext`（控制面板，带 `job` 里的类型和名称）和 `InMemoryStatusPool`（追踪板）。
   2. 新建三个虚拟线程，此时**还没启动**（`unstarted`）：`producer-<任务号>` 运行 `InboxProducer`，`consumer-<任务号>` 运行 `StatusConsumer`，`sandbox-<任务号>` 运行 `supervise`。
   3. 把 Sandbox 和 Supervisor 记到用户号牌上。
   4. `registry.register(sandbox)`：登记。
@@ -677,6 +697,8 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
   3. 通过 Cloud-API 3 读 BatchgenAuftrag，只认属于该用户的；读到就转换成 `TaskStatus.Cloud`。
   4. 云端读取失败时：本地有快照就只返回本地（`cloud = null`，记 warn 日志）；本地也没有就抛 `CloudUnavailableException`（`502`）。
   5. 两边都没有：`TaskNotFoundException`（`404`）。
+  6. 类型和名称：任务运行中取自本地快照，否则取自云端的 BatchgenAuftrag。
+- **为什么类型和名称放在应答的最外层**：它们属于任务本身，不属于两个来源中的某一个。这样界面总能在同一个位置找到它们，包括任务注销之后（这时 `local` 为 `null`）和云端暂时不可达时（这时 `cloud` 为 `null`）。
 - **为什么先读本地**：本地快照不受云端是否可达影响，而且读起来很快。
 - **为什么云端结果也要核对用户**：任务号可以猜。不核对的话，`bob` 用 `alice` 的任务号也能查到她的任务信息。
 - **为什么云端不可达时返回本地**：任务还在跑，用户至少能看到本地的进度，而不是只得到一个错误。
@@ -751,7 +773,7 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 
 | 字段 | 类型 | 含义 |
 |---|---|---|
-| `userId`、`taskNumber`、`startedAt`、`timeout`、`errorThreshold`、`clock` | 不可变 | 基本信息和阈值 |
+| `userId`、`taskNumber`、`job`、`startedAt`、`timeout`、`errorThreshold`、`clock` | 不可变 | 基本信息（`job`：BatchgenAuftrag 的类型和名称）和阈值 |
 | `state` | `AtomicReference<TaskState>` | 当前状态，初始为 `RUNNING` |
 | `finishedAt`、`reason` | `AtomicReference` | 结束时间和原因，运行中为 `null` |
 | `stopRequested` | `AtomicBoolean` | 停止按钮是否被按下 |
@@ -762,9 +784,9 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 
 **为什么用原子类型，而不是给整个对象加锁**：读操作（查询快照、循环里检查停止按钮）非常频繁，原子类型的读不需要加锁，几乎没有开销。只有"设置结束状态"这一步需要几个字段一起变，才用一把小锁。
 
-##### 构造器 `TaskContext(userId, taskNumber, timeout, errorThreshold, clock)`
+##### 构造器 `TaskContext(userId, taskNumber, job, timeout, errorThreshold, clock)`
 
-- **做什么**：保存基本信息，用 `clock` 记录开始时间。
+- **做什么**：保存基本信息（包括 BatchgenAuftrag 的类型和名称），用 `clock` 记录开始时间。
 - **为什么注入 `Clock`，而不是直接用系统时间**：测试时可以换成可控的时钟（`MutableClock`），把时间"快进"30 分钟来测试超时，而不用真的等。
 
 ##### `finish(endState, reason)`
@@ -905,6 +927,7 @@ Supervisor 线程**不在**这里面：它是 TaskManager 的收尾职责，由 
 | 字段 | 含义 |
 |---|---|
 | `taskNumber`、`userId` | 任务号（= BatchgenAuftrag 编号）和用户 |
+| `jobType`、`jobName` | BatchgenAuftrag 的类型和名称，启动时确定 |
 | `state`、`reason` | 状态和结束原因（运行中原因为 `null`） |
 | `startedAt`、`finishedAt` | 开始和结束时间 |
 | `submitted` | 拿到 TaskId 的文件数 |
@@ -919,7 +942,9 @@ Supervisor 线程**不在**这里面：它是 TaskManager 的收尾职责，由 
 
 #### `TaskStatus`（record）
 
-查询接口的应答：`taskNumber`、`userId`、`cloud`、`local`。
+查询接口的应答：`taskNumber`、`userId`、`jobType`、`jobName`、`cloud`、`local`。
+
+- `jobType`、`jobName`：BatchgenAuftrag 的类型和名称；任务运行中取自 `local`，之后取自云端。这里两者都是字符串，因为任务结束后它们原样取自云端的应答。
 
 - `cloud`（内部 record `Cloud`：`status`、`success`、`error`、`pending`）：云端看到的 BatchgenAuftrag 状态和各状态的记录数。为 `null` 表示云端暂时不可达。
 - `local`：本地快照。为 `null` 表示任务已经结束并注销。
@@ -931,12 +956,41 @@ Supervisor 线程**不在**这里面：它是 TaskManager 的收尾职责，由 
 {
   "taskNumber": "BJ-7",
   "userId": "alice",
+  "jobType": "VERTRAGSDATEN",
+  "jobName": "Testlauf Oktober",
   "cloud": {"status": "RUNNING", "success": 3, "error": 0, "pending": 2},
-  "local": {"state": "RUNNING", "reason": null, "submitted": 5, "succeeded": 3, "failed": 0, "pending": 2, "unclear": 0, ...}
+  "local": {"jobType": "VERTRAGSDATEN", "jobName": "Testlauf Oktober", "state": "RUNNING", "reason": null, "submitted": 5, "succeeded": 3, "failed": 0, "pending": 2, "unclear": 0, ...}
 }
 ```
 
+#### `JobDefinition`（record）
+
+一项任务的 BatchgenAuftrag 的类型（`JobType`）和名称，取自启动请求。`TaskContext` 持有它，快照把它输出。
+
+##### `of(jobType, jobName)`
+
+- **做什么**：校验启动请求里的这两项，返回一个合法的 `JobDefinition`。
+- **规则**：
+
+  | 输入 | 结果 |
+  |---|---|
+  | `jobType` 恰好是 `KUNDENDATEN` 或 `VERTRAGSDATEN` | 就是这个类型 |
+  | `jobType` 缺失、为空、大小写不同（例如 `kundendaten`）或未知 | `InvalidJobTypeException` → `400 INVALID_JOB_TYPE` |
+  | `jobName` 缺失、为空或只有空格 | 名称 = 类型名，例如 `KUNDENDATEN` |
+  | `jobName` 首尾有空格 | 去掉首尾空格（`strip`） |
+  | 去掉空格后 `jobName` 超过 `MAX_JOB_NAME_LENGTH`（200）个字符 | `InvalidJobNameException` → `400 INVALID_JOB_NAME` |
+- **例子**：`of("VERTRAGSDATEN", "  Testlauf Oktober ")` 得到 `JobDefinition(VERTRAGSDATEN, "Testlauf Oktober")`；`of("KUNDENDATEN", null)` 得到 `JobDefinition(KUNDENDATEN, "KUNDENDATEN")`。
+- **为什么用 `name()` 比较，而不是 `JobType.valueOf`**：`valueOf` 遇到未知的值会抛 `IllegalArgumentException`，和程序错误分不开。比较的方式能抛出专门的异常，信息里列出允许的值。大小写不做统一，保证到达云端的只有固定的写法。
+- **为什么空名称按"没填"处理**：界面常把没填的输入框作为 `""` 发过来；没有可读名称的 BatchgenAuftrag 对谁都没用。
+- **为什么最多 200 个字符**：名称会传给云端，也会出现在应答和日志里；设上限可以防止任意长的值。
+- **为什么放在 `task` 包而不是控制器里**：这些规则属于业务逻辑。`TaskManager.start` 调用它，`TaskManager` 的测试不经过 HTTP 也能一并验证。
+
 #### 异常类和原因代码
+
+##### `InvalidJobTypeException` 和 `InvalidJobNameException`
+
+- **何时**：`jobType` 缺失或未知，或者 `jobName` 过长；分别对应 `400 INVALID_JOB_TYPE` 和 `400 INVALID_JOB_NAME`。
+- **信息**：`jobType fehlt (erlaubt: KUNDENDATEN, VERTRAGSDATEN)`、`Ungültiger jobType: 'X' (erlaubt: KUNDENDATEN, VERTRAGSDATEN)`、`jobName ist zu lang: 201 Zeichen (höchstens 200)`。允许的值由 `JobType` 生成，新增类型后信息会自动包含它。
 
 ##### `TaskRejectedException` 和 `RejectReason`
 
@@ -1265,7 +1319,7 @@ flowchart TD
 
 | 方法 | 对应接口 | 失败时 |
 |---|---|---|
-| `createBatchJob(userId)` | Cloud-API 1：新建 BatchgenAuftrag | `SubmitFailedException`，带分类 |
+| `createBatchJob(userId, jobType, jobName)` | Cloud-API 1：带类型和名称新建 BatchgenAuftrag | `SubmitFailedException`，带分类 |
 | `submit(jobId, items)` | Cloud-API 1：提交一批文件 | `SubmitFailedException`，带分类 |
 | `queryStatus(taskIds)` | Cloud-API 2：批量查询状态 | 原始异常（已经按配置重试过） |
 | `setJobStatus(jobId, status)` | Cloud-API 3：写结束状态 | 原始异常（已经重试过） |
@@ -1279,11 +1333,11 @@ flowchart TD
 
 基于 Spring WebClient 的实现。WebClient 用"响应式"写法：一个调用由若干步骤串起来，每一步说明"接下来做什么"。下面的说明会逐步解释这些步骤。
 
-##### `createBatchJob(userId)`
+##### `createBatchJob(userId, jobType, jobName)`
 
-- **做什么**：新建 BatchgenAuftrag，返回编号。
+- **做什么**：带类型和名称新建 BatchgenAuftrag，返回编号。
 - **步骤**：
-  1. `post().uri(job-path).bodyValue({"userId"})`：准备 `POST /jobs`，请求体为 `{"userId":"alice"}`。
+  1. `post().uri(job-path).bodyValue(new CreateJobRequest(userId, jobType, jobName))`：准备 `POST /jobs`，请求体为 `{"userId":"alice","jobType":"VERTRAGSDATEN","jobName":"Testlauf Oktober"}`。
   2. `retrieve().bodyToMono(CreateJobResponse)`：发出请求，把应答 JSON 解析成对象。HTTP 状态是 4xx 或 5xx 时会产生 `WebClientResponseException`。
   3. `timeout(submit-timeout)`：超过这个时间还没拿到应答，就产生 `TimeoutException`，并放弃这次请求。
   4. `map(…requireNonNull(jobId))`：应答里没有 `jobId` 也算错误。
@@ -1319,7 +1373,7 @@ flowchart TD
 
 ##### `toBatchJob(response)`
 
-- **做什么**：把应答里"状态 → 数量"的映射拆成三个数字（成功、错误、处理中）。缺少的状态按 0 计；整个映射缺失也按全 0 处理。
+- **做什么**：取出编号、用户、类型、名称和状态，并把应答里"状态 → 数量"的映射拆成三个数字（成功、错误、处理中）。缺少的状态按 0 计；整个映射缺失也按全 0 处理。
 
 ##### `classify(error)`
 
@@ -1370,7 +1424,8 @@ flowchart TD
 | `RecordStatus` | `SUCCESS`、`ERROR`、`PENDING` | 记录的状态，由云端自己更新 |
 | `RecordStatusResult(taskId, status, fehlermeldung)` | Cloud-API 2 对一个 TaskId 的应答 | `fehlermeldung` 是 `ERROR` 的原因，其他状态下为空 |
 | `JobStatus` | `RUNNING`、`COMPLETED`、`TIMEOUT`、`ERROR`、`TERMINATED` | BatchgenAuftrag 的状态；云端新建时是 `RUNNING`，结束状态由本应用写入 |
-| `BatchJob(jobId, userId, status, success, error, pending)` | 从 Cloud-API 3 读到的 BatchgenAuftrag | |
+| `JobType` | `KUNDENDATEN`、`VERTRAGSDATEN` | BatchgenAuftrag 的类型；本应用在新建时传给云端 |
+| `BatchJob(jobId, userId, jobType, jobName, status, success, error, pending)` | 从 Cloud-API 3 读到的 BatchgenAuftrag | `jobType` 是字符串：本应用不认识的值不应该导致读取失败（未知的枚举值会让 Jackson 拒绝整个应答） |
 
 **为什么 `TaskId` 是一个类，而不直接用 `String`**：方法签名里写 `TaskId`，就不会把文件名、任务号之类的其他字符串误传进去；空值在创建时就被拒绝。
 
@@ -1589,16 +1644,16 @@ flowchart TD
   |---|---|
   | `POST /jobs` | 新建任务（`createJob`） |
   | `GET /jobs` | 列出所有任务，按创建顺序 |
-  | `GET /jobs/{id}` | 读一个任务，返回状态和各状态的记录数；不存在返回 `404` |
+  | `GET /jobs/{id}` | 读一个任务，返回类型、名称、状态和各状态的记录数；不存在返回 `404` |
   | `PUT /jobs/{id}/status` | 写结束状态（模拟 Cloud-API 3），并在控制台打印 |
 
 ##### `createJob(exchange)`
 
-- **做什么**：新建任务，编号依次为 `BJ-1`、`BJ-2` 等，状态 `RUNNING`。请求里没有 `userId` 时返回 `400`。
+- **做什么**：用请求里的 `userId`、`jobType` 和 `jobName` 新建任务，编号依次为 `BJ-1`、`BJ-2` 等，状态 `RUNNING`。缺少 `userId` 或 `jobType` 时返回 `400`。`jobName` 原样保存；值的校验是本应用的事。
 
 ##### `view(Job)`
 
-- **做什么**：把任务转换成应答格式，包括按状态统计的记录数（每次实时统计）。
+- **做什么**：把任务转换成应答格式，包括类型、名称和按状态统计的记录数（每次实时统计）。
 
 ##### `handleSubmitOrAdmin(exchange)`
 
@@ -1707,12 +1762,13 @@ flowchart TD
 | `InMemoryStatusPoolTest` | 单元 | 到期查询、重新排期、已移除条目不会被加回 |
 | `UserFoldersTest` | 单元 | 目录创建、用户名校验、列表、标记、移动、重名、原因文件 |
 | `PipelinePropertiesTest` | 单元 | 默认值和校验 |
+| `JobDefinitionTest` | 单元 | 类型和名称的校验：允许的类型、默认名称、空格、最大长度 |
 | `WebClientCloudClientTest` | 组件（对 `FakeCloud`） | 约定、API-1 的错误分类、重试、`fehlermeldung` |
-| `TaskManagerTest` | 组件（桩 Cloud，无 HTTP） | 启动、拒绝、中止、注销、关闭、各种结束原因 |
-| `PipelineIntegrationTest`、`PipelineTimeoutIntegrationTest` | 集成（完整 Spring 应用对 `FakeCloud`，同一 JVM） | 所有结束状态、API-1 的错误类型、启动被拒的原因、隔离性、errorbox 里的原因文件 |
+| `TaskManagerTest` | 组件（桩 Cloud，无 HTTP） | 启动、拒绝（包括在调用云端之前拒绝非法类型）、中止、注销、关闭、各种结束原因 |
+| `PipelineIntegrationTest`、`PipelineTimeoutIntegrationTest` | 集成（完整 Spring 应用对 `FakeCloud`，同一 JVM） | 所有结束状态、API-1 的错误类型、启动被拒的原因、类型和名称在启动应答/云端/状态查询中的传递、非法的启动请求体、隔离性、errorbox 里的原因文件 |
 | `PipelineBlackBoxIT` | 黑盒（应用 JAR 和 `FakeCloudBackendApplication` 各自独立运行，只通过 HTTP 交互） | 主要流程，作为外部视角的验收 |
 
-测试辅助类：`FakeCloud`（同一 JVM 里的云端替身，行为由文件内容和预设控制，例如 `REJECT`（未转换并带 `fehlermeldung`）、`OMIT`（应答里不出现）、`FAIL`（`ERROR` 并带 `fehlermeldung`）、`SLOW`、延迟应答）、`FakeBackendClient`（`FakeCloudBackendApplication` 管理接口的客户端）、`PipelineApi`（REST 接口和用户目录的客户端）、`ExternalProcess`（启动外部进程）、`MutableClock`、`TestProperties`、`PipelineTestSupport`（集成测试的公共配置：短间隔、随机端口）。
+测试辅助类：`FakeCloud`（同一 JVM 里的云端替身，行为由文件内容和预设控制，例如 `REJECT`（未转换并带 `fehlermeldung`）、`OMIT`（应答里不出现）、`FAIL`（`ERROR` 并带 `fehlermeldung`）、`SLOW`、延迟应答）、`FakeBackendClient`（`FakeCloudBackendApplication` 管理接口的客户端）、`PipelineApi`（REST 接口和用户目录的客户端；只用 HTTP/1.1，否则 JDK 客户端会在每个新连接上尝试升级到 h2c，带请求体的 POST 会因此卡住）、`ExternalProcess`（启动外部进程）、`MutableClock`、`TestProperties`、`PipelineTestSupport`（集成测试的公共配置：短间隔、随机端口）。
 
 `mvn test` 运行单元、组件和集成测试；`mvn verify` 另外打包 JAR 并运行黑盒测试，两个进程的输出在 `target/it-logs`。
 

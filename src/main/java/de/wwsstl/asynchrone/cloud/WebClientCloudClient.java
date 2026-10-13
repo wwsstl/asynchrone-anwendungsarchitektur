@@ -26,7 +26,8 @@ import reactor.util.retry.Retry;
  *
  * <p>Angenommener Vertrag der Cloud-Dienste (die Pfade sind über {@code pipeline.cloud.*} einstellbar):
  * <ul>
- *   <li>Cloud-API 1, BatchgenAuftrag anlegen: {@code POST job-path} mit {@code {"userId"}} → {@code {"jobId"}}</li>
+ *   <li>Cloud-API 1, BatchgenAuftrag anlegen: {@code POST job-path} mit {@code {"userId","jobType","jobName"}} →
+ *       {@code {"jobId"}}</li>
  *   <li>Cloud-API 1, Batch übermitteln: {@code POST submit-path} mit
  *       {@code {"jobId","items":[{"fileName","content"}]}} → {@code {"tasks":[{"fileName","taskId","fehlermeldung"}]}};
  *       {@code content} ist der Inhalt der Datei als JSON-Wert (keine Zeichenkette). Eine nicht umgewandelte Datei
@@ -37,8 +38,8 @@ import reactor.util.retry.Retry;
  *       begründet ein {@code ERROR}</li>
  *   <li>Cloud-API 3, Endzustand setzen: {@code PUT job-path/{jobId}/status} mit {@code {"status"}}</li>
  *   <li>Cloud-API 3, BatchgenAuftrag lesen: {@code GET job-path/{jobId}} →
- *       {@code {"jobId","userId","status","counts":{"SUCCESS":n,"ERROR":n,"PENDING":n}}}; {@code 404}, wenn es ihn
- *       nicht gibt</li>
+ *       {@code {"jobId","userId","jobType","jobName","status","counts":{"SUCCESS":n,"ERROR":n,"PENDING":n}}};
+ *       {@code 404}, wenn es ihn nicht gibt</li>
  * </ul>
  *
  * <p>Cloud-API 1 ist nicht idempotent und wird nie wiederholt. Die Aufrufe von Cloud-API 2 und 3 werden bei
@@ -57,10 +58,10 @@ public class WebClientCloudClient implements CloudClient {
     }
 
     @Override
-    public CompletableFuture<String> createBatchJob(String userId) {
+    public CompletableFuture<String> createBatchJob(String userId, JobType jobType, String jobName) {
         return webClient.post()
                 .uri(config.jobPath())
-                .bodyValue(new CreateJobRequest(userId))
+                .bodyValue(new CreateJobRequest(userId, jobType, jobName))
                 .retrieve()
                 .bodyToMono(CreateJobResponse.class)
                 .timeout(config.submitTimeout())
@@ -135,9 +136,9 @@ public class WebClientCloudClient implements CloudClient {
 
     private static BatchJob toBatchJob(JobResponse response) {
         Map<RecordStatus, Integer> counts = response.counts() == null ? Map.of() : response.counts();
-        return new BatchJob(response.jobId(), response.userId(), response.status(),
-                counts.getOrDefault(RecordStatus.SUCCESS, 0), counts.getOrDefault(RecordStatus.ERROR, 0),
-                counts.getOrDefault(RecordStatus.PENDING, 0));
+        return new BatchJob(response.jobId(), response.userId(), response.jobType(), response.jobName(),
+                response.status(), counts.getOrDefault(RecordStatus.SUCCESS, 0),
+                counts.getOrDefault(RecordStatus.ERROR, 0), counts.getOrDefault(RecordStatus.PENDING, 0));
     }
 
     /**
@@ -185,7 +186,7 @@ public class WebClientCloudClient implements CloudClient {
                 || error instanceof IOException;
     }
 
-    record CreateJobRequest(String userId) {
+    record CreateJobRequest(String userId, JobType jobType, String jobName) {
     }
 
     record CreateJobResponse(String jobId) {
@@ -212,6 +213,7 @@ public class WebClientCloudClient implements CloudClient {
     record JobStatusRequest(JobStatus status) {
     }
 
-    record JobResponse(String jobId, String userId, JobStatus status, Map<RecordStatus, Integer> counts) {
+    record JobResponse(String jobId, String userId, String jobType, String jobName, JobStatus status,
+            Map<RecordStatus, Integer> counts) {
     }
 }

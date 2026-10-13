@@ -21,6 +21,7 @@ import de.wwsstl.asynchrone.cloud.CloudErrors;
 import de.wwsstl.asynchrone.cloud.CloudTimeoutException;
 import de.wwsstl.asynchrone.cloud.CloudUnavailableException;
 import de.wwsstl.asynchrone.cloud.JobStatus;
+import de.wwsstl.asynchrone.cloud.JobType;
 import de.wwsstl.asynchrone.cloud.SubmitFailedException;
 import de.wwsstl.asynchrone.config.PipelineProperties;
 import de.wwsstl.asynchrone.consumer.StatusConsumer;
@@ -85,13 +86,19 @@ public class TaskManager {
     /**
      * Startet eine Aufgabe für die Benutzer:in.
      *
+     * @param jobType Art des BatchgenAuftrags, eine der Konstanten von {@link JobType}
+     * @param jobName Name des BatchgenAuftrags; ohne Angabe der Name der Art
+     * @throws InvalidJobTypeException   wenn {@code jobType} fehlt oder unbekannt ist
+     * @throws InvalidJobNameException   wenn {@code jobName} zu lang ist
      * @throws TaskRejectedException     mit {@code USER_TASK_RUNNING} oder {@code PENDINGBOX_NOT_EMPTY}
      * @throws CloudUnavailableException wenn Cloud-API 1 nicht erreichbar war; es wird keine Sandbox angelegt
      * @throws CloudTimeoutException     wenn das Ergebnis von Cloud-API 1 unklar ist (z. B. keine Antwort); es wird
      *                                   keine Sandbox angelegt
      */
-    public TaskSnapshot start(String userId) {
+    public TaskSnapshot start(String userId, String jobType, String jobName) {
         UserFolders folders = folderResolver.resolve(userId);
+        // Ungültige Angaben weisen den Start ab, bevor die Benutzer:in belegt wird.
+        JobDefinition job = JobDefinition.of(jobType, jobName);
         UserSlot slot = claimUser(userId);
         boolean launched = false;
         try {
@@ -99,11 +106,11 @@ public class TaskManager {
                 throw new TaskRejectedException(RejectReason.PENDINGBOX_NOT_EMPTY, "In der pendingbox von Benutzer '"
                         + userId + "' liegen noch Dateien einer früheren Aufgabe; bitte zuerst bearbeiten");
             }
-            String taskNumber = createBatchJob(userId);
-            Sandbox sandbox = launch(folders, taskNumber, slot);
+            String taskNumber = createBatchJob(userId, job);
+            Sandbox sandbox = launch(folders, taskNumber, job, slot);
             launched = true;
-            log.info("[{}] Aufgabe {} gestartet ({} Aufgaben in der TaskRegistry)", userId, taskNumber,
-                    registry.size());
+            log.info("[{}] Aufgabe {} ({}, {}) gestartet ({} Aufgaben in der TaskRegistry)", userId, taskNumber,
+                    job.jobType(), job.jobName(), registry.size());
             return sandbox.snapshot();
         } finally {
             if (!launched) {
@@ -154,10 +161,10 @@ public class TaskManager {
      * Ergebnis unklar (z. B. keine Antwort), wird wie bei einer Aufgabe nichts weiter unternommen und der Start mit
      * TIMEOUT abgewiesen. Ein dabei vielleicht angelegter BatchgenAuftrag bleibt RUNNING (Abschnitt 7).
      */
-    private String createBatchJob(String userId) {
+    private String createBatchJob(String userId, JobDefinition job) {
         String operation = "Cloud-API 1 (BatchgenAuftrag anlegen)";
         Duration wait = properties.cloud().submitTimeout().plus(RESULT_GRACE);
-        CompletableFuture<String> call = cloud.createBatchJob(userId);
+        CompletableFuture<String> call = cloud.createBatchJob(userId, job.jobType(), job.jobName());
         String taskNumber;
         try {
             taskNumber = call.get(wait.toMillis(), TimeUnit.MILLISECONDS);
@@ -186,8 +193,8 @@ public class TaskManager {
     }
 
     /** Baut die Sandbox auf, trägt sie in die TaskRegistry ein und startet ihre Threads. */
-    private Sandbox launch(UserFolders folders, String taskNumber, UserSlot slot) {
-        TaskContext context = new TaskContext(folders.userId(), taskNumber, properties.taskTimeout(),
+    private Sandbox launch(UserFolders folders, String taskNumber, JobDefinition job, UserSlot slot) {
+        TaskContext context = new TaskContext(folders.userId(), taskNumber, job, properties.taskTimeout(),
                 properties.errorThreshold(), clock);
         StatusPool pool = new InMemoryStatusPool();
         Thread producer = Thread.ofVirtual().name("producer-" + taskNumber)
@@ -222,11 +229,10 @@ public class TaskManager {
     public TaskStatus status(String userId, String taskNumber) {
         InvalidTaskNumberException.requireValid(taskNumber);
         Optional<TaskSnapshot> local = findLocal(userId, taskNumber).map(Sandbox::snapshot);
-        Optional<TaskStatus.Cloud> fromCloud;
+        Optional<BatchJob> fromCloud;
         try {
             fromCloud = await(cloud.batchJob(taskNumber), statusWait(), "Cloud-API 3 (BatchgenAuftrag lesen)")
-                    .filter(job -> userId.equals(job.userId()))
-                    .map(TaskStatus.Cloud::of);
+                    .filter(job -> userId.equals(job.userId()));
         } catch (CloudUnavailableException e) {
             if (local.isEmpty()) {
                 throw e;
@@ -237,7 +243,11 @@ public class TaskManager {
         if (fromCloud.isEmpty() && local.isEmpty()) {
             throw new TaskNotFoundException(userId, taskNumber);
         }
-        return new TaskStatus(taskNumber, userId, fromCloud.orElse(null), local.orElse(null));
+        // Art und Name: solange die Aufgabe läuft aus dem lokalen Stand, danach aus der Cloud.
+        String jobType = local.isPresent() ? local.get().jobType().name() : fromCloud.get().jobType();
+        String jobName = local.isPresent() ? local.get().jobName() : fromCloud.get().jobName();
+        return new TaskStatus(taskNumber, userId, jobType, jobName, fromCloud.map(TaskStatus.Cloud::of).orElse(null),
+                local.orElse(null));
     }
 
     // --- 5. Abbruch von außen --------------------------------------------------------------------------------

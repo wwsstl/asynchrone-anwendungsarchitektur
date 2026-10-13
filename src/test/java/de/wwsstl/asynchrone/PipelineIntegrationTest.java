@@ -4,12 +4,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 
 import org.junit.jupiter.api.Test;
 
 import de.wwsstl.asynchrone.FakeCloud.SubmitBehavior;
 import de.wwsstl.asynchrone.cloud.JobStatus;
+import de.wwsstl.asynchrone.cloud.JobType;
 import de.wwsstl.asynchrone.task.TaskSnapshot;
 import de.wwsstl.asynchrone.task.TaskState;
 import de.wwsstl.asynchrone.task.TaskStatus;
@@ -157,6 +159,55 @@ class PipelineIntegrationTest extends PipelineTestSupport {
         assertThat(api.names("nojob", "pendingbox")).isEmpty();
         assertThat(cloud.jobsOf("nojob")).hasSize(1)
                 .allSatisfy(jobId -> assertThat(cloud.jobStatus(jobId)).isEqualTo(JobStatus.RUNNING));
+    }
+
+    @Test
+    void jobTypeAndJobNameAreForwardedToTheCloudAndShownInStatus() {
+        api.drop("typed", "typed-1.json", "ok");
+
+        PipelineApi.Response response = api.startResponse("typed",
+                Map.of("jobType", "VERTRAGSDATEN", "jobName", "Testlauf Oktober"));
+
+        assertThat(response.status()).isEqualTo(202);
+        String taskNumber = (String) response.body().get("taskNumber");
+        assertThat(response.body()).containsEntry("jobType", "VERTRAGSDATEN")
+                .containsEntry("jobName", "Testlauf Oktober");
+        assertThat(cloud.jobTypeAndName(taskNumber)).containsExactly("VERTRAGSDATEN", "Testlauf Oktober");
+
+        // Nach der Abmeldung kommen Art und Name aus der Cloud.
+        TaskStatus status = awaitEnd("typed", taskNumber, JobStatus.COMPLETED);
+        assertThat(status.jobType()).isEqualTo("VERTRAGSDATEN");
+        assertThat(status.jobName()).isEqualTo("Testlauf Oktober");
+    }
+
+    @Test
+    void jobNameDefaultsToJobType() {
+        TaskSnapshot started = api.start("unnamed");
+
+        assertThat(started.jobType()).isEqualTo(JobType.KUNDENDATEN);
+        assertThat(started.jobName()).isEqualTo("KUNDENDATEN");
+        assertThat(cloud.jobTypeAndName(started.taskNumber())).containsExactly("KUNDENDATEN", "KUNDENDATEN");
+    }
+
+    @Test
+    void startWithoutValidJobTypeIsRejected() {
+        api.dropFiles("notype", 1, "ok");
+
+        assertRejected(api.startResponse("notype", null), "INVALID_JOB_TYPE");
+        assertRejected(api.startResponse("notype", Map.of("jobName", "Testlauf")), "INVALID_JOB_TYPE");
+        assertRejected(api.startResponse("notype", Map.of("jobType", "UNBEKANNT")), "INVALID_JOB_TYPE");
+        assertRejected(api.startResponse("notype", Map.of("jobType", "KUNDENDATEN", "jobName", "x".repeat(201))),
+                "INVALID_JOB_NAME");
+        assertRejected(api.startResponse("notype", "{\"jobType\":"), "INVALID_REQUEST_BODY");
+
+        // Es wurde nichts angelegt und nichts verschoben.
+        assertThat(cloud.jobsOf("notype")).isEmpty();
+        assertThat(api.names("notype", "inbox")).hasSize(1);
+    }
+
+    private static void assertRejected(PipelineApi.Response response, String code) {
+        assertThat(response.status()).isEqualTo(400);
+        assertThat(response.code()).isEqualTo(code);
     }
 
     // --- 2. Producer: Fehler von Cloud-API 1 -----------------------------------------------------------------

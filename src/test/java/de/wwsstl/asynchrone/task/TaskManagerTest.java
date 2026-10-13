@@ -29,6 +29,7 @@ import de.wwsstl.asynchrone.cloud.CloudClient;
 import de.wwsstl.asynchrone.cloud.CloudTimeoutException;
 import de.wwsstl.asynchrone.cloud.CloudUnavailableException;
 import de.wwsstl.asynchrone.cloud.JobStatus;
+import de.wwsstl.asynchrone.cloud.JobType;
 import de.wwsstl.asynchrone.cloud.RecordStatus;
 import de.wwsstl.asynchrone.cloud.RecordStatusResult;
 import de.wwsstl.asynchrone.cloud.SubmitFailedException;
@@ -68,7 +69,7 @@ class TaskManagerTest {
         inboxFile("b.json");
         cloud.status = RecordStatus.SUCCESS;
 
-        TaskSnapshot started = manager.start("anna");
+        TaskSnapshot started = manager.start("anna", "KUNDENDATEN", null);
 
         assertThat(started.taskNumber()).isEqualTo("BJ-1");
         assertThat(started.state()).isEqualTo(TaskState.RUNNING);
@@ -82,18 +83,32 @@ class TaskManagerTest {
     void filesInPendingboxBlockTheStart() throws IOException {
         Files.writeString(folders.pendingbox().resolve("left.json"), "{}");
 
-        assertThatThrownBy(() -> manager.start("anna"))
+        assertThatThrownBy(() -> manager.start("anna", "KUNDENDATEN", null))
                 .isInstanceOfSatisfying(TaskRejectedException.class,
                         e -> assertThat(e.reason()).isEqualTo(RejectReason.PENDINGBOX_NOT_EMPTY));
         assertThat(cloud.createdJobs).hasValue(0);
     }
 
     @Test
+    void invalidJobTypeIsRejectedBeforeTheCloudIsCalled() {
+        assertThatThrownBy(() -> manager.start("anna", "UNBEKANNT", "Testlauf"))
+                .isInstanceOf(InvalidJobTypeException.class);
+        assertThat(cloud.createdJobs).hasValue(0);
+
+        // Die Benutzer:in wurde nicht belegt: der nächste Start mit gültiger Art geht durch.
+        TaskSnapshot started = manager.start("anna", "VERTRAGSDATEN", " ");
+
+        assertThat(started.jobType()).isEqualTo(JobType.VERTRAGSDATEN);
+        assertThat(started.jobName()).isEqualTo("VERTRAGSDATEN");
+        assertThat(cloud.createdJobs).hasValue(1);
+    }
+
+    @Test
     void secondStartIsRejectedWhileRunning() throws IOException {
         inboxFile("a.json");
-        manager.start("anna");
+        manager.start("anna", "KUNDENDATEN", null);
 
-        assertThatThrownBy(() -> manager.start("anna"))
+        assertThatThrownBy(() -> manager.start("anna", "KUNDENDATEN", null))
                 .isInstanceOfSatisfying(TaskRejectedException.class,
                         e -> assertThat(e.reason()).isEqualTo(RejectReason.USER_TASK_RUNNING));
         assertThat(cloud.createdJobs).hasValue(1);
@@ -103,11 +118,11 @@ class TaskManagerTest {
     void startWaitsForTheDeregistrationOfAnEndingTask() {
         // Die Aufgabe endet sofort (leere inbox), das Schreiben des Endzustands dauert aber noch.
         cloud.endStateDelay = Duration.ofMillis(500);
-        manager.start("anna");
+        manager.start("anna", "KUNDENDATEN", null);
         await().atMost(Duration.ofSeconds(5)).until(() -> registry.find("BJ-1")
                 .map(sandbox -> sandbox.context().state() == TaskState.COMPLETED).orElse(false));
 
-        assertThat(manager.start("anna").taskNumber()).isEqualTo("BJ-2");
+        assertThat(manager.start("anna", "KUNDENDATEN", null).taskNumber()).isEqualTo("BJ-2");
         assertThat(cloud.writtenStates).contains(JobStatus.COMPLETED);
     }
 
@@ -116,7 +131,8 @@ class TaskManagerTest {
         cloud.createJob = () -> CompletableFuture.completedFuture("keine gültige Nummer");
 
         for (int attempt = 0; attempt < 2; attempt++) {
-            assertThatThrownBy(() -> manager.start("anna")).isInstanceOf(CloudTimeoutException.class)
+            assertThatThrownBy(() -> manager.start("anna", "KUNDENDATEN", null))
+                    .isInstanceOf(CloudTimeoutException.class)
                     .hasMessage("Cloud-API 1 (BatchgenAuftrag anlegen): Ergebnis unklar, ungültige Nummer des "
                             + "BatchgenAuftrags: 'keine gültige Nummer'");
         }
@@ -128,7 +144,8 @@ class TaskManagerTest {
         cloud.createJob = () -> CompletableFuture.failedFuture(new SubmitFailedException(
                 SubmitFailedException.Kind.NOT_PROCESSED, new IOException("Verbindung abgelehnt")));
 
-        assertThatThrownBy(() -> manager.start("anna")).isInstanceOf(CloudUnavailableException.class);
+        assertThatThrownBy(() -> manager.start("anna", "KUNDENDATEN", null))
+                .isInstanceOf(CloudUnavailableException.class);
         assertThat(registry.size()).isZero();
     }
 
@@ -139,7 +156,8 @@ class TaskManagerTest {
                 SubmitFailedException.Kind.UNKNOWN, new TimeoutException("Did not observe any item within 30000ms")));
 
         for (int attempt = 0; attempt < 2; attempt++) {
-            assertThatThrownBy(() -> manager.start("anna")).isInstanceOf(CloudTimeoutException.class)
+            assertThatThrownBy(() -> manager.start("anna", "KUNDENDATEN", null))
+                    .isInstanceOf(CloudTimeoutException.class)
                     .hasMessage("Cloud-API 1 (BatchgenAuftrag anlegen): Ergebnis unklar, "
                             + "keine Antwort innerhalb von submit-timeout");
         }
@@ -151,7 +169,7 @@ class TaskManagerTest {
     @Test
     void cancelWritesTerminatedAfterThreadsEnded() throws IOException {
         inboxFile("a.json");
-        manager.start("anna");
+        manager.start("anna", "KUNDENDATEN", null);
         awaitPending(1);
 
         TaskSnapshot cancelled = manager.cancel("anna", "BJ-1");
@@ -168,7 +186,7 @@ class TaskManagerTest {
     @Test
     void cancelOfForeignTaskIsNotFound() throws IOException {
         inboxFile("a.json");
-        manager.start("anna");
+        manager.start("anna", "KUNDENDATEN", null);
 
         assertThatThrownBy(() -> manager.cancel("bert", "BJ-1")).isInstanceOf(TaskNotFoundException.class);
         assertThat(registry.find("BJ-1")).get().extracting(sandbox -> sandbox.context().state())
@@ -182,20 +200,20 @@ class TaskManagerTest {
             throw new IllegalStateException("unerwarteter Fehler");
         };
 
-        manager.start("anna");
+        manager.start("anna", "KUNDENDATEN", null);
 
         awaitDeregistered();
         assertThat(cloud.writtenStates).isEmpty();
         // Wie nach einem Absturz: die Datei liegt ohne Marker in der pendingbox und blockiert den nächsten Start.
         assertThat(folders.pendingbox().resolve("a.json")).exists();
         assertThat(folders.markerOf(folders.pendingbox().resolve("a.json"))).doesNotExist();
-        assertThatThrownBy(() -> manager.start("anna")).isInstanceOf(TaskRejectedException.class);
+        assertThatThrownBy(() -> manager.start("anna", "KUNDENDATEN", null)).isInstanceOf(TaskRejectedException.class);
     }
 
     @Test
     void shutdownStopsRunningTasksWithoutWritingEndState() throws IOException {
         inboxFile("a.json");
-        manager.start("anna");
+        manager.start("anna", "KUNDENDATEN", null);
         awaitPending(1);
         Sandbox sandbox = registry.find("BJ-1").orElseThrow();
 
@@ -210,7 +228,7 @@ class TaskManagerTest {
     @Test
     void statusFallsBackToLocalStateWhileCloudIsUnavailable() throws IOException {
         inboxFile("a.json");
-        manager.start("anna");
+        manager.start("anna", "KUNDENDATEN", null);
         awaitPending(1);
         cloud.jobAvailable = false;
 
@@ -303,7 +321,7 @@ class TaskManagerTest {
      */
     private TaskSnapshot awaitEndedWhileRegistered(TaskState expected) {
         cloud.endStateDelay = Duration.ofMillis(500);
-        manager.start("anna");
+        manager.start("anna", "KUNDENDATEN", null);
         TaskSnapshot ended = await().atMost(Duration.ofSeconds(5)).pollInterval(Duration.ofMillis(10))
                 .until(() -> registry.find("BJ-1").map(Sandbox::snapshot).orElse(null),
                         local -> local != null && local.state() != TaskState.RUNNING);
@@ -338,7 +356,7 @@ class TaskManagerTest {
         volatile boolean jobAvailable = true;
 
         @Override
-        public CompletableFuture<String> createBatchJob(String userId) {
+        public CompletableFuture<String> createBatchJob(String userId, JobType jobType, String jobName) {
             return createJob.get();
         }
 

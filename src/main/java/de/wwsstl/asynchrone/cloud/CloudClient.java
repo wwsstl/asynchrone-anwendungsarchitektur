@@ -11,11 +11,12 @@ import java.util.concurrent.CompletableFuture;
 public interface CloudClient {
 
     /**
-     * Cloud-API 1: legt für die Benutzer:in einen BatchgenAuftrag (Status RUNNING) an und liefert seine Nummer.
+     * Cloud-API 1: legt für die Benutzer:in einen BatchgenAuftrag (Status RUNNING) mit Art und Name an und liefert seine
+     * Nummer.
      *
      * <p>Schlägt der Aufruf fehl, endet das Future wie bei {@link #submit} mit einer {@link SubmitFailedException}.
      */
-    CompletableFuture<String> createBatchJob(String userId);
+    CompletableFuture<String> createBatchJob(String userId, JobType jobType, String jobName);
 
     /**
      * Cloud-API 1: übermittelt einen Batch zum BatchgenAuftrag. Die Antwort enthält je erfolgreich umgewandelter Datei

@@ -38,7 +38,7 @@ class WebClientCloudClientTest {
 
     @Test
     void submitReturnsTaskIdOrFehlermeldungPerFile() throws Exception {
-        String jobId = get(client.createBatchJob("conv"));
+        String jobId = get(client.createBatchJob("conv", JobType.KUNDENDATEN, "Testlauf"));
 
         List<SubmittedFile> submitted = get(client.submit(jobId,
                 List.of(item("a.json", "ok"), item("b.json", "REJECT"), item("c.json", "OMIT"))));
@@ -53,7 +53,7 @@ class WebClientCloudClientTest {
 
     @Test
     void statusQueryReturnsFehlermeldungOfError() throws Exception {
-        String jobId = get(client.createBatchJob("failing"));
+        String jobId = get(client.createBatchJob("failing", JobType.KUNDENDATEN, "Testlauf"));
         TaskId taskId = get(client.submit(jobId, List.of(item("fail.json", "FAIL")))).getFirst().taskId();
 
         get(client.queryStatus(List.of(taskId)));
@@ -64,7 +64,7 @@ class WebClientCloudClientTest {
 
     @Test
     void submitSendsFileContentAsJson() throws Exception {
-        String jobId = get(client.createBatchJob("json"));
+        String jobId = get(client.createBatchJob("json", JobType.KUNDENDATEN, "Testlauf"));
         ObjectNode content = JsonNodeFactory.instance.objectNode().put("data", "ok").put("count", 2);
 
         get(client.submit(jobId, List.of(new TestdataItem("json.json", content))));
@@ -75,7 +75,7 @@ class WebClientCloudClientTest {
 
     @Test
     void statusAndJobFollowTheCloud() throws Exception {
-        String jobId = get(client.createBatchJob("flow"));
+        String jobId = get(client.createBatchJob("flow", JobType.KUNDENDATEN, "Testlauf"));
         TaskId taskId = get(client.submit(jobId, List.of(item("a.json", "ok")))).getFirst().taskId();
 
         assertThat(get(client.queryStatus(List.of(taskId))))
@@ -86,13 +86,13 @@ class WebClientCloudClientTest {
         get(client.setJobStatus(jobId, JobStatus.COMPLETED));
 
         assertThat(get(client.batchJob(jobId)))
-                .contains(new BatchJob(jobId, "flow", JobStatus.COMPLETED, 1, 0, 0));
+                .contains(new BatchJob(jobId, "flow", "KUNDENDATEN", "Testlauf", JobStatus.COMPLETED, 1, 0, 0));
         assertThat(get(client.batchJob("BJ-unknown"))).isEqualTo(Optional.empty());
     }
 
     @Test
     void rejectedOrUnavailableSubmitWasNotProcessed() throws Exception {
-        String jobId = get(client.createBatchJob("rejected"));
+        String jobId = get(client.createBatchJob("rejected", JobType.KUNDENDATEN, "Testlauf"));
         cloud.nextSubmitsFor("rejected", new SubmitBehavior.Respond(503), new SubmitBehavior.Respond(400));
 
         assertSubmitFails(client, jobId, SubmitFailedException.Kind.NOT_PROCESSED);
@@ -101,7 +101,7 @@ class WebClientCloudClientTest {
 
     @Test
     void serverErrorOrTimeoutMakesSubmitResultUnclear() throws Exception {
-        String jobId = get(client.createBatchJob("unclear"));
+        String jobId = get(client.createBatchJob("unclear", JobType.KUNDENDATEN, "Testlauf"));
         cloud.nextSubmitsFor("unclear", new SubmitBehavior.Respond(500),
                 new SubmitBehavior.Delay(Duration.ofSeconds(2)));
 
@@ -123,21 +123,23 @@ class WebClientCloudClientTest {
                 base.submitPath(), base.statusPath(), Duration.ofSeconds(20), base.statusTimeout(), 0));
 
         assertSubmitFails(offline, "BJ-1", SubmitFailedException.Kind.NOT_PROCESSED);
-        assertFails(offline.createBatchJob("anna"), SubmitFailedException.Kind.NOT_PROCESSED);
+        assertFails(offline.createBatchJob("anna", JobType.KUNDENDATEN, "Testlauf"),
+                SubmitFailedException.Kind.NOT_PROCESSED);
     }
 
     @Test
     void createJobWithoutResponseIsUnclear() {
         cloud.delayJobCreationFor("slowjob", Duration.ofSeconds(2));
 
-        assertFails(client.createBatchJob("slowjob"), SubmitFailedException.Kind.UNKNOWN);
+        assertFails(client.createBatchJob("slowjob", JobType.KUNDENDATEN, "Testlauf"),
+                SubmitFailedException.Kind.UNKNOWN);
         // Der BatchgenAuftrag wurde trotzdem angelegt: genau deshalb ist das Ergebnis unklar.
         assertThat(cloud.jobsOf("slowjob")).hasSize(1);
     }
 
     @Test
     void failedEndStateWriteIsReportedAfterRetries() throws Exception {
-        String jobId = get(client.createBatchJob("nowrite"));
+        String jobId = get(client.createBatchJob("nowrite", JobType.KUNDENDATEN, "Testlauf"));
         cloud.failJobStatusWrites(true);
         try {
             assertThatThrownBy(() -> get(client.setJobStatus(jobId, JobStatus.ERROR)))

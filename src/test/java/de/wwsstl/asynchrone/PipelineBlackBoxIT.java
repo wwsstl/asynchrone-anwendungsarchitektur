@@ -97,6 +97,8 @@ class PipelineBlackBoxIT {
         eventually().untilAsserted(() -> assertThat(api.status("bbdone", taskNumber).local().pending()).isEqualTo(3));
         TaskStatus running = api.status("bbdone", taskNumber);
         assertThat(running.cloud()).isEqualTo(new TaskStatus.Cloud(JobStatus.RUNNING, 0, 0, 3));
+        assertThat(running.jobType()).isEqualTo("KUNDENDATEN");
+        assertThat(running.jobName()).isEqualTo("KUNDENDATEN");
         TaskSnapshot local = running.local();
         assertThat(local.state()).isEqualTo(TaskState.RUNNING);
         assertThat(local.submitted()).isEqualTo(3);

@@ -12,14 +12,18 @@ sequenceDiagram
     participant Cloud as Cloud-Dienst<br/>(API 1, 2, 3)
 
     Note over B,Cloud: 1. Start
-    B->>API: Aufgabe starten
+    B->>API: Aufgabe starten (jobType, jobName)
     API->>TM: start
+    break jobType fehlt oder unbekannt, jobName zu lang
+        TM-->>API: abgewiesen
+        API-->>B: 400 Bad Request, INVALID_JOB_TYPE / INVALID_JOB_NAME
+    end
     TM->>O: pendingbox leer?
     break pendingbox nicht leer
         TM-->>API: abgewiesen
         API-->>B: 409 Conflict, PENDINGBOX_NOT_EMPTY
     end
-    TM->>Cloud: API 1: BatchgenAuftrag anlegen
+    TM->>Cloud: API 1: BatchgenAuftrag anlegen (userId, jobType, jobName)
     break Cloud nicht erreichbar oder Anfrage abgelehnt
         TM-->>API: abgewiesen, keine Sandbox
         API-->>B: 502 Bad Gateway, CLOUD_UNAVAILABLE

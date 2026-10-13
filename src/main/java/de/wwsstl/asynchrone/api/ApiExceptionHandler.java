@@ -6,10 +6,13 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.server.ServerWebInputException;
 
 import de.wwsstl.asynchrone.cloud.CloudTimeoutException;
 import de.wwsstl.asynchrone.cloud.CloudUnavailableException;
 import de.wwsstl.asynchrone.files.InvalidUserIdException;
+import de.wwsstl.asynchrone.task.InvalidJobNameException;
+import de.wwsstl.asynchrone.task.InvalidJobTypeException;
 import de.wwsstl.asynchrone.task.InvalidTaskNumberException;
 import de.wwsstl.asynchrone.task.TaskNotFoundException;
 import de.wwsstl.asynchrone.task.TaskRejectedException;
@@ -33,6 +36,23 @@ public class ApiExceptionHandler {
     @ExceptionHandler(InvalidTaskNumberException.class)
     ProblemDetail invalidTaskNumber(InvalidTaskNumberException e) {
         return problem(HttpStatus.BAD_REQUEST, "INVALID_TASK_NUMBER", e.getMessage());
+    }
+
+    @ExceptionHandler(InvalidJobTypeException.class)
+    ProblemDetail invalidJobType(InvalidJobTypeException e) {
+        return problem(HttpStatus.BAD_REQUEST, "INVALID_JOB_TYPE", e.getMessage());
+    }
+
+    @ExceptionHandler(InvalidJobNameException.class)
+    ProblemDetail invalidJobName(InvalidJobNameException e) {
+        return problem(HttpStatus.BAD_REQUEST, "INVALID_JOB_NAME", e.getMessage());
+    }
+
+    /** Der Rumpf der Anfrage ist kein lesbares JSON. */
+    @ExceptionHandler(ServerWebInputException.class)
+    ProblemDetail invalidRequestBody(ServerWebInputException e) {
+        return problem(HttpStatus.BAD_REQUEST, "INVALID_REQUEST_BODY",
+                "Rumpf der Anfrage nicht lesbar: " + e.getReason());
     }
 
     @ExceptionHandler(TaskNotFoundException.class)

@@ -61,7 +61,7 @@ Drei Randbedingungen prägen den gesamten Entwurf:
 de.wwsstl.asynchrone
 ├── TestdatenPipelineApplication   Einstiegspunkt von Spring Boot
 ├── api/        REST-Controller und Fehlerabbildung: reicht nur weiter, keine Geschäftslogik
-├── task/       TaskManager, TaskRegistry, Sandbox, TaskContext, Zustände und Momentaufnahmen
+├── task/       TaskManager, TaskRegistry, Sandbox, TaskContext, Zustände, Momentaufnahmen, Art und Name des Auftrags
 ├── producer/   InboxProducer: liest die inbox, übermittelt an Cloud-API 1
 ├── consumer/   StatusConsumer: fragt Cloud-API 2 ab, verschiebt Dateien, erkennt das Ende der Aufgabe
 ├── pool/       Status-Pool: Übergabebereich zwischen Producer und Consumer
@@ -152,10 +152,11 @@ sequenceDiagram
     participant S as Supervisor
     participant Cl as Cloud
 
-    R->>TM: start(userId)
+    R->>TM: start(userId, jobType, jobName)
+    TM->>TM: JobDefinition.of (Art und Name prüfen)
     TM->>TM: claimUser (Benutzer:in belegen)
     TM->>TM: pendingbox leer?
-    TM->>Cl: API 1: BatchgenAuftrag anlegen
+    TM->>Cl: API 1: BatchgenAuftrag anlegen (mit Art und Name)
     Cl-->>TM: Aufgabennummer
     TM->>TM: launch: Context, Pool, 3 Threads, in die Registry eintragen
     TM-->>R: Momentaufnahme (RUNNING) → 202
@@ -370,10 +371,11 @@ anlegen.
 | Schritt | Methode | Warum an dieser Stelle |
 |---|---|---|
 | 1. Ordner ermitteln und anlegen | `folderResolver.resolve` | Bei ungültiger Benutzerkennung direkt `400`, ohne Belegung |
-| 2. Benutzer:in belegen | `claimUser` | muss vor jeder Prüfung und jedem Cloud-Aufruf stehen, siehe oben |
-| 3. pendingbox prüfen | `hasPendingFiles` | Abweisung **vor** dem Anlegen des BatchgenAuftrags; in der Cloud bleibt kein leerer Auftrag zurück |
-| 4. BatchgenAuftrag anlegen | `createBatchJob` | synchron, weil die Aufgabennummer Schlüssel der Sandbox und der Registry ist und in den `Location`-Header kommt; schlägt es fehl, gibt es noch kein lokales Objekt |
-| 5. Aufbauen und starten | `launch` | erst Sandbox und Supervisor im `UserSlot` vermerken, dann eintragen, dann Threads starten, siehe unten |
+| 2. Art und Name prüfen | `JobDefinition.of` | Bei fehlender oder unbekannter Art oder zu langem Namen direkt `400`, ohne Belegung und ohne Cloud-Aufruf |
+| 3. Benutzer:in belegen | `claimUser` | muss vor jeder Prüfung des Zustands und jedem Cloud-Aufruf stehen, siehe oben |
+| 4. pendingbox prüfen | `hasPendingFiles` | Abweisung **vor** dem Anlegen des BatchgenAuftrags; in der Cloud bleibt kein leerer Auftrag zurück |
+| 5. BatchgenAuftrag mit Art und Name anlegen | `createBatchJob` | synchron, weil die Aufgabennummer Schlüssel der Sandbox und der Registry ist und in den `Location`-Header kommt; schlägt es fehl, gibt es noch kein lokales Objekt |
+| 6. Aufbauen und starten | `launch` | erst Sandbox und Supervisor im `UserSlot` vermerken, dann eintragen, dann Threads starten, siehe unten |
 | bei Fehlern | `finally` | ohne erfolgreichen Start wird die Belegung freigegeben (`users.remove(userId, slot)` entfernt nur die eigene) |
 
 `launch` baut zuerst alle Objekte auf; Producer, Consumer und Supervisor sind noch `unstarted`. Dann der Reihe nach:
@@ -517,7 +519,7 @@ das Paket ein zweites Mal aufzugeben.
 
 - 3.1 [Wurzelpaket](#31-wurzelpaket-dewwsstlasynchrone)
 - 3.2 [`api`](#32-api-rest-schnittstelle): `TaskController`, `ApiExceptionHandler`
-- 3.3 [`task`](#33-task-aufgabenverwaltung): `TaskManager`, `TaskContext`, `Sandbox`, `TaskRegistry`, `TaskState`, `TaskSnapshot`, `TaskStatus`, Ausnahmen
+- 3.3 [`task`](#33-task-aufgabenverwaltung): `TaskManager`, `TaskContext`, `Sandbox`, `TaskRegistry`, `TaskState`, `TaskSnapshot`, `TaskStatus`, `JobDefinition`, Ausnahmen
 - 3.4 [`producer`](#34-producer): `InboxProducer`
 - 3.5 [`consumer`](#35-consumer): `StatusConsumer`
 - 3.6 [`pool`](#36-pool): `StatusPool`, `InMemoryStatusPool`, `PoolEntry`
@@ -565,14 +567,23 @@ keine Geschäftslogik**; die Regeln stehen nur im Paket `task`, und Tests könne
 Drei Endpunkte unter `/api/users/{userId}/tasks`. Der Konstruktor erhält den `TaskManager` und einen eigenen Scheduler
 `taskManagerScheduler` (siehe `offload`).
 
-##### `start(userId)`: `POST /api/users/{userId}/tasks`
+##### `start(userId, request)`: `POST /api/users/{userId}/tasks`
 
-- **Was**: startet eine Aufgabe für die Benutzer:in.
+- **Was**: startet eine Aufgabe für die Benutzer:in, mit Art und Name des BatchgenAuftrags aus dem JSON-Rumpf.
 - **Wie**:
-  1. Über `offload` wird `taskManager.start(userId)` auf einem Virtual Thread aufgerufen; das Ergebnis ist die lokale
-     Momentaufnahme `TaskSnapshot`.
-  2. Antwort `202 Accepted` mit dem `Location`-Header `/api/users/{userId}/tasks/{Aufgabennummer}` und der
+  1. `@RequestBody(required = false) StartRequest request`: Spring liest den Rumpf in den inneren Record
+     `StartRequest(jobType, jobName)`; beide Felder sind Zeichenketten. Fehlt der Rumpf, ist `request` `null`, und
+     beide Werte gelten als nicht angegeben.
+  2. Über `offload` wird `taskManager.start(userId, jobType, jobName)` auf einem Virtual Thread aufgerufen; das
+     Ergebnis ist die lokale Momentaufnahme `TaskSnapshot`.
+  3. Antwort `202 Accepted` mit dem `Location`-Header `/api/users/{userId}/tasks/{Aufgabennummer}` und der
      Momentaufnahme als Rumpf.
+- **Warum `jobType` als `String` und nicht als `JobType`**: Würde Jackson den Wert direkt in das Enum umwandeln,
+  scheiterte ein unbekannter Wert schon beim Lesen des Rumpfs, mit der allgemeinen Meldung `INVALID_REQUEST_BODY`. So
+  prüft `JobDefinition.of` den Wert und antwortet mit dem genauen Code `INVALID_JOB_TYPE` und den erlaubten Werten. Die
+  Regel liegt außerdem im Paket `task` und gilt genauso für Aufrufe ohne HTTP.
+- **Warum `required = false`**: Sonst wiese Spring einen Start ohne Rumpf mit einer eigenen Meldung ab. So endet er bei
+  derselben Prüfung wie ein Rumpf ohne `jobType`: `400 INVALID_JOB_TYPE` mit „jobType fehlt“.
 - **Warum 202 statt 200**: 202 heißt „angenommen, wird bearbeitet“. Eine Aufgabe läuft Minuten oder länger; wenn diese
   Anfrage endet, ist sie noch lange nicht fertig.
 - **Warum `Location`**: Der Header sagt dem Client, wo er den Fortschritt abfragen kann. Das ist die übliche Art, mit
@@ -581,14 +592,18 @@ Drei Endpunkte unter `/api/users/{userId}/tasks`. Der Konstruktor erhält den `T
 
   ```
   POST /api/users/alice/tasks
+  Content-Type: application/json
+  {"jobType":"VERTRAGSDATEN","jobName":"Testlauf Oktober"}
   → 202 Accepted
     Location: /api/users/alice/tasks/BJ-7
-    {"taskNumber":"BJ-7","userId":"alice","state":"RUNNING","reason":null, ...}
+    {"taskNumber":"BJ-7","userId":"alice","jobType":"VERTRAGSDATEN","jobName":"Testlauf Oktober","state":"RUNNING",
+     "reason":null, ...}
   ```
 
   Der Zustand ist meist `RUNNING`. Bei leerer inbox kann die Aufgabe sofort zu Ende sein; dann steht dort womöglich
   schon `COMPLETED`.
-- **Bei Fehlern**: Die Ausnahmen des `TaskManager` (`409`, `502`, `504`, `400`) wandelt der `ApiExceptionHandler` um.
+- **Bei Fehlern**: Die Ausnahmen des `TaskManager` (`400`, `409`, `502`, `504`) und ein nicht lesbarer Rumpf (`400`)
+  wandelt der `ApiExceptionHandler` um.
 
 ##### `status(userId, taskNumber)`: `GET /api/users/{userId}/tasks/{taskNumber}`
 
@@ -647,6 +662,19 @@ Eine Fehlerantwort sieht etwa so aus:
 - **Wann**: Benutzerkennung oder Aufgabennummer im Pfad haben ein ungültiges Format.
 - **Warum 400**: ein Eingabefehler des Clients; mit einem gültigen Wert klappt es, der Zustand des Servers spielt
   keine Rolle.
+
+##### `invalidJobType` → `400 INVALID_JOB_TYPE`, `invalidJobName` → `400 INVALID_JOB_NAME`
+
+- **Wann**: `jobType` fehlt im Startrumpf (oder der Rumpf fehlt ganz) bzw. ist keine der erlaubten Arten; `jobName` ist
+  länger als 200 Zeichen. Die Meldung nennt bei der Art die erlaubten Werte, beim Namen die Länge.
+- **Warum zwei Codes**: Die Oberfläche kann das betroffene Eingabefeld markieren.
+
+##### `invalidRequestBody` → `400 INVALID_REQUEST_BODY`
+
+- **Wann**: Spring kann den Rumpf nicht lesen (`ServerWebInputException`), z. B. abgeschnittenes oder sonst ungültiges
+  JSON. `detail` beginnt mit „Rumpf der Anfrage nicht lesbar:“ und enthält den Grund von Spring.
+- **Warum ein eigener Handler**: Spring antwortete zwar auch mit `400`, aber ohne `code`; dies wäre die einzige
+  Fehlerantwort, zu der die Oberfläche keinen Ursachencode bekäme.
 
 ##### `notFound` → `404 TASK_NOT_FOUND`
 
@@ -717,23 +745,28 @@ Beide Felder sind `volatile`, weil der Thread, der sie schreibt (die Startanfrag
 weitere Startanfrage, das Beenden der Anwendung), verschiedene sein können; `volatile` sorgt dafür, dass der lesende
 Thread den neuesten Wert sieht.
 
-##### `start(userId)`
+##### `start(userId, jobType, jobName)`
 
 - **Was**: startet eine Aufgabe für die Benutzer:in und liefert die lokale Momentaufnahme.
 - **Wie**:
   1. `folderResolver.resolve(userId)`: prüft die Benutzerkennung und findet (oder legt an) die Ordner. Eine ungültige
      Kennung führt sofort zu einer Ausnahme; belegt ist dann noch nichts.
-  2. `claimUser(userId)`: belegt die Benutzer:in; ist sie schon belegt, Abweisung (`409 USER_TASK_RUNNING`).
-  3. `hasPendingFiles`: Liegen noch Dateien in der pendingbox, Abweisung (`409 PENDINGBOX_NOT_EMPTY`).
-  4. `createBatchJob`: legt in der Cloud den BatchgenAuftrag an und erhält die Aufgabennummer.
-  5. `launch`: baut die Sandbox auf und startet die drei Threads.
-  6. Rückgabe der Momentaufnahme.
-  7. Scheitert nach Schritt 2 irgendein Schritt, gibt `finally` die Belegung wieder frei (`users.remove(userId, slot)`
+  2. `JobDefinition.of(jobType, jobName)`: prüft Art und Namen und setzt den Standardnamen ein. Ungültige Angaben
+     führen sofort zu `400 INVALID_JOB_TYPE` bzw. `400 INVALID_JOB_NAME`; belegt ist auch dann noch nichts.
+  3. `claimUser(userId)`: belegt die Benutzer:in; ist sie schon belegt, Abweisung (`409 USER_TASK_RUNNING`).
+  4. `hasPendingFiles`: Liegen noch Dateien in der pendingbox, Abweisung (`409 PENDINGBOX_NOT_EMPTY`).
+  5. `createBatchJob`: legt in der Cloud den BatchgenAuftrag mit Art und Name an und erhält die Aufgabennummer.
+  6. `launch`: baut die Sandbox auf (Art und Name kommen in den `TaskContext`) und startet die drei Threads.
+  7. Rückgabe der Momentaufnahme; das Log vermerkt Aufgabennummer, Art und Name.
+  8. Scheitert nach Schritt 3 irgendein Schritt, gibt `finally` die Belegung wieder frei (`users.remove(userId, slot)`
      entfernt nur die eigene).
 - **Warum diese Reihenfolge**:
+  - **Zuerst die Eingaben prüfen**: Eine fehlerhafte Art oder ein zu langer Name sind Fehler der Anfrage und hängen vom
+    Zustand des Servers nicht ab. Sie sollen weder die Benutzer:in belegen noch die pendingbox lesen oder die Cloud
+    aufrufen.
   - **Erst belegen, dann prüfen**: Angenommen, dieselbe Benutzer:in schickt fast gleichzeitig zwei Startanfragen. Würde
     zuerst die pendingbox geprüft und erst dann belegt, sähen beide Anfragen „pendingbox leer“ und legten je einen
-    BatchgenAuftrag an. Wird zuerst belegt, scheitert die zweite Anfrage schon in Schritt 2.
+    BatchgenAuftrag an. Wird zuerst belegt, scheitert die zweite Anfrage schon in Schritt 3.
   - **Erst die pendingbox prüfen, dann die Cloud aufrufen**: Bei einer Abweisung entsteht in der Cloud kein leerer
     BatchgenAuftrag.
   - **Den BatchgenAuftrag synchron anlegen**: Die Aufgabennummer ist der Schlüssel der Sandbox in der Registry und kommt
@@ -777,12 +810,12 @@ Thread den neuesten Wert sieht.
   deklariert. Sie wird hier in eine `UncheckedIOException` umgewandelt, für die Spring schließlich `500` antwortet: Ein
   nicht lesbarer Ordner ist ein Fehler der Anwendung.
 
-##### `createBatchJob(userId)`
+##### `createBatchJob(userId, job)`
 
-- **Was**: legt über Cloud-API 1 den BatchgenAuftrag an und liefert die Aufgabennummer; bei Fehlern wirft sie je nach
+- **Was**: legt über Cloud-API 1 den BatchgenAuftrag mit Art und Name aus `job` an und liefert die Aufgabennummer; bei Fehlern wirft sie je nach
   Art eine andere Ausnahme.
 - **Wie**:
-  1. `cloud.createBatchJob(userId)` liefert ein `CompletableFuture`.
+  1. `cloud.createBatchJob(userId, job.jobType(), job.jobName())` liefert ein `CompletableFuture`.
   2. Es wird höchstens `submit-timeout` + 5 Sekunden (`RESULT_GRACE`) gewartet.
   3. Je nach Ergebnis:
 
@@ -813,11 +846,11 @@ Thread den neuesten Wert sieht.
   Ursache“.
 - **Beispiel**: `Cloud-API 1 (BatchgenAuftrag anlegen): Ergebnis unklar, keine Antwort innerhalb von submit-timeout`.
 
-##### `launch(folders, taskNumber, slot)`
+##### `launch(folders, taskNumber, job, slot)`
 
 - **Was**: richtet eine Sandbox (den Arbeitsplatz) ein, trägt sie ein und lässt die drei Threads loslaufen.
 - **Wie**:
-  1. `TaskContext` (Bedienfeld) und `InMemoryStatusPool` (Verfolgungstafel) anlegen.
+  1. `TaskContext` (Bedienfeld, mit Art und Namen aus `job`) und `InMemoryStatusPool` (Verfolgungstafel) anlegen.
   2. Drei Virtual Threads anlegen, **noch nicht gestartet** (`unstarted`): `producer-<Aufgabennummer>` führt den
      `InboxProducer` aus, `consumer-<Aufgabennummer>` den `StatusConsumer`, `sandbox-<Aufgabennummer>` die Methode
      `supervise`.
@@ -846,6 +879,10 @@ Thread den neuesten Wert sieht.
   4. Scheitert das Lesen in der Cloud: Gibt es eine lokale Momentaufnahme, nur diese (`cloud = null`, Warnung im Log);
      sonst `CloudUnavailableException` (`502`).
   5. Weder hier noch dort bekannt: `TaskNotFoundException` (`404`).
+  6. Art und Name: solange die Aufgabe läuft aus der lokalen Momentaufnahme, sonst aus dem BatchgenAuftrag der Cloud.
+- **Warum Art und Name auf oberster Ebene der Antwort**: Sie gehören zur Aufgabe, nicht zu einer der beiden Quellen.
+  Die Oberfläche findet sie so immer an derselben Stelle, auch nach der Abmeldung (`local` ist dann `null`) und wenn die
+  Cloud gerade nicht erreichbar ist (`cloud` ist dann `null`).
 - **Warum zuerst lokal**: Die lokale Momentaufnahme hängt nicht davon ab, ob die Cloud erreichbar ist, und ist schnell
   gelesen.
 - **Warum auch das Cloud-Ergebnis auf die Benutzer:in prüfen**: Aufgabennummern lassen sich erraten. Ohne Prüfung könnte
@@ -956,7 +993,7 @@ schreiben es gleichzeitig; deshalb ist jedes Feld von einem thread-sicheren Typ.
 
 | Feld | Typ | Bedeutung |
 |---|---|---|
-| `userId`, `taskNumber`, `startedAt`, `timeout`, `errorThreshold`, `clock` | unveränderlich | Grunddaten und Schwellwerte |
+| `userId`, `taskNumber`, `job`, `startedAt`, `timeout`, `errorThreshold`, `clock` | unveränderlich | Grunddaten (`job`: Art und Name des BatchgenAuftrags) und Schwellwerte |
 | `state` | `AtomicReference<TaskState>` | aktueller Zustand, anfangs `RUNNING` |
 | `finishedAt`, `reason` | `AtomicReference` | Zeitpunkt und Grund des Endes; während des Laufs `null` |
 | `stopRequested` | `AtomicBoolean` | ob der Stopp-Knopf gedrückt ist |
@@ -969,9 +1006,10 @@ schreiben es gleichzeitig; deshalb ist jedes Feld von einem thread-sicheren Typ.
 Prüfen des Stopp-Knopfs in Schleifen). Atomare Typen lassen sich ohne Sperre lesen, fast ohne Kosten. Nur das Setzen des
 Endzustands muss mehrere Felder zusammen ändern; dafür gibt es eine kleine Sperre.
 
-##### Konstruktor `TaskContext(userId, taskNumber, timeout, errorThreshold, clock)`
+##### Konstruktor `TaskContext(userId, taskNumber, job, timeout, errorThreshold, clock)`
 
-- **Was**: speichert die Grunddaten und hält mit `clock` den Startzeitpunkt fest.
+- **Was**: speichert die Grunddaten, darunter Art und Name des BatchgenAuftrags, und hält mit `clock` den
+  Startzeitpunkt fest.
 - **Warum eine `Clock` und nicht direkt die Systemzeit**: Tests können eine steuerbare Uhr (`MutableClock`) einsetzen und
   die Zeit um 30 Minuten „vorspulen“, um den Timeout zu prüfen, ohne wirklich zu warten.
 
@@ -1154,6 +1192,7 @@ Teil `local` der Statusabfrage.
 | Feld | Bedeutung |
 |---|---|
 | `taskNumber`, `userId` | Aufgabennummer (= Nummer des BatchgenAuftrags) und Benutzer:in |
+| `jobType`, `jobName` | Art und Name des BatchgenAuftrags, wie beim Start festgelegt |
 | `state`, `reason` | Zustand und Grund des Endes (während des Laufs `null`) |
 | `startedAt`, `finishedAt` | Start- und Endzeitpunkt |
 | `submitted` | Dateien mit TaskId |
@@ -1170,7 +1209,10 @@ etwas hinterherhinken.
 
 #### `TaskStatus` (Record)
 
-Die Antwort der Statusabfrage: `taskNumber`, `userId`, `cloud`, `local`.
+Die Antwort der Statusabfrage: `taskNumber`, `userId`, `jobType`, `jobName`, `cloud`, `local`.
+
+- `jobType`, `jobName`: Art und Name des BatchgenAuftrags; solange die Aufgabe läuft aus `local`, danach aus der Cloud.
+  Beide sind hier Zeichenketten, weil sie nach dem Ende so übernommen werden, wie die Cloud sie liefert.
 
 - `cloud` (innerer Record `Cloud`: `status`, `success`, `error`, `pending`): Zustand des BatchgenAuftrags laut Cloud und
   die Zahl seiner Datensätze je Status. `null`, wenn die Cloud gerade nicht erreichbar ist.
@@ -1184,12 +1226,52 @@ Beispiel (Aufgabe läuft):
 {
   "taskNumber": "BJ-7",
   "userId": "alice",
+  "jobType": "VERTRAGSDATEN",
+  "jobName": "Testlauf Oktober",
   "cloud": {"status": "RUNNING", "success": 3, "error": 0, "pending": 2},
-  "local": {"state": "RUNNING", "reason": null, "submitted": 5, "succeeded": 3, "failed": 0, "pending": 2, "unclear": 0, ...}
+  "local": {"jobType": "VERTRAGSDATEN", "jobName": "Testlauf Oktober", "state": "RUNNING", "reason": null, "submitted": 5, "succeeded": 3, "failed": 0, "pending": 2, "unclear": 0, ...}
 }
 ```
 
+#### `JobDefinition` (Record)
+
+Art (`JobType`) und Name des BatchgenAuftrags einer Aufgabe, so wie sie aus der Startanfrage übernommen werden. Der
+`TaskContext` hält sie, und die Momentaufnahme gibt sie aus.
+
+##### `of(jobType, jobName)`
+
+- **Was**: prüft die beiden Angaben der Startanfrage und liefert eine gültige `JobDefinition`.
+- **Regeln**:
+
+  | Eingabe | Ergebnis |
+  |---|---|
+  | `jobType` ist genau `KUNDENDATEN` oder `VERTRAGSDATEN` | diese Art |
+  | `jobType` fehlt, ist leer, anders geschrieben (z. B. `kundendaten`) oder unbekannt | `InvalidJobTypeException` → `400 INVALID_JOB_TYPE` |
+  | `jobName` fehlt, ist leer oder besteht nur aus Leerzeichen | Name = Name der Art, z. B. `KUNDENDATEN` |
+  | `jobName` mit Leerzeichen am Anfang oder Ende | ohne diese Leerzeichen (`strip`) |
+  | `jobName` nach dem Entfernen der Leerzeichen länger als `MAX_JOB_NAME_LENGTH` (200) Zeichen | `InvalidJobNameException` → `400 INVALID_JOB_NAME` |
+- **Beispiele**: `of("VERTRAGSDATEN", "  Testlauf Oktober ")` ergibt `JobDefinition(VERTRAGSDATEN, "Testlauf Oktober")`;
+  `of("KUNDENDATEN", null)` ergibt `JobDefinition(KUNDENDATEN, "KUNDENDATEN")`.
+- **Warum Vergleich mit `name()` statt `JobType.valueOf`**: `valueOf` wirft bei unbekannten Werten eine
+  `IllegalArgumentException`, die sich nicht von einem Programmfehler unterscheiden lässt. Der Vergleich führt zu einer
+  eigenen Ausnahme, deren Meldung die erlaubten Werte nennt. Groß- und Kleinschreibung wird nicht angeglichen, damit in
+  der Cloud nur die festen Schreibweisen ankommen.
+- **Warum ein leerer Name als nicht angegeben gilt**: Eine Oberfläche schickt ein leeres Eingabefeld oft als `""`; ein
+  BatchgenAuftrag ohne lesbaren Namen hilft niemandem.
+- **Warum höchstens 200 Zeichen**: Der Name geht an die Cloud und steht in Antworten und im Log; die Obergrenze
+  verhindert beliebig lange Werte.
+- **Warum im Paket `task` und nicht im Controller**: Die Regeln gehören zur Geschäftslogik. `TaskManager.start` ruft sie
+  auf, und die Tests des `TaskManager` prüfen sie ohne HTTP mit.
+
 #### Ausnahmen und Ursachencodes
+
+##### `InvalidJobTypeException` und `InvalidJobNameException`
+
+- **Wann**: `jobType` fehlt oder ist unbekannt bzw. `jobName` ist zu lang; ergibt `400 INVALID_JOB_TYPE` bzw.
+  `400 INVALID_JOB_NAME`.
+- **Meldungen**: `jobType fehlt (erlaubt: KUNDENDATEN, VERTRAGSDATEN)`,
+  `Ungültiger jobType: 'X' (erlaubt: KUNDENDATEN, VERTRAGSDATEN)`, `jobName ist zu lang: 201 Zeichen (höchstens 200)`.
+  Die erlaubten Werte werden aus `JobType` gebildet; eine neue Art erscheint also ohne weitere Änderung in der Meldung.
 
 ##### `TaskRejectedException` und `RejectReason`
 
@@ -1635,7 +1717,7 @@ Alles, was die Anwendung von der Cloud braucht: fünf Methoden. Jede **kehrt sof
 
 | Methode | Schnittstelle | bei Fehlern |
 |---|---|---|
-| `createBatchJob(userId)` | Cloud-API 1: BatchgenAuftrag anlegen | `SubmitFailedException` mit Einordnung |
+| `createBatchJob(userId, jobType, jobName)` | Cloud-API 1: BatchgenAuftrag mit Art und Name anlegen | `SubmitFailedException` mit Einordnung |
 | `submit(jobId, items)` | Cloud-API 1: einen Batch übermitteln | `SubmitFailedException` mit Einordnung |
 | `queryStatus(taskIds)` | Cloud-API 2: Bulk-Statusabfrage | die ursprüngliche Ausnahme (nach den eingestellten Wiederholungen) |
 | `setJobStatus(jobId, status)` | Cloud-API 3: Endzustand schreiben | die ursprüngliche Ausnahme (nach den Wiederholungen) |
@@ -1653,11 +1735,12 @@ WebClient oder etwas anderes sie erledigt. Tests kommen mit einer kleinen Ersatz
 Die Umsetzung mit Spring WebClient. WebClient arbeitet „reaktiv“: Ein Aufruf ist eine Kette von Schritten, von denen
 jeder sagt, was als Nächstes geschieht. Die folgenden Beschreibungen erklären diese Schritte einzeln.
 
-##### `createBatchJob(userId)`
+##### `createBatchJob(userId, jobType, jobName)`
 
-- **Was**: legt einen BatchgenAuftrag an und liefert seine Nummer.
+- **Was**: legt einen BatchgenAuftrag mit Art und Name an und liefert seine Nummer.
 - **Schritte**:
-  1. `post().uri(job-path).bodyValue({"userId"})`: bereitet `POST /jobs` mit dem Rumpf `{"userId":"alice"}` vor.
+  1. `post().uri(job-path).bodyValue(new CreateJobRequest(userId, jobType, jobName))`: bereitet `POST /jobs` mit dem
+     Rumpf `{"userId":"alice","jobType":"VERTRAGSDATEN","jobName":"Testlauf Oktober"}` vor.
   2. `retrieve().bodyToMono(CreateJobResponse)`: sendet die Anfrage und liest die JSON-Antwort in ein Objekt. Bei
      HTTP-Status 4xx oder 5xx entsteht eine `WebClientResponseException`.
   3. `timeout(submit-timeout)`: Kommt bis dahin keine Antwort, entsteht eine `TimeoutException`, und die Anfrage wird
@@ -1717,8 +1800,8 @@ jeder sagt, was als Nächstes geschieht. Die folgenden Beschreibungen erklären 
 
 ##### `toBatchJob(response)`
 
-- **Was**: zerlegt die Map „Status → Anzahl“ der Antwort in drei Zahlen (erfolgreich, fehlerhaft, in Arbeit). Fehlende
-  Status zählen als 0; fehlt die ganze Map, sind alle drei 0.
+- **Was**: übernimmt Nummer, Benutzer:in, Art, Name und Status und zerlegt die Map „Status → Anzahl“ der Antwort in
+  drei Zahlen (erfolgreich, fehlerhaft, in Arbeit). Fehlende Status zählen als 0; fehlt die ganze Map, sind alle drei 0.
 
 ##### `classify(error)`
 
@@ -1783,7 +1866,8 @@ jeder sagt, was als Nächstes geschieht. Die folgenden Beschreibungen erklären 
 | `RecordStatus` | `SUCCESS`, `ERROR`, `PENDING` | Status eines Datensatzes; die Cloud aktualisiert ihn selbst |
 | `RecordStatusResult(taskId, status, fehlermeldung)` | Antwort von Cloud-API 2 für eine TaskId | `fehlermeldung` begründet ein `ERROR`, sonst ist sie leer |
 | `JobStatus` | `RUNNING`, `COMPLETED`, `TIMEOUT`, `ERROR`, `TERMINATED` | Status eines BatchgenAuftrags; die Cloud legt ihn mit `RUNNING` an, die Endzustände schreibt die Anwendung |
-| `BatchJob(jobId, userId, status, success, error, pending)` | ein BatchgenAuftrag, gelesen über Cloud-API 3 | |
+| `JobType` | `KUNDENDATEN`, `VERTRAGSDATEN` | Art eines BatchgenAuftrags; die Anwendung übergibt sie beim Anlegen |
+| `BatchJob(jobId, userId, jobType, jobName, status, success, error, pending)` | ein BatchgenAuftrag, gelesen über Cloud-API 3 | `jobType` ist eine Zeichenkette: Ein Wert, den die Anwendung nicht kennt, soll das Lesen des Auftrags nicht scheitern lassen (ein unbekannter Enum-Wert ließe Jackson die ganze Antwort ablehnen) |
 
 **Warum `TaskId` eine eigene Klasse ist und kein `String`**: Steht in einer Methodensignatur `TaskId`, kann man keinen
 Dateinamen, keine Aufgabennummer oder sonstige Zeichenkette versehentlich übergeben; leere Werte scheitern schon beim
@@ -2058,16 +2142,19 @@ antworten).
   |---|---|
   | `POST /jobs` | Auftrag anlegen (`createJob`) |
   | `GET /jobs` | alle Aufträge in der Reihenfolge ihres Anlegens |
-  | `GET /jobs/{id}` | einen Auftrag lesen, mit Status und Zahl der Datensätze je Status; unbekannt ergibt `404` |
+  | `GET /jobs/{id}` | einen Auftrag lesen, mit Art, Name, Status und Zahl der Datensätze je Status; unbekannt ergibt `404` |
   | `PUT /jobs/{id}/status` | Endzustand schreiben (Cloud-API 3 nachgebildet), Ausgabe auf der Konsole |
 
 ##### `createJob(exchange)`
 
-- **Was**: legt einen Auftrag an, nummeriert `BJ-1`, `BJ-2` usw., Status `RUNNING`. Fehlt `userId` in der Anfrage, `400`.
+- **Was**: legt einen Auftrag mit `userId`, `jobType` und `jobName` aus der Anfrage an, nummeriert `BJ-1`, `BJ-2`
+  usw., Status `RUNNING`. Fehlt `userId` oder `jobType`, `400`. `jobName` wird übernommen, wie er kommt; die Prüfung
+  der Werte ist Sache der Anwendung.
 
 ##### `view(Job)`
 
-- **Was**: wandelt einen Auftrag in das Antwortformat um, mit der Zahl der Datensätze je Status (jedes Mal neu gezählt).
+- **Was**: wandelt einen Auftrag in das Antwortformat um, mit Art, Name und der Zahl der Datensätze je Status (jedes Mal
+  neu gezählt).
 
 ##### `handleSubmitOrAdmin(exchange)`
 
@@ -2199,15 +2286,17 @@ Zusammenhänge, die man beim Anpassen bedenken sollte:
 | `InMemoryStatusPoolTest` | Unit | fällige Einträge, Neueinplanen, entfernte Einträge kommen nicht zurück |
 | `UserFoldersTest` | Unit | Anlegen der Ordner, Prüfung der Benutzerkennung, Auflisten, Marker, Verschieben, gleiche Namen, Grund-Dateien |
 | `PipelinePropertiesTest` | Unit | Standardwerte und Prüfungen |
+| `JobDefinitionTest` | Unit | Prüfung von Art und Name: erlaubte Arten, Standardname, Leerzeichen, Höchstlänge |
 | `WebClientCloudClientTest` | Komponente (gegen `FakeCloud`) | Vertrag, Einordnung der Fehler von API 1, Wiederholungen, `fehlermeldung` |
-| `TaskManagerTest` | Komponente (Stub-Cloud, ohne HTTP) | Start, Abweisungen, Abbruch, Abmeldung, Beenden der Anwendung, alle Gründe für ein Ende |
-| `PipelineIntegrationTest`, `PipelineTimeoutIntegrationTest` | Integration (vollständige Spring-Anwendung gegen `FakeCloud`, in derselben JVM) | alle Endzustände, Fehlerarten von API 1, Gründe für abgewiesene Starts, Isolation, Grund-Dateien in der errorbox |
+| `TaskManagerTest` | Komponente (Stub-Cloud, ohne HTTP) | Start, Abweisungen (auch ungültige Art vor jedem Cloud-Aufruf), Abbruch, Abmeldung, Beenden der Anwendung, alle Gründe für ein Ende |
+| `PipelineIntegrationTest`, `PipelineTimeoutIntegrationTest` | Integration (vollständige Spring-Anwendung gegen `FakeCloud`, in derselben JVM) | alle Endzustände, Fehlerarten von API 1, Gründe für abgewiesene Starts, Art und Name in Start, Cloud und Status, ungültige Startrümpfe, Isolation, Grund-Dateien in der errorbox |
 | `PipelineBlackBoxIT` | Black-Box (Anwendungs-JAR und `FakeCloudBackendApplication` als eigene Prozesse, nur über HTTP) | die wichtigsten Abläufe, als Abnahme aus Sicht von außen |
 
 Hilfsklassen der Tests: `FakeCloud` (Cloud-Ersatz in derselben JVM; das Verhalten steuern Dateiinhalt und Vorgaben,
 z. B. `REJECT` (nicht umgewandelt, mit `fehlermeldung`), `OMIT` (fehlt in der Antwort), `FAIL` (`ERROR` mit
 `fehlermeldung`), `SLOW`, verzögerte Antworten), `FakeBackendClient` (Client für die Admin-Endpunkte der
-`FakeCloudBackendApplication`), `PipelineApi` (Client für REST-API und Benutzerordner), `ExternalProcess` (startet
+`FakeCloudBackendApplication`), `PipelineApi` (Client für REST-API und Benutzerordner; spricht nur HTTP/1.1, weil der JDK-Client sonst auf jeder neuen
+Verbindung ein Upgrade auf h2c versucht und eine POST-Anfrage mit Rumpf dabei hängen bleibt), `ExternalProcess` (startet
 externe Prozesse), `MutableClock`, `TestProperties`, `PipelineTestSupport` (gemeinsame Einstellungen der
 Integrationstests: kurze Intervalle, zufälliger Port).
 

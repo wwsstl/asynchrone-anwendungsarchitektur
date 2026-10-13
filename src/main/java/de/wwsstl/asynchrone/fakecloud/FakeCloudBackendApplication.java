@@ -40,7 +40,8 @@ import tools.jackson.databind.json.JsonMapper;
  * Statuslogik:
  *
  * <ol>
- *   <li>{@code POST <job-path>} legt einen BatchgenAuftrag mit dem Status {@code RUNNING} an (Cloud-API 1).</li>
+ *   <li>{@code POST <job-path>} legt einen BatchgenAuftrag mit Art ({@code jobType}), Name ({@code jobName}) und dem
+ *       Status {@code RUNNING} an (Cloud-API 1).</li>
  *   <li>{@code POST <submit-path>} nimmt Batches zu einem BatchgenAuftrag entgegen und vergibt je Datei eine TaskId;
  *       der Anfangsstatus ist immer {@code PENDING} (Cloud-API 1).</li>
  *   <li>{@code POST <status-path>} beantwortet die Bulk-Statusabfragen des {@code StatusConsumer} mit dem jeweils
@@ -81,12 +82,16 @@ public final class FakeCloudBackendApplication {
     private static final class Job {
         private final String jobId;
         private final String userId;
+        private final String jobType;
+        private final String jobName;
         private final long sequence;
         private volatile JobStatus status = JobStatus.RUNNING;
 
-        Job(String jobId, String userId, long sequence) {
+        Job(String jobId, String userId, String jobType, String jobName, long sequence) {
             this.jobId = jobId;
             this.userId = userId;
+            this.jobType = jobType;
+            this.jobName = jobName;
             this.sequence = sequence;
         }
     }
@@ -182,15 +187,20 @@ public final class FakeCloudBackendApplication {
     }
 
     private void createJob(HttpExchange exchange) throws IOException {
-        String userId = readJson(exchange).path("userId").asString("");
-        if (userId.isBlank()) {
-            reply(exchange, 400, Map.of("error", "userId fehlt"));
+        JsonNode request = readJson(exchange);
+        String userId = request.path("userId").asString("");
+        String jobType = request.path("jobType").asString("");
+        if (userId.isBlank() || jobType.isBlank()) {
+            reply(exchange, 400, Map.of("error", "userId oder jobType fehlt"));
             return;
         }
+        // Wie die Cloud übernimmt das Fake-Backend Art und Name unverändert.
+        String jobName = request.path("jobName").asString("");
         int sequence = jobSequence.incrementAndGet();
-        Job job = new Job("BJ-" + sequence, userId, sequence);
+        Job job = new Job("BJ-" + sequence, userId, jobType, jobName, sequence);
         jobs.put(job.jobId, job);
-        System.out.printf("[cloud-api-1] BatchgenAuftrag %s fuer %s angelegt (RUNNING)%n", job.jobId, userId);
+        System.out.printf("[cloud-api-1] BatchgenAuftrag %s (%s, %s) fuer %s angelegt (RUNNING)%n", job.jobId, jobType,
+                jobName, userId);
         reply(exchange, 200, Map.of("jobId", job.jobId));
     }
 
@@ -204,6 +214,8 @@ public final class FakeCloudBackendApplication {
         Map<String, Object> view = new LinkedHashMap<>();
         view.put("jobId", job.jobId);
         view.put("userId", job.userId);
+        view.put("jobType", job.jobType);
+        view.put("jobName", job.jobName);
         view.put("status", job.status.name());
         view.put("counts", counts);
         return view;

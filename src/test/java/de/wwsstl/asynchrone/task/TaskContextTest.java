@@ -10,11 +10,13 @@ import org.junit.jupiter.api.Test;
 
 import de.wwsstl.asynchrone.MutableClock;
 import de.wwsstl.asynchrone.cloud.JobStatus;
+import de.wwsstl.asynchrone.cloud.JobType;
 
 class TaskContextTest {
 
     private final MutableClock clock = new MutableClock();
-    private final TaskContext context = new TaskContext("anna", "BJ-1", Duration.ofMinutes(1), 2, clock);
+    private final TaskContext context = new TaskContext("anna", "BJ-1",
+            new JobDefinition(JobType.VERTRAGSDATEN, "Testlauf"), Duration.ofMinutes(1), 2, clock);
 
     @Test
     void firstEndStateWinsAndSetsStopSignal() {
@@ -83,8 +85,8 @@ class TaskContextTest {
 
         TaskSnapshot snapshot = context.snapshot(1);
 
-        assertThat(snapshot).isEqualTo(new TaskSnapshot("BJ-1", "anna", TaskState.RUNNING, null, clock.instant(), null,
-                2, 1, 1, 1, 3));
+        assertThat(snapshot).isEqualTo(new TaskSnapshot("BJ-1", "anna", JobType.VERTRAGSDATEN, "Testlauf",
+                TaskState.RUNNING, null, clock.instant(), null, 2, 1, 1, 1, 3));
     }
 
     @Test

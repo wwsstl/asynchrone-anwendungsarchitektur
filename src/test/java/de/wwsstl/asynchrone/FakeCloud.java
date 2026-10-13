@@ -68,10 +68,14 @@ public final class FakeCloud implements AutoCloseable {
 
     private static final class Job {
         private final String userId;
+        private final String jobType;
+        private final String jobName;
         private volatile JobStatus status = JobStatus.RUNNING;
 
-        Job(String userId) {
+        Job(String userId, String jobType, String jobName) {
             this.userId = userId;
+            this.jobType = jobType;
+            this.jobName = jobName;
         }
     }
 
@@ -147,6 +151,12 @@ public final class FakeCloud implements AutoCloseable {
         jobStatusWritesFail.set(fail);
     }
 
+    /** Art und Name, mit denen Cloud-API 1 den BatchgenAuftrag angelegt hat; {@code null}, wenn es ihn nicht gibt. */
+    public List<String> jobTypeAndName(String jobId) {
+        Job job = jobs.get(jobId);
+        return job == null ? null : List.of(job.jobType, job.jobName);
+    }
+
     /** Status des BatchgenAuftrags; {@code null}, wenn es ihn nicht gibt. */
     public JobStatus jobStatus(String jobId) {
         Job job = jobs.get(jobId);
@@ -184,13 +194,15 @@ public final class FakeCloud implements AutoCloseable {
         String[] path = exchange.getRequestURI().getPath().substring(1).split("/");
         String method = exchange.getRequestMethod();
         if (path.length == 1 && "POST".equals(method)) {
-            String userId = mapper.readTree(exchange.getRequestBody().readAllBytes()).path("userId").asString("");
+            JsonNode request = mapper.readTree(exchange.getRequestBody().readAllBytes());
+            String userId = request.path("userId").asString("");
             if (unavailableUsers.contains(userId)) {
                 reply(exchange, 503, Map.of());
                 return;
             }
             String jobId = "BJ-" + jobSequence.incrementAndGet();
-            jobs.put(jobId, new Job(userId));
+            jobs.put(jobId, new Job(userId, request.path("jobType").asString(""),
+                    request.path("jobName").asString("")));
             Duration delay = jobCreationDelays.get(userId);
             if (delay != null) {
                 try {
@@ -227,7 +239,8 @@ public final class FakeCloud implements AutoCloseable {
         }
         records.values().stream().filter(record -> record.jobId.equals(jobId))
                 .forEach(record -> counts.merge(record.status, 1, Integer::sum));
-        return Map.of("jobId", jobId, "userId", job.userId, "status", job.status.name(), "counts", counts);
+        return Map.of("jobId", jobId, "userId", job.userId, "jobType", job.jobType, "jobName", job.jobName, "status",
+                job.status.name(), "counts", counts);
     }
 
     // --- Cloud-API 1: Batch übermitteln ----------------------------------------------------------------------

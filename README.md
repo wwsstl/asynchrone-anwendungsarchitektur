@@ -90,15 +90,30 @@ wird der Start mit `PENDINGBOX_NOT_EMPTY` abgewiesen; die Benutzer:in bearbeitet
 
 | Methode | Pfad | Wirkung |
 |---|---|---|
-| `POST` | `/api/users/{userId}/tasks` | Startet eine Aufgabe: `202` mit `Location`-Header und lokalem Stand |
+| `POST` | `/api/users/{userId}/tasks` | Startet eine Aufgabe mit Art und Name des BatchgenAuftrags im JSON-Rumpf: `202` mit `Location`-Header und lokalem Stand |
 | `GET` | `/api/users/{userId}/tasks/{taskNumber}` | Status aus der Cloud, solange die Aufgabe läuft zusätzlich der lokale Stand |
 | `POST` | `/api/users/{userId}/tasks/{taskNumber}/cancel` | Abbruch von außen: `202` mit lokalem Stand; `TERMINATED` wird nach dem Ende der Threads geschrieben |
+
+Rumpf des Starts (`Content-Type: application/json`):
+
+```json
+{"jobType": "VERTRAGSDATEN", "jobName": "Testlauf Oktober"}
+```
+
+| Feld | Bedeutung |
+|---|---|
+| `jobType` | Pflicht: `KUNDENDATEN` oder `VERTRAGSDATEN`, genau so geschrieben |
+| `jobName` | optional, höchstens 200 Zeichen; Leerzeichen am Anfang und Ende werden entfernt. Fehlt er oder ist er leer, ist der Name gleich `jobType` |
+
+Beide werden beim Anlegen des BatchgenAuftrags an Cloud-API 1 übergeben und in Start- und Statusantwort gezeigt.
+Ungültige Angaben weisen den Start ab, bevor die Cloud aufgerufen wird.
 
 Die Statusabfrage liefert:
 
 | Feld | Bedeutung |
 |---|---|
 | `taskNumber`, `userId` | Aufgabennummer (= Nummer des BatchgenAuftrags) und Benutzer:in |
+| `jobType`, `jobName` | Art und Name des BatchgenAuftrags; solange die Aufgabe läuft aus dem lokalen Stand, danach aus der Cloud |
 | `cloud` | `status` des BatchgenAuftrags sowie `success`, `error`, `pending` je Datensatzstatus; `null`, wenn die Cloud gerade nicht erreichbar ist |
 | `local` | lokaler Stand der Sandbox; `null`, sobald die Aufgabe abgemeldet ist |
 
@@ -106,6 +121,7 @@ Der lokale Stand (auch Antwort von Start und Abbruch) enthält:
 
 | Feld | Bedeutung |
 |---|---|
+| `taskNumber`, `userId`, `jobType`, `jobName` | wie in der Statusabfrage |
 | `state` | `RUNNING`, `COMPLETED`, `TIMEOUT`, `ERROR`, `TERMINATED` oder `ABORTED` |
 | `reason` | Grund des Endzustands, z. B. `Cloud-API 1 (Batch übermitteln): Ergebnis unklar, keine Antwort innerhalb von submit-timeout` oder `maximale Laufzeit (task-timeout) überschritten; letzte Statusabfrage (Cloud-API 2) fehlgeschlagen: 503 Service Unavailable from POST …`; `null`, solange die Aufgabe läuft. Er steht nur im lokalen Stand und im Log, nicht in der Cloud |
 | `startedAt`, `finishedAt` | Start und Ende (`finishedAt` ist `null`, solange die Aufgabe läuft) |
@@ -120,6 +136,9 @@ Eigenschaft `code` beantwortet:
 | Status | `code` | Ursache |
 |---|---|---|
 | `400` | `INVALID_USER_ID`, `INVALID_TASK_NUMBER` | ungültige Kennung im Pfad |
+| `400` | `INVALID_JOB_TYPE` | `jobType` fehlt (auch: Start ohne Rumpf) oder ist keine der erlaubten Arten |
+| `400` | `INVALID_JOB_NAME` | `jobName` ist länger als 200 Zeichen |
+| `400` | `INVALID_REQUEST_BODY` | Rumpf des Starts ist kein lesbares JSON |
 | `404` | `TASK_NOT_FOUND` | Aufgabe unbekannt, gehört einer anderen Benutzer:in oder läuft beim Abbruch nicht mehr |
 | `409` | `USER_TASK_RUNNING` | für die Benutzer:in läuft bereits eine Aufgabe |
 | `409` | `PENDINGBOX_NOT_EMPTY` | Restdateien einer früheren Aufgabe in der `pendingbox` |
@@ -133,11 +152,11 @@ Der angenommene Vertrag der Cloud-Dienste (Pfade über `pipeline.cloud.*` einste
 
 | Aufruf | Anfrage | Antwort |
 |---|---|---|
-| Cloud-API 1: BatchgenAuftrag anlegen | `POST /jobs` `{"userId"}` | `{"jobId"}` |
+| Cloud-API 1: BatchgenAuftrag anlegen | `POST /jobs` `{"userId","jobType","jobName"}` | `{"jobId"}` |
 | Cloud-API 1: Batch übermitteln | `POST /tasks` `{"jobId","items":[{"fileName","content"}]}`; `content` ist der Inhalt der Datei als JSON-Wert, z. B. `{"fileName":"a.json","content":{"name":"Beispiel"}}` | `{"tasks":[{"fileName","taskId","fehlermeldung"}]}`; je Datei ein Eintrag: umgewandelt mit TaskId, nicht umgewandelt mit leerer TaskId und `fehlermeldung` (fehlt eine Datei ganz, gilt sie ebenfalls als nicht umgewandelt) |
 | Cloud-API 2: Bulk-Statusabfrage | `POST /tasks/status` `{"taskIds":[…]}` | `{"results":[{"taskId","status","fehlermeldung"}]}` mit `SUCCESS`, `ERROR` oder `PENDING`; `fehlermeldung` begründet ein `ERROR` |
 | Cloud-API 3: Endzustand setzen | `PUT /jobs/{jobId}/status` `{"status"}` | – |
-| Cloud-API 3: BatchgenAuftrag lesen | `GET /jobs/{jobId}` | `{"jobId","userId","status","counts":{"SUCCESS","ERROR","PENDING"}}`; `404`, wenn es ihn nicht gibt |
+| Cloud-API 3: BatchgenAuftrag lesen | `GET /jobs/{jobId}` | `{"jobId","userId","jobType","jobName","status","counts":{"SUCCESS","ERROR","PENDING"}}`; `404`, wenn es ihn nicht gibt |
 
 Cloud-API 2 und 3 werden bei Netzwerk-, Timeout- und `5xx`-Fehlern bis zu `cloud.retries` Mal wiederholt.
 
@@ -201,7 +220,7 @@ Optionale Argumente über `-Dspring-boot.run.arguments="…"` in dieser Reihenfo
 
 | Anfrage | Wirkung |
 |---|---|
-| `GET /jobs` | alle BatchgenAufträge mit Status und Zahl der Datensätze je Status |
+| `GET /jobs` | alle BatchgenAufträge mit Art, Name, Status und Zahl der Datensätze je Status |
 | `GET /tasks` | alle Datensätze mit BatchgenAuftrag, Dateiname, TaskId und Status |
 | `POST /tasks/{taskId}/status?status=SUCCESS` | Status eines Datensatzes setzen (`SUCCESS`, `ERROR`, `PENDING`); bei `ERROR` optional mit `&fehlermeldung=…`, die Cloud-API 2 dann liefert |
 | `POST /tasks/reject?fileName=a.json` | die nächste Übermittlung dieser Datei wird nicht umgewandelt: sie kommt in die `errorbox`; optional `&fehlermeldung=…` als Grund, sonst ein Standardtext |
@@ -233,7 +252,8 @@ Mit dem Fake-Backend lässt sich eine Aufgabe von Hand durchspielen:
    ```bash
    mkdir -p data/users/alice/inbox
    echo '{"name": "Beispiel"}' > data/users/alice/inbox/a.json
-   curl -X POST http://localhost:8080/api/users/alice/tasks
+   curl -X POST http://localhost:8080/api/users/alice/tasks -H "Content-Type: application/json" \
+        -d '{"jobType":"KUNDENDATEN","jobName":"Testlauf"}'
    ```
 
 4. Die TaskId des Datensatzes im Fake-Backend nachsehen und ihn entscheiden; nach dem nächsten Abfragezyklus liegt die
@@ -245,7 +265,12 @@ Mit dem Fake-Backend lässt sich eine Aufgabe von Hand durchspielen:
    curl http://localhost:8080/api/users/alice/tasks/<taskNumber>
    ```
 
-Unter Windows PowerShell ist `curl` ein Alias für `Invoke-WebRequest`; dort `curl.exe` verwenden.
+Unter Windows PowerShell ist `curl` ein Alias für `Invoke-WebRequest`; dort `curl.exe` verwenden. Windows PowerShell 5.1
+entfernt die Anführungszeichen im JSON-Rumpf, bevor `curl.exe` ihn erhält; dort `\"` schreiben:
+
+```powershell
+curl.exe -X POST http://localhost:8080/api/users/alice/tasks -H "Content-Type: application/json" -d '{\"jobType\":\"KUNDENDATEN\"}'
+```
 
 ## Projektstruktur
 
