@@ -49,13 +49,14 @@ class TaskManagerTest {
     private final StubCloud cloud = new StubCloud();
     private final InMemoryTaskRegistry registry = new InMemoryTaskRegistry();
     private TaskManager manager;
+    private UserFolderResolver resolver;
     private UserFolders folders;
 
     @BeforeEach
     void setUp() {
-        UserFolderResolver resolver = new UserFolderResolver(TestProperties.withBase(base));
+        resolver = new UserFolderResolver(TestProperties.withBase(base));
         manager = new TaskManager(registry, resolver, cloud, TestProperties.withBase(base), Clock.systemUTC());
-        folders = resolver.resolve("anna");
+        folders = resolver.resolve("anna", JobType.KUNDENDATEN);
     }
 
     @AfterEach
@@ -87,6 +88,38 @@ class TaskManagerTest {
                 .isInstanceOfSatisfying(TaskRejectedException.class,
                         e -> assertThat(e.reason()).isEqualTo(RejectReason.PENDINGBOX_NOT_EMPTY));
         assertThat(cloud.createdJobs).hasValue(0);
+    }
+
+    @Test
+    void pendingboxOfAnotherJobTypeDoesNotBlockTheStart() throws IOException {
+        Files.writeString(folders.pendingbox().resolve("left.json"), "{}");
+
+        TaskSnapshot started = manager.start("anna", "VERTRAGSDATEN", null);
+
+        assertThat(started.jobType()).isEqualTo(JobType.VERTRAGSDATEN);
+        assertThat(folders.pendingbox().resolve("left.json")).exists();
+    }
+
+    @Test
+    void tasksOfDifferentJobTypesRunSideBySideInTheirOwnFolders() throws IOException {
+        UserFolders contracts = resolver.resolve("anna", JobType.VERTRAGSDATEN);
+        inboxFile("a.json");
+        Files.writeString(contracts.inbox().resolve("b.json"), "{}");
+
+        manager.start("anna", "KUNDENDATEN", null);
+        manager.start("anna", "VERTRAGSDATEN", null);
+
+        // Jede Aufgabe übermittelt nur die Dateien ihrer Art; beide warten auf PENDING.
+        await().atMost(Duration.ofSeconds(5)).until(() -> Files.exists(folders.pendingbox().resolve("a.json"))
+                && Files.exists(contracts.pendingbox().resolve("b.json")));
+        assertThat(registry.size()).isEqualTo(2);
+        assertThat(folders.pendingbox().resolve("b.json")).doesNotExist();
+        assertThat(contracts.pendingbox().resolve("a.json")).doesNotExist();
+        // Je Benutzer:in und Art bleibt es bei höchstens einer Aufgabe.
+        assertThatThrownBy(() -> manager.start("anna", "VERTRAGSDATEN", null))
+                .isInstanceOfSatisfying(TaskRejectedException.class,
+                        e -> assertThat(e.reason()).isEqualTo(RejectReason.USER_TASK_RUNNING));
+        assertThat(cloud.createdJobs).hasValue(2);
     }
 
     @Test

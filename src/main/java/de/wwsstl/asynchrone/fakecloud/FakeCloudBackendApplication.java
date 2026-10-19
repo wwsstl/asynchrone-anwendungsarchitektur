@@ -260,17 +260,18 @@ public final class FakeCloudBackendApplication {
         }
         List<Map<String, String>> tasks = new ArrayList<>();
         for (JsonNode item : request.path("items")) {
-            String fileName = item.path("fileName").asString("");
+            // Der Identifikator ist der Dateiname; nach ihm richten sich auch die Vorgaben aus /tasks/reject.
+            String fileName = item.path("identifikator").asString("");
             String rejection = rejectNext.remove(fileName);
             if (rejection != null) {
                 // Nicht umgewandelt: leere TaskId und der Grund in fehlermeldung.
-                tasks.add(Map.of("fileName", fileName, "taskId", "", "fehlermeldung", rejection));
+                tasks.add(Map.of("identifikator", fileName, "taskId", "", "fehlermeldung", rejection));
                 System.out.printf("[submit] %s: %s nicht umgewandelt: %s%n", jobId, fileName, rejection);
                 continue;
             }
             String taskId = UUID.randomUUID().toString();
             records.put(taskId, new DataRecord(taskId, jobId, fileName, recordSequence.incrementAndGet()));
-            tasks.add(Map.of("fileName", fileName, "taskId", taskId, "fehlermeldung", ""));
+            tasks.add(Map.of("identifikator", fileName, "taskId", taskId, "fehlermeldung", ""));
             System.out.printf("[submit] %s: %s -> %s (PENDING)%n", jobId, fileName, taskId);
         }
         reply(exchange, 200, Map.of("tasks", tasks));

@@ -10,7 +10,8 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
 /**
  * Konfiguration der Pipeline ({@code pipeline.*}).
  *
- * @param baseDirectory       Basisverzeichnis; je Benutzer {@code <base>/<userId>/{inbox,pendingbox,donebox,errorbox}}
+ * @param baseDirectory       Basisverzeichnis; je Benutzer und Art
+ *                            {@code <base>/<userId>/<jobType>/{inbox,pendingbox,donebox,errorbox}}
  * @param batchSize           Dateien je Batch, den der Producer an Cloud-API 1 übermittelt
  * @param poolResumeThreshold der Producer liest den nächsten Batch erst, wenn der Status-Pool auf diesen Wert oder
  *                            darunter gesunken ist (Rückstau)
@@ -65,8 +66,8 @@ public record PipelineProperties(
             @DefaultValue("/jobs") String jobPath,
             @DefaultValue("/tasks") String submitPath,
             @DefaultValue("/tasks/status") String statusPath,
-            @DefaultValue("30s") Duration submitTimeout,
-            @DefaultValue("30s") Duration statusTimeout,
+            @DefaultValue("15s") Duration submitTimeout,
+            @DefaultValue("10s") Duration statusTimeout,
             @DefaultValue("2") int retries) {
 
         public Cloud {

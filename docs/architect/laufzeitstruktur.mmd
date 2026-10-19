@@ -9,7 +9,7 @@ flowchart TB
         API["TaskController<br/>+ ApiExceptionHandler"]
         TM["TaskManager"]
         Reg[("TaskRegistry")]
-        Users[("users: je Benutzer:in ein UserSlot")]
+        Users[("users: je Benutzer:in und Art ein UserSlot")]
         Cloud["CloudClient<br/>(WebClientCloudClient)"]
     end
     subgraph PerTask["Je Aufgabe, angelegt von TaskManager.launch"]

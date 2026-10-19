@@ -31,7 +31,7 @@ class PipelinePropertiesTest {
         assertThat(properties.taskTimeout()).isEqualTo(Duration.ofMinutes(30));
         assertThat(properties.submitRetryMaxWait()).isEqualTo(Duration.ofMinutes(1));
         assertThat(properties.cloud()).isEqualTo(new PipelineProperties.Cloud(URI.create("http://localhost:8081"),
-                "/jobs", "/tasks", "/tasks/status", Duration.ofSeconds(30), Duration.ofSeconds(30), 2));
+                "/jobs", "/tasks", "/tasks/status", Duration.ofSeconds(15), Duration.ofSeconds(10), 2));
     }
 
     @Test

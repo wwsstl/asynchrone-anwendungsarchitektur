@@ -17,13 +17,15 @@
 | `donebox` | 生成成功的文件 |
 | `errorbox` | 没有转换成功或生成出错的文件；每个文件的原因写在`errorbox/.fehler/<文件名>.txt`里 |
 
+每个用户按BatchgenAuftrag的类型各有一套这四个目录：`<userId>/KUNDENDATEN/inbox`、`<userId>/VERTRAGSDATEN/inbox`等。任务只使用自己类型的目录，不同类型的文件不会混在一起。
+
 ## 1. 启动
 
-用户通过REST-API启动一项任务，同时给出BatchgenAuftrag的类型（`jobType`：`KUNDENDATEN`或`VERTRAGSDATEN`），名称可选（`jobName`，最多200个字符；不填则等于类型）。类型缺失、未知或名称过长时，启动立即被拒绝，返回`400 Bad Request`和原因代码`INVALID_JOB_TYPE`或`INVALID_JOB_NAME`；不新建任何东西，也不移动任何文件。REST-API用Spring WebFlux实现，它在一个虚拟线程上把调用转交给TaskManager，以免阻塞事件循环（Event-Loop）。每个用户同一时间最多只运行一项任务。
+用户通过REST-API启动一项任务，同时给出BatchgenAuftrag的类型（`jobType`：`KUNDENDATEN`或`VERTRAGSDATEN`），名称可选（`jobName`，最多200个字符；不填则等于类型）。类型缺失、未知或名称过长时，启动立即被拒绝，返回`400 Bad Request`和原因代码`INVALID_JOB_TYPE`或`INVALID_JOB_NAME`；不新建任何东西，也不移动任何文件。REST-API用Spring WebFlux实现，它在一个虚拟线程上把调用转交给TaskManager，以免阻塞事件循环（Event-Loop）。同一用户的同一种类型同一时间最多只运行一项任务；同类型的第二次启动被拒绝，返回`409 Conflict`和原因代码`USER_TASK_RUNNING`。同一用户不同类型的任务可以同时运行，因为它们的目录是分开的。
 
 TaskManager按以下步骤启动任务：
 
-1. **检查`pendingbox`：** 不为空说明还留有之前的任务没有处理完的文件（见第7节）。这时不新建BatchgenAuftrag，启动被拒绝，返回`409 Conflict`和原因代码`PENDINGBOX_NOT_EMPTY`，提示用户先处理这些文件。
+1. **检查该类型的`pendingbox`：** 不为空说明还留有之前的任务没有处理完的文件（见第7节）。这时不新建BatchgenAuftrag，启动被拒绝，返回`409 Conflict`和原因代码`PENDINGBOX_NOT_EMPTY`，提示用户先处理这些文件。
 2. **新建BatchgenAuftrag：** 通过Cloud-API 1在云端数据库中新建一个BatchgenAuftrag，带上类型和名称，初始状态为RUNNING，它的编号就是任务号。第一阶段云端不限制同一用户拥有的BatchgenAuftrag数量，即使之前的BatchgenAuftrag仍处于RUNNING，也可以新建。
    调用失败时不创建Sandbox，失败按第2节的方式分类：
    - **明确没有被处理**（连接失败、请求被拒绝）：云端不可用，启动被拒绝，返回`502 Bad Gateway`和原因代码`CLOUD_UNAVAILABLE`。
@@ -105,7 +107,7 @@ Producer等待Cloud-API 1的应答时是阻塞的，但时间很短：应答只�
 | 应用崩溃 | 已经提交、还没有结果的文件，带TaskId标记；崩溃时正在提交的那一批没有标记 |
 | 调用Cloud-API 1结果不明（第2节） | 这一批文件，没有TaskId标记 |
 
-这些文件由用户在下一次启动任务之前自己处理。启动时的检查（第1节）保证这一点：`pendingbox`不为空时，启动被拒绝（`PENDINGBOX_NOT_EMPTY`）。
+这些文件由用户在下一次启动任务之前自己处理。启动时的检查（第1节）保证这一点：该类型的`pendingbox`不为空时，这种类型的启动被拒绝（`PENDINGBOX_NOT_EMPTY`）；其他类型不受影响。
 
 以下情况下，BatchgenAuftrag会保持RUNNING，需要人工修正：
 

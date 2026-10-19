@@ -30,9 +30,9 @@ flowchart LR
     C -->|ERROR| Error[("errorbox")]
 ```
 
-1. **Start** – Liegen in der `pendingbox` noch Dateien, wird der Start abgewiesen. Sonst legt der TaskManager über
+1. **Start** – Liegen in der `pendingbox` dieser Art noch Dateien, wird der Start abgewiesen. Sonst legt der TaskManager über
    Cloud-API 1 einen BatchgenAuftrag an (seine Nummer ist die Aufgabennummer), baut die Sandbox auf, trägt sie in die
-   TaskRegistry ein und startet Producer und Consumer. Je Benutzer:in läuft höchstens eine Aufgabe. Schlägt das
+   TaskRegistry ein und startet Producer und Consumer. Je Benutzer:in und Art läuft höchstens eine Aufgabe. Schlägt das
    Anlegen fehl, wird keine Sandbox angelegt und der Start mit `502` (Cloud nicht verfügbar) bzw. `504` (Ergebnis
    unklar, z. B. keine Antwort) abgewiesen.
 2. **Producer** – verschiebt bis zu `batch-size` Dateien aus der `inbox` in die `pendingbox`, wandelt ihren Inhalt in
@@ -69,10 +69,10 @@ Die Anwendung schreibt diese Zustände über Cloud-API 3 in den BatchgenAuftrag.
 ein unerwarteter Fehler die Sandbox, wird wie bei einem Absturz nichts geschrieben: Der BatchgenAuftrag bleibt
 `RUNNING` und muss manuell korrigiert werden (Abschnitt 7).
 
-### Ordner je Benutzer:in
+### Ordner je Benutzer:in und Art
 
 ```
-<base-directory>/<userId>/
+<base-directory>/<userId>/<jobType>/      z. B. data/users/0000/KUNDENDATEN
 ├── inbox/        abgelegte, noch zu übermittelnde Dateien
 ├── pendingbox/   an Cloud-API 1 übergeben, Ergebnis steht aus
 │   └── .taskids/ TaskId je Datei als Marker; eine Datei ohne Marker hat ein unklares Übermittlungsergebnis
@@ -81,10 +81,13 @@ ein unerwarteter Fehler die Sandbox, wird wie bei einem Absturz nichts geschrieb
     └── .fehler/  Grund je Datei (<Dateiname>.txt), z. B. die Fehlermeldung der Cloud
 ```
 
-Die Ordner werden beim ersten Start angelegt. Gültige Benutzerkennungen: `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
+Jede Art (`KUNDENDATEN`, `VERTRAGSDATEN`) hat eigene Ordner; eine Aufgabe liest nur die `inbox` ihrer Art. Aufgaben
+verschiedener Arten derselben Benutzer:in laufen deshalb nebeneinander. Die Ordner einer Art werden beim ersten Start
+dieser Art angelegt. Gültige Benutzerkennungen: `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`.
 
-Es gibt kein Fortsetzen: Eine neue Aufgabe übernimmt keine Dateien aus der `pendingbox`. Solange dort Dateien liegen,
-wird der Start mit `PENDINGBOX_NOT_EMPTY` abgewiesen; die Benutzer:in bearbeitet sie zuerst von Hand (Abschnitt 7).
+Es gibt kein Fortsetzen: Eine neue Aufgabe übernimmt keine Dateien aus der `pendingbox`. Solange in der `pendingbox`
+einer Art Dateien liegen, wird der Start dieser Art mit `PENDINGBOX_NOT_EMPTY` abgewiesen; die Benutzer:in bearbeitet
+sie zuerst von Hand (Abschnitt 7). Andere Arten sind nicht betroffen.
 
 ## REST-API
 
@@ -102,7 +105,7 @@ Rumpf des Starts (`Content-Type: application/json`):
 
 | Feld | Bedeutung |
 |---|---|
-| `jobType` | Pflicht: `KUNDENDATEN` oder `VERTRAGSDATEN`, genau so geschrieben |
+| `jobType` | Pflicht: `KUNDENDATEN` oder `VERTRAGSDATEN`, genau so geschrieben; bestimmt auch die Ordner, aus denen die Aufgabe liest |
 | `jobName` | optional, höchstens 200 Zeichen; Leerzeichen am Anfang und Ende werden entfernt. Fehlt er oder ist er leer, ist der Name gleich `jobType` |
 
 Beide werden beim Anlegen des BatchgenAuftrags an Cloud-API 1 übergeben und in Start- und Statusantwort gezeigt.
@@ -140,8 +143,8 @@ Eigenschaft `code` beantwortet:
 | `400` | `INVALID_JOB_NAME` | `jobName` ist länger als 200 Zeichen |
 | `400` | `INVALID_REQUEST_BODY` | Rumpf des Starts ist kein lesbares JSON |
 | `404` | `TASK_NOT_FOUND` | Aufgabe unbekannt, gehört einer anderen Benutzer:in oder läuft beim Abbruch nicht mehr |
-| `409` | `USER_TASK_RUNNING` | für die Benutzer:in läuft bereits eine Aufgabe |
-| `409` | `PENDINGBOX_NOT_EMPTY` | Restdateien einer früheren Aufgabe in der `pendingbox` |
+| `409` | `USER_TASK_RUNNING` | für die Benutzer:in läuft bereits eine Aufgabe derselben Art |
+| `409` | `PENDINGBOX_NOT_EMPTY` | Restdateien einer früheren Aufgabe in der `pendingbox` dieser Art |
 | `502` | `CLOUD_UNAVAILABLE` | Cloud nicht erreichbar oder Anfrage abgelehnt; beim Start wird keine Sandbox angelegt |
 | `504` | `TIMEOUT` | Ergebnis von Cloud-API 1 beim Anlegen des BatchgenAuftrags unklar, z. B. keine Antwort innerhalb von `cloud.submit-timeout`; `detail` nennt Aufruf und Ursache. Es wird keine Sandbox angelegt; ein trotzdem angelegter BatchgenAuftrag bleibt `RUNNING` |
 
@@ -153,7 +156,7 @@ Der angenommene Vertrag der Cloud-Dienste (Pfade über `pipeline.cloud.*` einste
 | Aufruf | Anfrage | Antwort |
 |---|---|---|
 | Cloud-API 1: BatchgenAuftrag anlegen | `POST /jobs` `{"userId","jobType","jobName"}` | `{"jobId"}` |
-| Cloud-API 1: Batch übermitteln | `POST /tasks` `{"jobId","items":[{"fileName","content"}]}`; `content` ist der Inhalt der Datei als JSON-Wert, z. B. `{"fileName":"a.json","content":{"name":"Beispiel"}}` | `{"tasks":[{"fileName","taskId","fehlermeldung"}]}`; je Datei ein Eintrag: umgewandelt mit TaskId, nicht umgewandelt mit leerer TaskId und `fehlermeldung` (fehlt eine Datei ganz, gilt sie ebenfalls als nicht umgewandelt) |
+| Cloud-API 1: Batch übermitteln | `POST /tasks` `{"jobId","items":[{"identifikator","content"}]}`; `identifikator` ist der Dateiname (innerhalb einer Anfrage eindeutig), `content` der Inhalt der Datei als JSON-Wert, z. B. `{"identifikator":"a.json","content":{"name":"Beispiel"}}` | `{"tasks":[{"identifikator","taskId","fehlermeldung"}]}`; je Datei ein Eintrag mit ihrem unveränderten `identifikator`: umgewandelt mit TaskId, nicht umgewandelt mit leerer TaskId und `fehlermeldung` (fehlt eine Datei ganz, gilt sie ebenfalls als nicht umgewandelt) |
 | Cloud-API 2: Bulk-Statusabfrage | `POST /tasks/status` `{"taskIds":[…]}` | `{"results":[{"taskId","status","fehlermeldung"}]}` mit `SUCCESS`, `ERROR` oder `PENDING`; `fehlermeldung` begründet ein `ERROR` |
 | Cloud-API 3: Endzustand setzen | `PUT /jobs/{jobId}/status` `{"status"}` | – |
 | Cloud-API 3: BatchgenAuftrag lesen | `GET /jobs/{jobId}` | `{"jobId","userId","jobType","jobName","status","counts":{"SUCCESS","ERROR","PENDING"}}`; `404`, wenn es ihn nicht gibt |
@@ -179,8 +182,8 @@ Alle Werte stehen unter `pipeline.*` in [`application.yml`](src/main/resources/a
 | `cloud.job-path` | `/jobs` | BatchgenAufträge (Cloud-API 1 und 3) |
 | `cloud.submit-path` | `/tasks` | Batch übermitteln (Cloud-API 1) |
 | `cloud.status-path` | `/tasks/status` | Bulk-Statusabfrage (Cloud-API 2) |
-| `cloud.submit-timeout` | `30s` | so lange wartet die Anwendung auf eine Antwort von Cloud-API 1; danach ist das Ergebnis unklar, und die Aufgabe endet mit `TIMEOUT` bzw. der Start wird mit `TIMEOUT` abgewiesen |
-| `cloud.status-timeout` | `30s` | Timeout je Aufruf an Cloud-API 2 und 3 |
+| `cloud.submit-timeout` | `15s` | so lange wartet die Anwendung auf eine Antwort von Cloud-API 1; danach ist das Ergebnis unklar, und die Aufgabe endet mit `TIMEOUT` bzw. der Start wird mit `TIMEOUT` abgewiesen |
+| `cloud.status-timeout` | `10s` | Timeout je Aufruf an Cloud-API 2 und 3 |
 | `cloud.retries` | `2` | Wiederholungen bei Cloud-API 2 und 3 |
 
 ## Bauen und testen
@@ -250,8 +253,8 @@ Mit dem Fake-Backend lässt sich eine Aufgabe von Hand durchspielen:
 3. Dateien ablegen und eine Aufgabe starten; die Antwort enthält die Aufgabennummer:
 
    ```bash
-   mkdir -p data/users/alice/inbox
-   echo '{"name": "Beispiel"}' > data/users/alice/inbox/a.json
+   mkdir -p data/users/alice/KUNDENDATEN/inbox
+   echo '{"name": "Beispiel"}' > data/users/alice/KUNDENDATEN/inbox/a.json
    curl -X POST http://localhost:8080/api/users/alice/tasks -H "Content-Type: application/json" \
         -d '{"jobType":"KUNDENDATEN","jobName":"Testlauf"}'
    ```

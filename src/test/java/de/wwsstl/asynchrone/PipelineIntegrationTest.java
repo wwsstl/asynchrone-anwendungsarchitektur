@@ -163,7 +163,7 @@ class PipelineIntegrationTest extends PipelineTestSupport {
 
     @Test
     void jobTypeAndJobNameAreForwardedToTheCloudAndShownInStatus() {
-        api.drop("typed", "typed-1.json", "ok");
+        api.drop("typed", "VERTRAGSDATEN", "typed-1.json", "ok");
 
         PipelineApi.Response response = api.startResponse("typed",
                 Map.of("jobType", "VERTRAGSDATEN", "jobName", "Testlauf Oktober"));
@@ -178,6 +178,28 @@ class PipelineIntegrationTest extends PipelineTestSupport {
         TaskStatus status = awaitEnd("typed", taskNumber, JobStatus.COMPLETED);
         assertThat(status.jobType()).isEqualTo("VERTRAGSDATEN");
         assertThat(status.jobName()).isEqualTo("Testlauf Oktober");
+        assertThat(api.names("typed", "VERTRAGSDATEN", "donebox")).containsExactly("typed-1.json");
+    }
+
+    @Test
+    void eachJobTypeHasItsOwnFoldersAndItsOwnTask() {
+        api.drop("both", "both-k.json", "SLOW");
+        api.drop("both", "VERTRAGSDATEN", "both-v.json", "ok");
+        String customers = api.start("both").taskNumber();
+
+        // Während KUNDENDATEN läuft, startet VERTRAGSDATEN derselben Benutzer:in; jede Aufgabe sieht nur ihre Ordner.
+        PipelineApi.Response contracts = api.startResponse("both", Map.of("jobType", "VERTRAGSDATEN"));
+        assertThat(contracts.status()).isEqualTo(202);
+        awaitEnd("both", (String) contracts.body().get("taskNumber"), JobStatus.COMPLETED);
+        assertThat(api.names("both", "VERTRAGSDATEN", "donebox")).containsExactly("both-v.json");
+        assertThat(api.names("both", "donebox")).isEmpty();
+        // Je Benutzer:in und Art höchstens eine Aufgabe.
+        assertThat(api.startResponse("both").code()).isEqualTo("USER_TASK_RUNNING");
+
+        cloud.release(List.of("both-k.json"));
+        awaitEnd("both", customers, JobStatus.COMPLETED);
+        assertThat(api.names("both", "donebox")).containsExactly("both-k.json");
+        assertThat(submittedBy("both")).containsExactlyInAnyOrder("both-k.json", "both-v.json");
     }
 
     @Test

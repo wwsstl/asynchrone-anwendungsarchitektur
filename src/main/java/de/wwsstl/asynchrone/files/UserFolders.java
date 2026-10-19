@@ -13,7 +13,7 @@ import java.util.UUID;
 import de.wwsstl.asynchrone.cloud.TaskId;
 
 /**
- * Die Ordner einer Benutzer:in; alle Zugriffe laufen über Java NIO.2.
+ * Die Ordner einer Benutzer:in für eine Art von BatchgenAuftrag; alle Zugriffe laufen über Java NIO.2.
  *
  * <ul>
  *   <li>{@code inbox}: Dateien, die auf die Übermittlung warten</li>

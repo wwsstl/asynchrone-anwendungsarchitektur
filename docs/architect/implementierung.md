@@ -82,7 +82,7 @@ flowchart TB
         API["TaskController<br/>+ ApiExceptionHandler"]
         TM["TaskManager"]
         Reg[("TaskRegistry")]
-        Users[("users: je Benutzer:in ein UserSlot")]
+        Users[("users: je Benutzer:in und Art ein UserSlot")]
         Cloud["CloudClient<br/>(WebClientCloudClient)"]
     end
     subgraph PerTask["Je Aufgabe, angelegt von TaskManager.launch"]
@@ -133,7 +133,7 @@ Dabei sind zwei Ebenen zu unterscheiden:
   Supervisor.
 - **Zur Laufzeit** gibt es je Aufgabe genau einen Supervisor-Thread. Bei jedem Start legt `launch` einen neuen Thread
   an, der `supervise` ausführt; sein Name enthält die Aufgabennummer (`sandbox-BJ-7`), und er wird in der Belegung
-  `UserSlot` der Benutzer:in vermerkt. Es gibt nur einen TaskManager, aber seine Methode `supervise` läuft gleichzeitig
+  `UserSlot` der Benutzer:in und Art vermerkt. Es gibt nur einen TaskManager, aber seine Methode `supervise` läuft gleichzeitig
   auf mehreren Threads, je Aufgabe einem.
 
 ---
@@ -154,8 +154,8 @@ sequenceDiagram
 
     R->>TM: start(userId, jobType, jobName)
     TM->>TM: JobDefinition.of (Art und Name prüfen)
-    TM->>TM: claimUser (Benutzer:in belegen)
-    TM->>TM: pendingbox leer?
+    TM->>TM: claimUser (Benutzer:in und Art belegen)
+    TM->>TM: pendingbox der Art leer?
     TM->>Cl: API 1: BatchgenAuftrag anlegen (mit Art und Name)
     Cl-->>TM: Aufgabennummer
     TM->>TM: launch: Context, Pool, 3 Threads, in die Registry eintragen
@@ -348,14 +348,20 @@ nicht übersehen werden.
 `TaskManager` ist das einzige Spring-Singleton dafür und besteht über die gesamte Laufzeit. An den Schleifen von
 Producer und Consumer ist er nicht beteiligt; er kümmert sich nur um Start, Statusabfrage, Abbruch und Abschluss.
 
-#### Belegung je Benutzer:in (UserSlot)
+#### Belegung je Benutzer:in und Art (UserSlot)
 
-`users` (`ConcurrentHashMap<String, UserSlot>`) stellt sicher, dass für eine Benutzer:in höchstens eine Aufgabe läuft.
-Die Belegung beginnt mit `claimUser` und endet mit `deregister`.
+`users` (`ConcurrentHashMap<SlotKey, UserSlot>`) stellt sicher, dass für eine Benutzer:in und eine Art höchstens eine
+Aufgabe läuft. Der Schlüssel ist der innere Record `SlotKey(userId, jobType)`; jede Belegung kennt ihren Schlüssel und
+gibt genau ihn wieder frei. Die Belegung beginnt mit `claimUser` und endet mit `deregister`.
+
+**Warum je Art und nicht je Benutzer:in**: Jede Art hat eigene Ordner (`<userId>/<jobType>/…`). Eine Aufgabe für
+`KUNDENDATEN` und eine für `VERTRAGSDATEN` derselben Benutzer:in berühren keine gemeinsame Datei und dürfen deshalb
+nebeneinander laufen. Innerhalb einer Art teilen sich alle Aufgaben dieselbe inbox und pendingbox; dort darf nur eine
+gleichzeitig arbeiten.
 
 **Warum nicht einfach die TaskRegistry fragen:** Die Registry ist nach Aufgabennummer geordnet, und die
 Aufgabennummer liefert erst Cloud-API 1. Die Belegung muss **vor** dem Cloud-Aufruf stehen; sonst könnten zwei
-gleichzeitige Startanfragen derselben Benutzer:in beide eine leere pendingbox sehen und je einen BatchgenAuftrag
+gleichzeitige Startanfragen derselben Benutzer:in und Art beide eine leere pendingbox sehen und je einen BatchgenAuftrag
 anlegen.
 
 `claimUser` im Einzelnen:
@@ -370,13 +376,14 @@ anlegen.
 
 | Schritt | Methode | Warum an dieser Stelle |
 |---|---|---|
-| 1. Ordner ermitteln und anlegen | `folderResolver.resolve` | Bei ungültiger Benutzerkennung direkt `400`, ohne Belegung |
-| 2. Art und Name prüfen | `JobDefinition.of` | Bei fehlender oder unbekannter Art oder zu langem Namen direkt `400`, ohne Belegung und ohne Cloud-Aufruf |
-| 3. Benutzer:in belegen | `claimUser` | muss vor jeder Prüfung des Zustands und jedem Cloud-Aufruf stehen, siehe oben |
-| 4. pendingbox prüfen | `hasPendingFiles` | Abweisung **vor** dem Anlegen des BatchgenAuftrags; in der Cloud bleibt kein leerer Auftrag zurück |
-| 5. BatchgenAuftrag mit Art und Name anlegen | `createBatchJob` | synchron, weil die Aufgabennummer Schlüssel der Sandbox und der Registry ist und in den `Location`-Header kommt; schlägt es fehl, gibt es noch kein lokales Objekt |
-| 6. Aufbauen und starten | `launch` | erst Sandbox und Supervisor im `UserSlot` vermerken, dann eintragen, dann Threads starten, siehe unten |
-| bei Fehlern | `finally` | ohne erfolgreichen Start wird die Belegung freigegeben (`users.remove(userId, slot)` entfernt nur die eigene) |
+| 1. Benutzerkennung prüfen | `InvalidUserIdException.requireValid` | Bei ungültiger Kennung direkt `400`, ohne Belegung |
+| 2. Art und Name prüfen | `JobDefinition.of` | Bei fehlender oder unbekannter Art oder zu langem Namen direkt `400`, ohne Ordner, Belegung und Cloud-Aufruf |
+| 3. Ordner der Art ermitteln und anlegen | `folderResolver.resolve(userId, jobType)` | erst jetzt, da die Art feststeht; ungültige Anfragen legen keine Ordner an |
+| 4. Benutzer:in und Art belegen | `claimUser` | muss vor jeder Prüfung des Zustands und jedem Cloud-Aufruf stehen, siehe oben |
+| 5. pendingbox der Art prüfen | `hasPendingFiles` | Abweisung **vor** dem Anlegen des BatchgenAuftrags; in der Cloud bleibt kein leerer Auftrag zurück |
+| 6. BatchgenAuftrag mit Art und Name anlegen | `createBatchJob` | synchron, weil die Aufgabennummer Schlüssel der Sandbox und der Registry ist und in den `Location`-Header kommt; schlägt es fehl, gibt es noch kein lokales Objekt |
+| 7. Aufbauen und starten | `launch` | erst Sandbox und Supervisor im `UserSlot` vermerken, dann eintragen, dann Threads starten, siehe unten |
+| bei Fehlern | `finally` | ohne erfolgreichen Start wird die Belegung freigegeben (`users.remove(slot.key, slot)` entfernt nur die eigene) |
 
 `launch` baut zuerst alle Objekte auf; Producer, Consumer und Supervisor sind noch `unstarted`. Dann der Reihe nach:
 im `UserSlot` vermerken → `registry.register` → `sandbox.start()` → `supervisor.start()`. Erst eintragen, dann
@@ -391,7 +398,7 @@ Aufgabe mit `ABORTED` und wird aus der Registry entfernt.
 2. Lokalen Zustand in den Cloud-Zustand umsetzen (`TaskState.jobStatus()`). `ABORTED` ergibt `null`, also kein
    Schreiben; wie nach einem Absturz bleibt der BatchgenAuftrag `RUNNING`.
 3. `writeEndState`: über Cloud-API 3 schreiben; ein Fehler wird nur protokolliert.
-4. Aus Registry und `users` entfernen; die Belegung ist frei.
+4. Aus Registry und `users` entfernen (`users.remove(slot.key, slot)`); die Belegung von Benutzer:in und Art ist frei.
 
 **Warum der Supervisor den Endzustand schreibt und nicht der Thread, der ihn gesetzt hat:**
 
@@ -430,8 +437,9 @@ Entscheidende Reihenfolgen und ihre Gründe:
    TaskId abgefragt werden kann.
 3. **Erst die Datei verschieben, dann den Marker löschen** (`UserFolders.settle`): Bei einem Absturz bleibt höchstens
    ein überzähliger Marker übrig, aber nie eine Datei ohne Marker, die wie ein „unklares Ergebnis“ aussähe.
-4. **Beim Start muss die pendingbox leer sein** (gezählt werden nur reguläre Dateien, nicht der Ordner `.taskids`):
-   Es gibt kein Fortsetzen; Restdateien bearbeitet die Benutzer:in zuerst, Dateien zweier Aufgaben vermischen sich nie.
+4. **Beim Start muss die pendingbox der Art leer sein** (gezählt werden nur reguläre Dateien, nicht der Ordner
+   `.taskids`): Es gibt kein Fortsetzen; Restdateien bearbeitet die Benutzer:in zuerst, Dateien zweier Aufgaben
+   vermischen sich nie. Restdateien einer Art halten den Start einer anderen Art nicht auf.
 5. **Nie überschreiben** (`moveInto`): Gibt es im Zielordner schon eine gleichnamige Datei, erhält die neue einen
    zufälligen Zusatz; keine Daten der Benutzer:in gehen verloren.
 
@@ -652,7 +660,7 @@ Eine Fehlerantwort sieht etwa so aus:
   "type": "about:blank",
   "title": "Conflict",
   "status": 409,
-  "detail": "In der pendingbox von Benutzer 'alice' liegen noch Dateien einer früheren Aufgabe; bitte zuerst bearbeiten",
+  "detail": "In der pendingbox von Benutzer 'alice' (KUNDENDATEN) liegen noch Dateien einer früheren Aufgabe; bitte zuerst bearbeiten",
   "code": "PENDINGBOX_NOT_EMPTY"
 }
 ```
@@ -686,8 +694,8 @@ Eine Fehlerantwort sieht etwa so aus:
 
 ##### `rejected` → `409`
 
-- **Wann**: Der Start wurde abgewiesen; `code` ist `USER_TASK_RUNNING` (eine Aufgabe läuft schon) oder
-  `PENDINGBOX_NOT_EMPTY` (Restdateien vorhanden).
+- **Wann**: Der Start wurde abgewiesen; `code` ist `USER_TASK_RUNNING` (für Benutzer:in und Art läuft schon eine
+  Aufgabe) oder `PENDINGBOX_NOT_EMPTY` (Restdateien in der pendingbox dieser Art).
 - **Warum 409 Conflict**: Die Anfrage ist in Ordnung, steht aber im Widerspruch zum aktuellen Zustand des Servers. Die
   Benutzer:in muss erst das Ende der laufenden Aufgabe abwarten oder die Restdateien bearbeiten und kann dann erneut
   starten.
@@ -735,13 +743,14 @@ Wichtige Felder:
 | `cloud` | der Cloud-Client |
 | `properties` | die Konfiguration |
 | `clock` | die Zeitquelle (in Tests austauschbar) |
-| `users` | je Benutzer:in eine Belegung (`UserSlot`); sie stellt sicher, dass höchstens eine Aufgabe läuft |
+| `users` | je Benutzer:in und Art eine Belegung (`UserSlot`); sie stellt sicher, dass dafür höchstens eine Aufgabe läuft |
 
 Konstanten: `RESULT_GRACE` = 5 Sekunden, der Puffer über den Timeout des Clients hinaus beim Warten auf die Cloud;
 `STOP_WAIT` = 10 Sekunden, die Höchstwartezeit auf eine Aufgabe, die gerade abgeschlossen wird.
 
-Innere Klasse `UserSlot`: die Belegung einer Benutzer:in; sie vermerkt deren aktuelle Sandbox und den Supervisor-Thread.
-Beide Felder sind `volatile`, weil der Thread, der sie schreibt (die Startanfrage), und die Threads, die sie lesen (eine
+Innerer Record `SlotKey(userId, jobType)`: der Schlüssel einer Belegung. Innere Klasse `UserSlot`: die Belegung einer
+Benutzer:in für eine Art; sie kennt ihren `key` und vermerkt die aktuelle Sandbox und den Supervisor-Thread. Diese
+beiden Felder sind `volatile`, weil der Thread, der sie schreibt (die Startanfrage), und die Threads, die sie lesen (eine
 weitere Startanfrage, das Beenden der Anwendung), verschiedene sein können; `volatile` sorgt dafür, dass der lesende
 Thread den neuesten Wert sieht.
 
@@ -749,42 +758,52 @@ Thread den neuesten Wert sieht.
 
 - **Was**: startet eine Aufgabe für die Benutzer:in und liefert die lokale Momentaufnahme.
 - **Wie**:
-  1. `folderResolver.resolve(userId)`: prüft die Benutzerkennung und findet (oder legt an) die Ordner. Eine ungültige
-     Kennung führt sofort zu einer Ausnahme; belegt ist dann noch nichts.
+  1. `InvalidUserIdException.requireValid(userId)`: prüft die Benutzerkennung; eine ungültige führt sofort zu
+     `400 INVALID_USER_ID`, angelegt und belegt ist dann noch nichts.
   2. `JobDefinition.of(jobType, jobName)`: prüft Art und Namen und setzt den Standardnamen ein. Ungültige Angaben
-     führen sofort zu `400 INVALID_JOB_TYPE` bzw. `400 INVALID_JOB_NAME`; belegt ist auch dann noch nichts.
-  3. `claimUser(userId)`: belegt die Benutzer:in; ist sie schon belegt, Abweisung (`409 USER_TASK_RUNNING`).
-  4. `hasPendingFiles`: Liegen noch Dateien in der pendingbox, Abweisung (`409 PENDINGBOX_NOT_EMPTY`).
-  5. `createBatchJob`: legt in der Cloud den BatchgenAuftrag mit Art und Name an und erhält die Aufgabennummer.
-  6. `launch`: baut die Sandbox auf (Art und Name kommen in den `TaskContext`) und startet die drei Threads.
-  7. Rückgabe der Momentaufnahme; das Log vermerkt Aufgabennummer, Art und Name.
-  8. Scheitert nach Schritt 3 irgendein Schritt, gibt `finally` die Belegung wieder frei (`users.remove(userId, slot)`
-     entfernt nur die eigene).
+     führen sofort zu `400 INVALID_JOB_TYPE` bzw. `400 INVALID_JOB_NAME`; auch dann ist noch nichts angelegt oder
+     belegt.
+  3. `folderResolver.resolve(userId, jobType)`: findet (oder legt an) die Ordner dieser Art,
+     `<base>/<userId>/<jobType>/…`.
+  4. `claimUser(userId, jobType)`: belegt Benutzer:in und Art; läuft dafür schon eine Aufgabe, Abweisung
+     (`409 USER_TASK_RUNNING`). Eine laufende Aufgabe einer anderen Art stört nicht.
+  5. `hasPendingFiles`: Liegen noch Dateien in der pendingbox dieser Art, Abweisung (`409 PENDINGBOX_NOT_EMPTY`).
+  6. `createBatchJob`: legt in der Cloud den BatchgenAuftrag mit Art und Name an und erhält die Aufgabennummer.
+  7. `launch`: baut die Sandbox auf (Art und Name kommen in den `TaskContext`, Producer und Consumer erhalten die
+     Ordner der Art) und startet die drei Threads.
+  8. Rückgabe der Momentaufnahme; das Log vermerkt Aufgabennummer, Art und Name.
+  9. Scheitert nach Schritt 4 irgendein Schritt, gibt `finally` die Belegung wieder frei (`users.remove(slot.key,
+     slot)` entfernt nur die eigene).
 - **Warum diese Reihenfolge**:
-  - **Zuerst die Eingaben prüfen**: Eine fehlerhafte Art oder ein zu langer Name sind Fehler der Anfrage und hängen vom
-    Zustand des Servers nicht ab. Sie sollen weder die Benutzer:in belegen noch die pendingbox lesen oder die Cloud
-    aufrufen.
-  - **Erst belegen, dann prüfen**: Angenommen, dieselbe Benutzer:in schickt fast gleichzeitig zwei Startanfragen. Würde
+  - **Zuerst die Eingaben prüfen**: Eine ungültige Kennung, eine fehlerhafte Art oder ein zu langer Name sind Fehler
+    der Anfrage und hängen vom Zustand des Servers nicht ab. Sie sollen weder Ordner anlegen noch die Benutzer:in
+    belegen, die pendingbox lesen oder die Cloud aufrufen. Die Kennung kommt vor der Art, weil sie im Pfad steht und
+    die Art im Rumpf; hat eine Anfrage beide Fehler, nennt die Antwort den im Pfad.
+  - **Erst belegen, dann prüfen**: Angenommen, dieselbe Benutzer:in schickt fast gleichzeitig zwei Startanfragen derselben
+    Art. Würde
     zuerst die pendingbox geprüft und erst dann belegt, sähen beide Anfragen „pendingbox leer“ und legten je einen
-    BatchgenAuftrag an. Wird zuerst belegt, scheitert die zweite Anfrage schon in Schritt 3.
+    BatchgenAuftrag an. Wird zuerst belegt, scheitert die zweite Anfrage schon in Schritt 4.
   - **Erst die pendingbox prüfen, dann die Cloud aufrufen**: Bei einer Abweisung entsteht in der Cloud kein leerer
     BatchgenAuftrag.
   - **Den BatchgenAuftrag synchron anlegen**: Die Aufgabennummer ist der Schlüssel der Sandbox in der Registry und kommt
     in den `Location`-Header, sie muss also zuerst da sein. Scheitert die Cloud, gibt es lokal noch nichts
     aufzuräumen.
 - **Ohne Freigabe der Belegung**: Ein einziger misslungener Start (z. B. Cloud nicht erreichbar) würde die Benutzer:in
-  für immer blockieren.
+  für diese Art für immer blockieren.
 
-##### `claimUser(userId)`
+##### `claimUser(userId, jobType)`
 
-- **Was**: belegt die Benutzer:in.
+- **Was**: belegt die Benutzer:in für diese Art.
 - **Wie**:
-  1. `users.putIfAbsent(userId, neue Belegung)`: Ist niemand eingetragen, gelingt es; die neue Belegung wird
-     zurückgegeben.
+  1. `users.putIfAbsent(SlotKey(userId, jobType), neue Belegung)`: Ist für Benutzer:in und Art niemand eingetragen,
+     gelingt es; die neue Belegung wird zurückgegeben.
   2. Schon belegt: `awaitDeregistered(alte Belegung)` prüft, ob die Aufgabe bereits zu Ende ist und nur noch
      abgeschlossen wird, und wartet in diesem Fall darauf.
   3. Erneut `putIfAbsent`; gelingt es, Rückgabe.
-  4. Immer noch belegt: `TaskRejectedException(USER_TASK_RUNNING)`.
+  4. Immer noch belegt: `TaskRejectedException(USER_TASK_RUNNING)`, Meldung z. B. „Für Benutzer 'alice' läuft bereits
+     eine Aufgabe mit jobType KUNDENDATEN“.
+- **Beispiel für zwei Arten**: Für `alice` läuft eine Aufgabe mit `KUNDENDATEN`. Ein Start mit `VERTRAGSDATEN` hat einen
+  anderen Schlüssel und läuft sofort an; ein zweiter Start mit `KUNDENDATEN` wird abgewiesen.
 - **Warum auf den Abschluss warten**: Nach dem Ende einer Aufgabe schreibt der Supervisor noch den Endzustand über
   Cloud-API 3; das kann einige hundert Millisekunden bis Sekunden dauern, erst danach ist die Belegung frei.
 - **Beispiel**: Eine Aufgabe endet um 12:00:00.000 mit `COMPLETED`, der Supervisor braucht 300 Millisekunden für
@@ -854,7 +873,7 @@ Thread den neuesten Wert sieht.
   2. Drei Virtual Threads anlegen, **noch nicht gestartet** (`unstarted`): `producer-<Aufgabennummer>` führt den
      `InboxProducer` aus, `consumer-<Aufgabennummer>` den `StatusConsumer`, `sandbox-<Aufgabennummer>` die Methode
      `supervise`.
-  3. Sandbox und Supervisor in der Belegung der Benutzer:in vermerken.
+  3. Sandbox und Supervisor in der Belegung von Benutzer:in und Art vermerken.
   4. `registry.register(sandbox)`: eintragen.
   5. Producer und Consumer starten, danach den Supervisor.
   6. Scheitert Schritt 5 (sehr selten): Aufgabe mit `ABORTED` beenden, aus der Registry entfernen, Ausnahme
@@ -974,8 +993,7 @@ Thread den neuesten Wert sieht.
   `status-timeout` × (`retries` + 1) + 5 Sekunden.
 - **Warum diese Formel**: Jeder Versuch dauert höchstens `status-timeout`, es gibt höchstens `retries` + 1 Versuche, dazu
   5 Sekunden Puffer für die kurzen Pausen zwischen den Wiederholungen.
-- **Beispiel**: Mit den Standardwerten 30 s × 3 + 5 s = 95 s; mit der aktuellen `application.yml` (10 s, 2
-  Wiederholungen) 10 s × 3 + 5 s = 35 s.
+- **Beispiel**: Mit den Standardwerten (10 s, 2 Wiederholungen) 10 s × 3 + 5 s = 35 s.
 
 ##### `await(call, wait, operation)`
 
@@ -1757,8 +1775,10 @@ jeder sagt, was als Nächstes geschieht. Die folgenden Beschreibungen erklären 
 - **Was**: übermittelt einen Batch und liefert das Ergebnis je Datei der Antwort: umgewandelte mit TaskId, nicht
   umgewandelte mit `fehlermeldung`.
 - **Schritte**: wie bei `createBatchJob`, mit der Anfrage `POST /tasks` und dem Rumpf
-  `{"jobId", "items":[{"fileName","content"}]}`. `content` ist der in JSON umgewandelte Inhalt der Datei; Jackson
-  schreibt ihn unverändert in die Anfrage, z. B. `{"fileName":"a.json","content":{"name":"Beispiel"}}`, und nicht als
+  `{"jobId", "items":[{"identifikator","content"}]}`. `identifikator` ist der Dateiname; in Java heißt das Feld
+  weiterhin `fileName`, `@JsonProperty("identifikator")` an `TestdataItem` und `SubmitEntry` legt den Namen im JSON
+  fest. `content` ist der in JSON umgewandelte Inhalt der Datei; Jackson schreibt ihn unverändert in die Anfrage, z. B.
+  `{"identifikator":"a.json","content":{"name":"Beispiel"}}`, und nicht als
   maskierte Zeichenkette. Aus der Antwort wird jeder Eintrag mit Dateinamen zu einem
   `SubmittedFile(Dateiname, TaskId, fehlermeldung)`; eine leere oder fehlende TaskId wird zu `null` (über
   `taskIdOrNull`) und bedeutet „nicht umgewandelt“. Fehlt das Feld `tasks` ganz, ist das Ergebnis eine leere Liste, also
@@ -1861,7 +1881,7 @@ jeder sagt, was als Nächstes geschieht. Die folgenden Beschreibungen erklären 
 | Typ | Bedeutung | Ergänzung |
 |---|---|---|
 | `TaskId` | Nummer eines Datensatzes der Untertabelle (die Sendungsnummer) | der Konstruktor lehnt leere Werte ab, eine „leere Sendungsnummer“ gibt es nicht; `toString()` liefert die Nummer selbst, im Log steht also `t-123` statt `TaskId[value=t-123]` |
-| `TestdataItem(fileName, content)` | eine zu übermittelnde Datei | `content` ist ein `JsonNode`: der in JSON umgewandelte Inhalt. Nur mit `JsonNode` statt `String` schreibt Jackson ihn als JSON-Wert in die Anfrage und nicht als maskierte Zeichenkette |
+| `TestdataItem(fileName, content)` | eine zu übermittelnde Datei | `fileName` heißt im JSON `identifikator`; `content` ist ein `JsonNode`: der in JSON umgewandelte Inhalt. Nur mit `JsonNode` statt `String` schreibt Jackson ihn als JSON-Wert in die Anfrage und nicht als maskierte Zeichenkette |
 | `SubmittedFile(fileName, taskId, fehlermeldung)` | Antwort von Cloud-API 1 für eine Datei | `taskId` ist `null`, wenn die Datei nicht umgewandelt wurde; dann steht in `fehlermeldung` der Grund der Cloud; `converted()` sagt, ob umgewandelt wurde |
 | `RecordStatus` | `SUCCESS`, `ERROR`, `PENDING` | Status eines Datensatzes; die Cloud aktualisiert ihn selbst |
 | `RecordStatusResult(taskId, status, fehlermeldung)` | Antwort von Cloud-API 2 für eine TaskId | `fehlermeldung` begründet ein `ERROR`, sonst ist sie leer |
@@ -1926,7 +1946,8 @@ Anlegen.
 
 #### `UserFolderResolver`
 
-Findet zu einer Benutzerkennung deren vier Ordner und legt sie beim ersten Mal an.
+Findet zu einer Benutzerkennung und einer Art die vier Ordner und legt sie beim ersten Mal an. Jede Art hat eigene
+Ordner; eine Aufgabe sieht nur die Dateien ihrer Art.
 
 ##### Konstruktor
 
@@ -1934,35 +1955,41 @@ Findet zu einer Benutzerkennung deren vier Ordner und legt sie beim ersten Mal a
 - **Warum**: Ein relativer Pfad hinge davon ab, in welchem Verzeichnis die Anwendung gestartet wird. Als absoluter Pfad
   verhält er sich eindeutig, und im Log ist klar, welcher Ordner gemeint ist.
 
-##### `resolve(userId)`
+##### `resolve(userId, jobType)`
 
-- **Was**: prüft die Benutzerkennung, liefert `UserFolders` und stellt sicher, dass alle vier Ordner existieren.
+- **Was**: prüft die Benutzerkennung, liefert `UserFolders` der Art und stellt sicher, dass alle vier Ordner existieren.
 - **Wie**:
-  1. Die Kennung muss `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` entsprechen: beginnt mit Buchstabe oder Ziffer, höchstens 64
-     Zeichen, nur Buchstaben, Ziffern, `.`, `_` und `-`. Sonst `InvalidUserIdException` (`400`).
-  2. `<base>/<userId>/inbox`, `pendingbox`, `donebox` und `errorbox` zusammensetzen.
+  1. `InvalidUserIdException.requireValid(userId)`: Die Kennung muss `[A-Za-z0-9][A-Za-z0-9._-]{0,63}` entsprechen:
+     beginnt mit Buchstabe oder Ziffer, höchstens 64 Zeichen, nur Buchstaben, Ziffern, `.`, `_` und `-`. Sonst
+     `InvalidUserIdException` (`400`).
+  2. `<base>/<userId>/<jobType>/inbox`, `pendingbox`, `donebox` und `errorbox` zusammensetzen. Der Ordnername der Art
+     ist der Name der Konstante (`KUNDENDATEN`, `VERTRAGSDATEN`); er braucht keine Prüfung, weil `JobType` nur feste
+     Werte kennt.
   3. Mit `Files.createDirectories` einzeln anlegen; vorhandene bleiben unverändert. Scheitert das Anlegen,
      `UncheckedIOException`.
 - **Warum die Kennung geprüft wird**: Sie wird unmittelbar zum Ordnernamen. Wäre `../bob` erlaubt, könnte `alice` in den
   Ordnern von `bob` arbeiten (Path Traversal); ein Name mit `.` am Anfang könnte ein versteckter Ordner werden oder als
   `..` gelesen werden.
-- **Beispiel**: `base-directory` ist `./data/users`, die Kennung `alice`; es entstehen `…/data/users/alice/inbox` und die
-  drei übrigen Ordner.
+- **Beispiel**: `base-directory` ist `./data/users`, die Kennung `alice`, die Art `KUNDENDATEN`; es entstehen
+  `…/data/users/alice/KUNDENDATEN/inbox` und die drei übrigen Ordner. Die Ordner von `VERTRAGSDATEN` entstehen erst beim
+  ersten Start dieser Art.
 
 #### `UserFolders` (Record)
 
-Die vier Ordner einer Benutzer:in und alle Dateioperationen darauf, durchweg mit Java NIO.2.
+Die vier Ordner einer Benutzer:in für eine Art und alle Dateioperationen darauf, durchweg mit Java NIO.2.
 
 Ordnerstruktur:
 
 ```
 <base>/alice/
-├── inbox/        noch zu übermitteln
-├── pendingbox/   übermittelt, Ergebnis steht aus
-│   └── .taskids/ je Datei ein Marker mit ihrer TaskId
-├── donebox/      erfolgreich
-└── errorbox/     fehlgeschlagen
-    └── .fehler/  je fehlgeschlagener Datei eine Grund-Datei <Dateiname>.txt
+├── KUNDENDATEN/          die Ordner der Art KUNDENDATEN
+│   ├── inbox/            noch zu übermitteln
+│   ├── pendingbox/       übermittelt, Ergebnis steht aus
+│   │   └── .taskids/     je Datei ein Marker mit ihrer TaskId
+│   ├── donebox/          erfolgreich
+│   └── errorbox/         fehlgeschlagen
+│       └── .fehler/      je fehlgeschlagener Datei eine Grund-Datei <Dateiname>.txt
+└── VERTRAGSDATEN/        dieselben vier Ordner für VERTRAGSDATEN
 ```
 
 ##### `listInbox(max, excluded)`
@@ -2045,6 +2072,9 @@ Ordnerstruktur:
 
 - **Wann**: ungültige Benutzerkennung; ergibt `400 INVALID_USER_ID`. Die Meldung nennt das erlaubte Format, die
   Benutzer:in sieht sofort, was zu ändern ist.
+- **`requireValid(userId)`**: prüft die Kennung und gibt eine gültige unverändert zurück, wie
+  `InvalidTaskNumberException.requireValid`. `TaskManager.start` ruft sie vor allen anderen Prüfungen auf,
+  `UserFolderResolver.resolve` noch einmal, damit kein Ordner mit ungeprüftem Namen entsteht.
 
 ---
 
@@ -2262,8 +2292,8 @@ die Standardwerte aus `PipelineProperties`.
 | `submit-retry-max-wait` | `1m` | längste Wartezeit vor einem erneuten Versuch nach „eindeutig nicht verarbeitet“ |
 | `cloud.base-url` | `http://localhost:8081` | Adresse der Cloud |
 | `cloud.job-path` / `submit-path` / `status-path` | `/jobs`, `/tasks`, `/tasks/status` | Pfade der Schnittstellen |
-| `cloud.submit-timeout` | `30s` | so lange wird auf eine Antwort von Cloud-API 1 gewartet; danach ist das Ergebnis unklar: Ein Start wird mit `504 TIMEOUT` abgewiesen, eine Aufgabe endet mit `TIMEOUT` |
-| `cloud.status-timeout` | `30s` | Timeout je Aufruf von Cloud-API 2 und 3 |
+| `cloud.submit-timeout` | `15s` | so lange wird auf eine Antwort von Cloud-API 1 gewartet; danach ist das Ergebnis unklar: Ein Start wird mit `504 TIMEOUT` abgewiesen, eine Aufgabe endet mit `TIMEOUT` |
+| `cloud.status-timeout` | `10s` | Timeout je Aufruf von Cloud-API 2 und 3 |
 | `cloud.retries` | `2` | Wiederholungen bei Cloud-API 2 und 3 |
 
 Hinweis: Die aktuelle `application.yml` setzt `cloud.submit-timeout` auf `15s` und `cloud.status-timeout` auf `10s` und
@@ -2284,12 +2314,12 @@ Zusammenhänge, die man beim Anpassen bedenken sollte:
 |---|---|---|
 | `TaskContextTest` | Unit | „Wer zuerst kommt, gewinnt“, Abbruchsignal, Timeout, Fehlerschwelle, Momentaufnahme, Zuordnung der Zustände |
 | `InMemoryStatusPoolTest` | Unit | fällige Einträge, Neueinplanen, entfernte Einträge kommen nicht zurück |
-| `UserFoldersTest` | Unit | Anlegen der Ordner, Prüfung der Benutzerkennung, Auflisten, Marker, Verschieben, gleiche Namen, Grund-Dateien |
+| `UserFoldersTest` | Unit | Anlegen der Ordner je Art, Prüfung der Benutzerkennung, Auflisten, Marker, Verschieben, gleiche Namen, Grund-Dateien |
 | `PipelinePropertiesTest` | Unit | Standardwerte und Prüfungen |
 | `JobDefinitionTest` | Unit | Prüfung von Art und Name: erlaubte Arten, Standardname, Leerzeichen, Höchstlänge |
 | `WebClientCloudClientTest` | Komponente (gegen `FakeCloud`) | Vertrag, Einordnung der Fehler von API 1, Wiederholungen, `fehlermeldung` |
-| `TaskManagerTest` | Komponente (Stub-Cloud, ohne HTTP) | Start, Abweisungen (auch ungültige Art vor jedem Cloud-Aufruf), Abbruch, Abmeldung, Beenden der Anwendung, alle Gründe für ein Ende |
-| `PipelineIntegrationTest`, `PipelineTimeoutIntegrationTest` | Integration (vollständige Spring-Anwendung gegen `FakeCloud`, in derselben JVM) | alle Endzustände, Fehlerarten von API 1, Gründe für abgewiesene Starts, Art und Name in Start, Cloud und Status, ungültige Startrümpfe, Isolation, Grund-Dateien in der errorbox |
+| `TaskManagerTest` | Komponente (Stub-Cloud, ohne HTTP) | Start, Abweisungen (auch ungültige Art vor jedem Cloud-Aufruf), Aufgaben verschiedener Arten nebeneinander, Abbruch, Abmeldung, Beenden der Anwendung, alle Gründe für ein Ende |
+| `PipelineIntegrationTest`, `PipelineTimeoutIntegrationTest` | Integration (vollständige Spring-Anwendung gegen `FakeCloud`, in derselben JVM) | alle Endzustände, Fehlerarten von API 1, Gründe für abgewiesene Starts, Art und Name in Start, Cloud und Status, getrennte Ordner und Aufgaben je Art, ungültige Startrümpfe, Isolation, Grund-Dateien in der errorbox |
 | `PipelineBlackBoxIT` | Black-Box (Anwendungs-JAR und `FakeCloudBackendApplication` als eigene Prozesse, nur über HTTP) | die wichtigsten Abläufe, als Abnahme aus Sicht von außen |
 
 Hilfsklassen der Tests: `FakeCloud` (Cloud-Ersatz in derselben JVM; das Verhalten steuern Dateiinhalt und Vorgaben,
@@ -2310,7 +2340,7 @@ Black-Box-Tests aus. Die Ausgaben beider Prozesse stehen in `target/it-logs`.
 | Thema | Erläuterung |
 |---|---|
 | nur ein Server | TaskRegistry, Status-Pool und Belegungen liegen im Speicher. Die Schnittstellen (`TaskRegistry`, `StatusPool`) lassen Raum für eine spätere verteilte Umsetzung |
-| kein Fortsetzen | Restdateien in der pendingbox müssen zuerst von Hand bearbeitet werden, sonst wird der Start abgewiesen (`409 PENDINGBOX_NOT_EMPTY`) |
+| kein Fortsetzen | Restdateien in der pendingbox einer Art müssen zuerst von Hand bearbeitet werden, sonst wird der Start dieser Art abgewiesen (`409 PENDINGBOX_NOT_EMPTY`) |
 | verwaiste Aufträge bei unklarem Ergebnis | Ist beim Anlegen des BatchgenAuftrags das Ergebnis unklar, hat die Cloud ihn womöglich angelegt, ohne dass die Anwendung seine Nummer kennt; er bleibt `RUNNING` und muss von Hand korrigiert werden |
 | Dateien mit unklarem Ergebnis nur von Hand | Ohne TaskId lassen sie sich über Cloud-API 2 nicht abfragen |
 | Grund des Endzustands nicht dauerhaft | nur in der lokalen Momentaufnahme (bis zur Abmeldung) und im Log |

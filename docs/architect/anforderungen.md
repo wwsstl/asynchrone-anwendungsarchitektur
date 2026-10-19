@@ -2,13 +2,13 @@
 
 - Nutzung von Cloud-Diensten: Das System muss Cloud-Dienstschnittstellen aufrufen, um die Testdaten zu generieren.
 
-- Lokale Dateiverwaltung: Jeder Benutzer muss über einen spezifisch zugewiesenen, lokalen Ordner auf dem Server verfügen. Dieser Ordner muss zwingend die drei Unterverzeichnisse inbox, errorbox und donebox enthalten, um die Testdatendateien zu speichern.
+- Lokale Dateiverwaltung: Jeder Benutzer muss über einen spezifisch zugewiesenen, lokalen Ordner auf dem Server verfügen. Darin gibt es je Art des BatchgenAuftrags (jobType: KUNDENDATEN, VERTRAGSDATEN) einen eigenen Unterordner, z. B. `<userId>/KUNDENDATEN`. Jeder dieser Unterordner muss zwingend die drei Unterverzeichnisse inbox, errorbox und donebox enthalten, um die Testdatendateien dieser Art zu speichern. Dateien verschiedener Arten dürfen sich nicht vermischen.
 
-- Stapelverarbeitung (Batch-Processing): Die Benutzer stellen die zu generierenden Testdaten im inbox-Verzeichnis bereit. Die Anwendung muss diese Dateien stapelweise aus der inbox lesen, in das JSON-Format konvertieren und über den Cloud-Dienst verarbeiten, bis alle Dateien vollständig abgearbeitet sind.
+- Stapelverarbeitung (Batch-Processing): Die Benutzer stellen die zu generierenden Testdaten im inbox-Verzeichnis der jeweiligen Art bereit und geben beim Start einer Aufgabe die Art an. Die Anwendung muss die Dateien dieser Art stapelweise aus deren inbox lesen, in das JSON-Format konvertieren und über den Cloud-Dienst verarbeiten, bis alle Dateien vollständig abgearbeitet sind.
 
-- Parallele Statusüberwachung und Dateiverschiebung: Es ist erforderlich, dass ein separater Prozess (oder Thread) innerhalb der Aufgabe gleichzeitig den Generierungsstatus der Cloud-Dienste überwacht. Erfolgreich generierte Dateien müssen in die donebox verschoben werden. Dateien, bei denen während der Generierung Fehler aufgetreten sind, müssen in die errorbox verschoben werden.
+- Parallele Statusüberwachung und Dateiverschiebung: Es ist erforderlich, dass ein separater Prozess (oder Thread) innerhalb der Aufgabe gleichzeitig den Generierungsstatus der Cloud-Dienste überwacht. Erfolgreich generierte Dateien müssen in die donebox ihrer Art verschoben werden. Dateien, bei denen während der Generierung Fehler aufgetreten sind, müssen in die errorbox ihrer Art verschoben werden.
 
-- Unabhängige Benutzeraufgaben: Jeder Benutzer muss in der Lage sein, seine eigenen Verarbeitungsaufgaben zu starten. Diese Aufgaben müssen vollständig voneinander unabhängig ablaufen und dürfen sich gegenseitig in keiner Weise beeinflussen.
+- Unabhängige Benutzeraufgaben: Jeder Benutzer muss in der Lage sein, seine eigenen Verarbeitungsaufgaben zu starten. Diese Aufgaben müssen vollständig voneinander unabhängig ablaufen und dürfen sich gegenseitig in keiner Weise beeinflussen. Je Benutzer und Art läuft höchstens eine Aufgabe gleichzeitig; Aufgaben verschiedener Arten desselben Benutzers dürfen parallel laufen, da sie getrennte Ordner verwenden.
 
 - Externer Abbruch: Wenn bei der Generierung der Testdaten zu viele Fehler auftreten oder es zu einer Zeitüberschreitung (Timeout) kommt, muss das System dem Benutzer die Möglichkeit bieten, seine Aufgabe von außen manuell zu beenden.
 
@@ -39,7 +39,7 @@
 
 - Dynamische Ressourcenisolierung (Vertikale Skalierung): Auf dem Einzelserver muss das System über ein "Sandbox-Muster" skalieren. Jedem neuen Benutzer-Task wird zur Laufzeit dynamisch ein vollständig isolierter TaskContext (mit AtomicBoolean für Abbruchsignale und AtomicInteger für Fehlerzähler), eine eigene TestdatenAnlegenStatusPool im Speicher sowie dedizierte Threads zugewiesen.
 
-- Vorbereitung für horizontale Verteilung: Für eine zukünftige Verteilung über mehrere Instanzen (Container/Pods) muss das Design vorsehen, dass die lokalen Dateisystem-Ordner (inbox, donebox, errorbox) durch relationale Datenbanktabellen mit entsprechenden Statusfeldern (INBOX, DONE, ERROR) abgelöst werden können.
+- Vorbereitung für horizontale Verteilung: Für eine zukünftige Verteilung über mehrere Instanzen (Container/Pods) muss das Design vorsehen, dass die lokalen Dateisystem-Ordner (inbox, donebox, errorbox) durch relationale Datenbanktabellen mit entsprechenden Statusfeldern (INBOX, DONE, ERROR) abgelöst werden können; die Art (jobType) wird dabei zu einer Spalte der Tabelle.
 
 - Austauschbare Middleware-Komponenten: Die interne Speicher-Warteschlange (TestdatenAnlegenStatusPool) ist so zu abstrahieren, dass sie künftig durch eine verteilte Message Queue (MQ wie RabbitMQ oder RocketMQ) ersetzt werden kann. Ebenso muss das lokale In-Memory-Register für Aufgaben bei einer Cluster-Skalierung in ein verteiltes Cache-System (wie Redis) überführt werden können, damit Abbruchsignale über alle Container hinweg wirksam werden.
 
@@ -50,6 +50,6 @@
 
 - Verzicht auf externe Middleware: Die Bereitstellung erfolgt zunächst gänzlich ohne externe Middleware; es werden stattdessen ausschließlich JVM-Standardbibliotheken (wie ConcurrentHashMap und TestdatenAnlegenStatusPool) genutzt, um die Aufgabensteuerung und Isolierung lokal zu gewährleisten.
 
-- Lokale Dateiverwaltung: Im aktuellen Deployment-Szenario verwaltet und mappt die Anwendung physisch die exklusiven Ordner (inbox, donebox, errorbox) der einzelnen Benutzer direkt auf dem Server.
+- Lokale Dateiverwaltung: Im aktuellen Deployment-Szenario verwaltet und mappt die Anwendung physisch die exklusiven Ordner (inbox, donebox, errorbox) der einzelnen Benutzer, je Art getrennt, direkt auf dem Server.
 
 - Cloud-Native Vorbereitung (Containerisierung): Obwohl das System aktuell als Monolith läuft, garantiert die Entkopplung der Architektur (Trennung von Status, Produzent und Konsument) eine Container-Ready-Struktur, die später ohne komplette Neuentwicklung in Kubernetes- oder Docker Swarm-Umgebungen bereitgestellt werden kann.

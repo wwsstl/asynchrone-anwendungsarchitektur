@@ -25,6 +25,7 @@ import de.wwsstl.asynchrone.cloud.JobType;
 import de.wwsstl.asynchrone.cloud.SubmitFailedException;
 import de.wwsstl.asynchrone.config.PipelineProperties;
 import de.wwsstl.asynchrone.consumer.StatusConsumer;
+import de.wwsstl.asynchrone.files.InvalidUserIdException;
 import de.wwsstl.asynchrone.files.UserFolderResolver;
 import de.wwsstl.asynchrone.files.UserFolders;
 import de.wwsstl.asynchrone.pool.InMemoryStatusPool;
@@ -38,7 +39,8 @@ import jakarta.annotation.PreDestroy;
  *
  * <ul>
  *   <li><b>Start</b> (Abschnitt 1): {@code pendingbox} prüfen, über Cloud-API 1 einen BatchgenAuftrag anlegen, Sandbox
- *       aufbauen, eintragen und starten. Je Benutzer:in läuft höchstens eine Aufgabe gleichzeitig.</li>
+ *       aufbauen, eintragen und starten. Je Benutzer:in und Art ({@link JobType}) läuft höchstens eine Aufgabe
+ *       gleichzeitig; Aufgaben verschiedener Arten arbeiten in getrennten Ordnern und laufen nebeneinander.</li>
  *   <li><b>Statusabfrage</b> (Abschnitt 4): aus der Cloud, während der Laufzeit zusätzlich lokal aus der Sandbox.</li>
  *   <li><b>Abbruch von außen</b> (Abschnitt 5): Abbruchsignal setzen; nach dem Ende der Threads wird {@code TERMINATED}
  *       geschrieben.</li>
@@ -54,13 +56,22 @@ public class TaskManager {
     /** Puffer, damit der Timeout des Clients (der eigentliche Grenzwert) vor dem Timeout des Futures greift. */
     private static final Duration RESULT_GRACE = Duration.ofSeconds(5);
 
-    /** So lange wartet ein Start, bis die gerade endende Aufgabe derselben Benutzer:in abgemeldet ist. */
+    /** So lange wartet ein Start, bis die gerade endende Aufgabe derselben Benutzer:in und Art abgemeldet ist. */
     private static final Duration STOP_WAIT = Duration.ofSeconds(10);
 
-    /** Belegung einer Benutzer:in, vom Start bis zur Abmeldung ihrer Sandbox. */
+    /** Benutzer:in und Art: der Schlüssel einer Belegung. */
+    private record SlotKey(String userId, JobType jobType) {
+    }
+
+    /** Belegung einer Benutzer:in für eine Art, vom Start bis zur Abmeldung ihrer Sandbox. */
     private static final class UserSlot {
+        private final SlotKey key;
         private volatile Sandbox sandbox;
         private volatile Thread supervisor;
+
+        UserSlot(SlotKey key) {
+            this.key = key;
+        }
     }
 
     private final TaskRegistry registry;
@@ -69,8 +80,8 @@ public class TaskManager {
     private final PipelineProperties properties;
     private final Clock clock;
 
-    /** Je Benutzer:in höchstens eine Aufgabe; der Eintrag besteht vom Start bis zur Abmeldung. */
-    private final ConcurrentHashMap<String, UserSlot> users = new ConcurrentHashMap<>();
+    /** Je Benutzer:in und Art höchstens eine Aufgabe; der Eintrag besteht vom Start bis zur Abmeldung. */
+    private final ConcurrentHashMap<SlotKey, UserSlot> users = new ConcurrentHashMap<>();
 
     public TaskManager(TaskRegistry registry, UserFolderResolver folderResolver, CloudClient cloud,
             PipelineProperties properties, Clock clock) {
@@ -90,21 +101,24 @@ public class TaskManager {
      * @param jobName Name des BatchgenAuftrags; ohne Angabe der Name der Art
      * @throws InvalidJobTypeException   wenn {@code jobType} fehlt oder unbekannt ist
      * @throws InvalidJobNameException   wenn {@code jobName} zu lang ist
-     * @throws TaskRejectedException     mit {@code USER_TASK_RUNNING} oder {@code PENDINGBOX_NOT_EMPTY}
+     * @throws TaskRejectedException     mit {@code USER_TASK_RUNNING} (für Benutzer:in und Art läuft schon eine
+     *                                   Aufgabe) oder {@code PENDINGBOX_NOT_EMPTY} (in der pendingbox dieser Art)
      * @throws CloudUnavailableException wenn Cloud-API 1 nicht erreichbar war; es wird keine Sandbox angelegt
      * @throws CloudTimeoutException     wenn das Ergebnis von Cloud-API 1 unklar ist (z. B. keine Antwort); es wird
      *                                   keine Sandbox angelegt
      */
     public TaskSnapshot start(String userId, String jobType, String jobName) {
-        UserFolders folders = folderResolver.resolve(userId);
-        // Ungültige Angaben weisen den Start ab, bevor die Benutzer:in belegt wird.
+        // Ungültige Angaben weisen den Start ab, bevor Ordner angelegt werden oder die Benutzer:in belegt wird.
+        InvalidUserIdException.requireValid(userId);
         JobDefinition job = JobDefinition.of(jobType, jobName);
-        UserSlot slot = claimUser(userId);
+        UserFolders folders = folderResolver.resolve(userId, job.jobType());
+        UserSlot slot = claimUser(userId, job.jobType());
         boolean launched = false;
         try {
             if (hasPendingFiles(folders)) {
                 throw new TaskRejectedException(RejectReason.PENDINGBOX_NOT_EMPTY, "In der pendingbox von Benutzer '"
-                        + userId + "' liegen noch Dateien einer früheren Aufgabe; bitte zuerst bearbeiten");
+                        + userId + "' (" + job.jobType() + ") liegen noch Dateien einer früheren Aufgabe; bitte zuerst "
+                        + "bearbeiten");
             }
             String taskNumber = createBatchJob(userId, job);
             Sandbox sandbox = launch(folders, taskNumber, job, slot);
@@ -114,24 +128,28 @@ public class TaskManager {
             return sandbox.snapshot();
         } finally {
             if (!launched) {
-                users.remove(userId, slot);
+                users.remove(slot.key, slot);
             }
         }
     }
 
-    /** Belegt die Benutzer:in; eine gerade endende Aufgabe derselben Benutzer:in darf noch auslaufen. */
-    private UserSlot claimUser(String userId) {
-        UserSlot slot = new UserSlot();
-        UserSlot existing = users.putIfAbsent(userId, slot);
+    /**
+     * Belegt die Benutzer:in für diese Art; eine gerade endende Aufgabe derselben Benutzer:in und Art darf noch
+     * auslaufen. Aufgaben anderer Arten stören nicht.
+     */
+    private UserSlot claimUser(String userId, JobType jobType) {
+        SlotKey key = new SlotKey(userId, jobType);
+        UserSlot slot = new UserSlot(key);
+        UserSlot existing = users.putIfAbsent(key, slot);
         if (existing == null) {
             return slot;
         }
         awaitDeregistered(existing);
-        if (users.putIfAbsent(userId, slot) == null) {
+        if (users.putIfAbsent(key, slot) == null) {
             return slot;
         }
         throw new TaskRejectedException(RejectReason.USER_TASK_RUNNING,
-                "Für Benutzer '" + userId + "' läuft bereits eine Aufgabe");
+                "Für Benutzer '" + userId + "' läuft bereits eine Aufgabe mit jobType " + jobType);
     }
 
     /** Wartet begrenzt auf die Abmeldung einer Aufgabe, die bereits einen Endzustand hat; eine laufende nicht. */
@@ -299,7 +317,7 @@ public class TaskManager {
             writeEndState(context, endState);
         }
         registry.remove(sandbox);
-        users.remove(context.userId(), slot);
+        users.remove(slot.key, slot);
         log.info("[{}] Aufgabe {} abgemeldet: {} ({} Aufgaben in der TaskRegistry)", context.userId(),
                 context.taskNumber(), sandbox.snapshot(), registry.size());
     }

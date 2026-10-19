@@ -8,7 +8,8 @@ spring:
 
 # Pipeline-Einstellungen (PipelineProperties); die Werte entsprechen den Standardwerten.
 pipeline:
-  # Je Benutzer: <base-directory>/<userId>/{inbox,pendingbox,donebox,errorbox}
+  # Je Benutzer und Art: <base-directory>/<userId>/<jobType>/{inbox,pendingbox,donebox,errorbox},
+  # z. B. ./data/users/0000/KUNDENDATEN/inbox
   base-directory: ./data/users
   # Dateien je Batch, den der Producer an Cloud-API 1 übermittelt
   batch-size: 4

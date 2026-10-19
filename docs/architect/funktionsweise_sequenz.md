@@ -17,13 +17,15 @@ Die Anwendung veranlasst nur, dass die Cloud Daten erzeugt, und verarbeitet die 
 | `donebox` | erfolgreich erzeugte Dateien |
 | `errorbox` | Dateien, die nicht umgewandelt werden konnten oder bei deren Erzeugung ein Fehler auftrat; der Grund steht je Datei in `errorbox/.fehler/<Dateiname>.txt` |
 
+Jede Benutzer:in hat diese vier Ordner einmal je Art des BatchgenAuftrags: `<userId>/KUNDENDATEN/inbox`, `<userId>/VERTRAGSDATEN/inbox` usw. Eine Aufgabe arbeitet nur mit den Ordnern ihrer Art; Dateien verschiedener Arten vermischen sich nie.
+
 ## 1. Start
 
-Die Benutzer:in startet über die REST-API eine Aufgabe und gibt dabei die Art des BatchgenAuftrags an (`jobType`: `KUNDENDATEN` oder `VERTRAGSDATEN`), optional auch seinen Namen (`jobName`, höchstens 200 Zeichen; ohne Angabe gleich der Art). Fehlt die Art, ist sie unbekannt oder ist der Name zu lang, wird der Start sofort mit `400 Bad Request` und dem Ursachencode `INVALID_JOB_TYPE` bzw. `INVALID_JOB_NAME` abgewiesen; es wird nichts angelegt und keine Datei bewegt. Die REST-API ist mit Spring WebFlux umgesetzt und reicht den Aufruf auf einem Virtual Thread an den TaskManager weiter, damit der Event-Loop nicht blockiert. Je Benutzer:in läuft höchstens eine Aufgabe gleichzeitig.
+Die Benutzer:in startet über die REST-API eine Aufgabe und gibt dabei die Art des BatchgenAuftrags an (`jobType`: `KUNDENDATEN` oder `VERTRAGSDATEN`), optional auch seinen Namen (`jobName`, höchstens 200 Zeichen; ohne Angabe gleich der Art). Fehlt die Art, ist sie unbekannt oder ist der Name zu lang, wird der Start sofort mit `400 Bad Request` und dem Ursachencode `INVALID_JOB_TYPE` bzw. `INVALID_JOB_NAME` abgewiesen; es wird nichts angelegt und keine Datei bewegt. Die REST-API ist mit Spring WebFlux umgesetzt und reicht den Aufruf auf einem Virtual Thread an den TaskManager weiter, damit der Event-Loop nicht blockiert. Je Benutzer:in und Art läuft höchstens eine Aufgabe gleichzeitig; ein zweiter Start derselben Art wird mit `409 Conflict` und dem Ursachencode `USER_TASK_RUNNING` abgewiesen. Aufgaben verschiedener Arten derselben Benutzer:in laufen nebeneinander, weil sie getrennte Ordner haben.
 
 Der TaskManager startet die Aufgabe in folgenden Schritten:
 
-1. **`pendingbox` prüfen:** Ist sie nicht leer, liegen dort noch Dateien einer früheren Aufgabe, die nicht abgeschlossen wurden (siehe Abschnitt 7). Dann legt der TaskManager keinen BatchgenAuftrag an; der Start wird mit `409 Conflict` und dem Ursachencode `PENDINGBOX_NOT_EMPTY` abgewiesen, und die Benutzer:in wird aufgefordert, zuerst diese Dateien zu bearbeiten.
+1. **`pendingbox` der Art prüfen:** Ist sie nicht leer, liegen dort noch Dateien einer früheren Aufgabe, die nicht abgeschlossen wurden (siehe Abschnitt 7). Dann legt der TaskManager keinen BatchgenAuftrag an; der Start wird mit `409 Conflict` und dem Ursachencode `PENDINGBOX_NOT_EMPTY` abgewiesen, und die Benutzer:in wird aufgefordert, zuerst diese Dateien zu bearbeiten.
 2. **BatchgenAuftrag anlegen:** Über Cloud-API 1 wird in der Cloud-Datenbank ein neuer BatchgenAuftrag mit Art, Name und dem Anfangsstatus RUNNING angelegt; seine Nummer ist die Aufgabennummer. In Phase 1 begrenzt die Cloud die Zahl der BatchgenAufträge je Benutzer:in nicht; ein neuer kann auch dann angelegt werden, wenn ein früherer noch auf RUNNING steht.
    Schlägt der Aufruf fehl, wird keine Sandbox angelegt; die Fehler werden wie in Abschnitt 2 eingeordnet:
    - **Eindeutig nicht verarbeitet** (Verbindungsfehler, Anfrage abgelehnt): Die Cloud ist nicht verfügbar; der Start wird mit `502 Bad Gateway` und dem Ursachencode `CLOUD_UNAVAILABLE` abgewiesen.
@@ -105,7 +107,7 @@ In folgenden Fällen bleiben Dateien in der `pendingbox`:
 | Absturz der Anwendung | übermittelte Dateien ohne Ergebnis, mit TaskId-Marker; der Batch, der beim Absturz gerade übermittelt wurde, ohne Marker |
 | Unklares Ergebnis eines Aufrufs von Cloud-API 1 (Abschnitt 2) | die Dateien dieses Batches, ohne TaskId-Marker |
 
-Diese Dateien bearbeitet die Benutzer:in vor dem nächsten Start selbst. Die Prüfung beim Start (Abschnitt 1) stellt das sicher: Ist die `pendingbox` nicht leer, wird der Start abgewiesen (`PENDINGBOX_NOT_EMPTY`).
+Diese Dateien bearbeitet die Benutzer:in vor dem nächsten Start selbst. Die Prüfung beim Start (Abschnitt 1) stellt das sicher: Ist die `pendingbox` dieser Art nicht leer, wird der Start dieser Art abgewiesen (`PENDINGBOX_NOT_EMPTY`); andere Arten sind nicht betroffen.
 
 In folgenden Fällen bleibt der BatchgenAuftrag auf RUNNING und muss manuell korrigiert werden:
 

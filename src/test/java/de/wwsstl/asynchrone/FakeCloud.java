@@ -267,7 +267,7 @@ public final class FakeCloud implements AutoCloseable {
         submitBatchSizes.add(items.size());
         List<Map<String, String>> tasks = new ArrayList<>();
         for (JsonNode item : items) {
-            String fileName = item.path("fileName").asString();
+            String fileName = item.path("identifikator").asString();
             // Der Inhalt kommt als JSON-Wert an; für die Marker (REJECT, FAIL, SLOW) genügt sein JSON-Text.
             String content = item.path("content").toString();
             submittedFileNames.add(fileName);
@@ -275,12 +275,12 @@ public final class FakeCloud implements AutoCloseable {
                 continue;
             }
             if (content.contains("REJECT")) {
-                tasks.add(Map.of("fileName", fileName, "taskId", "", "fehlermeldung", REJECT_MESSAGE));
+                tasks.add(Map.of("identifikator", fileName, "taskId", "", "fehlermeldung", REJECT_MESSAGE));
                 continue;
             }
             String taskId = UUID.randomUUID().toString();
             records.put(taskId, new DataRecord(jobId, fileName, content));
-            tasks.add(Map.of("fileName", fileName, "taskId", taskId, "fehlermeldung", ""));
+            tasks.add(Map.of("identifikator", fileName, "taskId", taskId, "fehlermeldung", ""));
         }
         if (behavior instanceof SubmitBehavior.Delay delay) {
             try {

@@ -2,19 +2,19 @@
   "jobId": "BJ-1",
   "items": [
     {
-      "fileName": "test_1.json",
+      "identifikator": "test_1.json",
       "content": {
         "test_1": "test_1"
       }
     },
     {
-      "fileName": "test_2.json",
+      "identifikator": "test_2.json",
       "content": {
         "test_2": "test_2"
       }
     },
     {
-      "fileName": "test_3.json",
+      "identifikator": "test_3.json",
       "content": {
         "test_3": "test_3"
       }

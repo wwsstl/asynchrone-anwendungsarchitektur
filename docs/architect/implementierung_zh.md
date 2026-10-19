@@ -76,7 +76,7 @@ flowchart TB
         API["TaskController<br/>+ ApiExceptionHandler"]
         TM["TaskManager"]
         Reg[("TaskRegistry")]
-        Users[("users：每个用户一个 UserSlot")]
+        Users[("users：每个用户每种类型一个 UserSlot")]
         Cloud["CloudClient<br/>(WebClientCloudClient)"]
     end
     subgraph PerTask["每项任务一份，由 TaskManager.launch 创建"]
@@ -122,7 +122,7 @@ flowchart TB
 要分清两个层面：
 
 - **代码上**，Supervisor 属于 TaskManager。它执行的 `supervise`、`deregister` 都是 TaskManager 的方法；`Sandbox` 这个 record 里只有 `context`、`pool`、`producer`、`consumer`，没有 Supervisor。
-- **运行时**，Supervisor 线程和任务一一对应。每次启动任务，`launch` 都会新建一个线程来执行 `supervise`，线程名带着任务号（`sandbox-BJ-7`），并记在该用户的号牌 `UserSlot` 上。TaskManager 只有一个，但它的 `supervise` 方法同时在多个线程上运行，每项任务一个。
+- **运行时**，Supervisor 线程和任务一一对应。每次启动任务，`launch` 都会新建一个线程来执行 `supervise`，线程名带着任务号（`sandbox-BJ-7`），并记在该用户该类型的号牌 `UserSlot` 上。TaskManager 只有一个，但它的 `supervise` 方法同时在多个线程上运行，每项任务一个。
 
 ---
 
@@ -142,8 +142,8 @@ sequenceDiagram
 
     R->>TM: start(userId, jobType, jobName)
     TM->>TM: JobDefinition.of（校验类型和名称）
-    TM->>TM: claimUser（占用户名额）
-    TM->>TM: pendingbox 为空？
+    TM->>TM: claimUser（占用户+类型名额）
+    TM->>TM: 该类型的 pendingbox 为空？
     TM->>Cl: API 1：新建 BatchgenAuftrag（带类型和名称）
     Cl-->>TM: 任务号
     TM->>TM: launch：Context、Pool、3 个线程，登记到 Registry
@@ -299,11 +299,13 @@ Consumer 在一轮 `sweep` 之后判断 `isProducerFinished() && pool.isEmpty()`
 
 `TaskManager` 是唯一的 Spring 单例，整个运行期间都存在。它不参与 Producer/Consumer 的循环，只负责：启动、查询、中止、收尾。
 
-#### 用户名额（UserSlot）
+#### 用户+类型名额（UserSlot）
 
-`users`（`ConcurrentHashMap<String, UserSlot>`）保证每个用户同一时间最多一项任务。名额从 `claimUser` 开始，直到 `deregister` 结束。
+`users`（`ConcurrentHashMap<SlotKey, UserSlot>`）保证同一用户的同一种类型同一时间最多一项任务。键是内部 record `SlotKey(userId, jobType)`；每个名额记着自己的键，释放时只释放这一个。名额从 `claimUser` 开始，直到 `deregister` 结束。
 
-**为什么不直接用 TaskRegistry 判断：** Registry 按任务号索引，而任务号要先调用 Cloud-API 1 才能拿到。名额必须在调用云端**之前**占住，否则同一用户的两个并发启动请求可能都看到 pendingbox 为空，各自新建一个 BatchgenAuftrag。
+**为什么按类型分名额，而不是每个用户一个**：每种类型有自己的一套目录（`<userId>/<jobType>/…`）。同一用户的 `KUNDENDATEN` 任务和 `VERTRAGSDATEN` 任务碰不到同一个文件，所以可以同时运行。同一种类型的任务共用同一个 inbox 和 pendingbox，只能有一个在干活。
+
+**为什么不直接用 TaskRegistry 判断：** Registry 按任务号索引，而任务号要先调用 Cloud-API 1 才能拿到。名额必须在调用云端**之前**占住，否则同一用户同一类型的两个并发启动请求可能都看到 pendingbox 为空，各自新建一个 BatchgenAuftrag。
 
 `claimUser` 的细节：
 
@@ -315,13 +317,14 @@ Consumer 在一轮 `sweep` 之后判断 `isProducerFinished() && pool.isEmpty()`
 
 | 步骤 | 方法 | 为什么在这个位置 |
 |---|---|---|
-| 1. 解析并创建目录 | `folderResolver.resolve` | 用户名不合法时直接 `400`，不占名额 |
-| 2. 校验类型和名称 | `JobDefinition.of` | 类型缺失或未知、名称过长时直接 `400`，不占名额，也不调用云端 |
-| 3. 占名额 | `claimUser` | 必须在任何状态检查和云端调用之前，见上文 |
-| 4. 检查 pendingbox | `hasPendingFiles` | 在新建 BatchgenAuftrag **之前**拒绝，不会在云端留下空任务 |
-| 5. 带类型和名称新建 BatchgenAuftrag | `createBatchJob` | 同步进行，因为任务号是 Sandbox 和 Registry 的键，也要放进 `Location` 头；失败时还没有创建任何本地对象 |
-| 6. 构建并启动 | `launch` | 先在 `UserSlot` 里记下 Sandbox 和 Supervisor，再登记、再启动线程，见下文 |
-| 失败时 | `finally` | 没有成功启动的话释放名额（`users.remove(userId, slot)` 只删除自己的名额） |
+| 1. 校验用户名 | `InvalidUserIdException.requireValid` | 用户名不合法时直接 `400`，不占名额 |
+| 2. 校验类型和名称 | `JobDefinition.of` | 类型缺失或未知、名称过长时直接 `400`，不建目录、不占名额，也不调用云端 |
+| 3. 解析并创建该类型的目录 | `folderResolver.resolve(userId, jobType)` | 类型确定之后才做；不合法的请求不会建目录 |
+| 4. 占用户+类型名额 | `claimUser` | 必须在任何状态检查和云端调用之前，见上文 |
+| 5. 检查该类型的 pendingbox | `hasPendingFiles` | 在新建 BatchgenAuftrag **之前**拒绝，不会在云端留下空任务 |
+| 6. 带类型和名称新建 BatchgenAuftrag | `createBatchJob` | 同步进行，因为任务号是 Sandbox 和 Registry 的键，也要放进 `Location` 头；失败时还没有创建任何本地对象 |
+| 7. 构建并启动 | `launch` | 先在 `UserSlot` 里记下 Sandbox 和 Supervisor，再登记、再启动线程，见下文 |
+| 失败时 | `finally` | 没有成功启动的话释放名额（`users.remove(slot.key, slot)` 只删除自己的名额） |
 
 `launch` 先把所有对象都构建好，Producer、Consumer、Supervisor 三个线程都处于 `unstarted` 状态。然后依次：记入 `UserSlot` → `registry.register` → `sandbox.start()` → `supervisor.start()`。先登记再启动，是为了线程一启动，查询和中止就能找到这个 Sandbox。启动失败时以 `ABORTED` 结束并从 Registry 移除。
 
@@ -332,7 +335,7 @@ Consumer 在一轮 `sweep` 之后判断 `isProducerFinished() && pool.isEmpty()`
 1. `finish(ABORTED, …)` 兜底：正常情况下结束状态早已设好，这次调用返回 `false`。
 2. 把本地状态映射为云端状态（`TaskState.jobStatus()`）。`ABORTED` 映射为 `null`，表示不写，和崩溃时一样，BatchgenAuftrag 保持 `RUNNING`。
 3. `writeEndState`：通过 Cloud-API 3 写入，失败只记日志。
-4. 从 Registry 和 `users` 中移除，名额释放。
+4. 从 Registry 和 `users` 中移除（`users.remove(slot.key, slot)`），该用户该类型的名额释放。
 
 **为什么结束状态由 Supervisor 写，而不是由设置结束状态的线程写：**
 
@@ -365,7 +368,7 @@ Consumer 在一轮 `sweep` 之后判断 `isProducerFinished() && pool.isEmpty()`
 1. **先移动，再提交：** 调用 Cloud-API 1 之前就把文件移出 inbox。即使提交过程中崩溃，下次也不会被重复提交（API-1 不是幂等的）。
 2. **收到应答后才写标记：** 有标记就说明云端一定有这条记录，可以按 TaskId 查询。
 3. **先移动文件，再删标记**（`UserFolders.settle`）：崩溃时最多留下一个多余的标记，而不会出现一个没有标记、看起来"结果不明"的文件。
-4. **启动时 pendingbox 必须为空**（只统计普通文件，`.taskids` 目录不算）：没有"续跑"，遗留文件由用户先处理，因此不会有两个任务的文件混在一起。
+4. **启动时该类型的 pendingbox 必须为空**（只统计普通文件，`.taskids` 目录不算）：没有"续跑"，遗留文件由用户先处理，因此不会有两个任务的文件混在一起。一种类型的遗留文件不会挡住另一种类型的启动。
 5. **从不覆盖文件**（`moveInto`）：目标目录里已有同名文件时，加一个随机后缀，用户数据不会丢。
 
 ### 2.6 Cloud 调用：超时、重试和错误分类
@@ -536,7 +539,7 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
   "type": "about:blank",
   "title": "Conflict",
   "status": 409,
-  "detail": "In der pendingbox von Benutzer 'alice' liegen noch Dateien einer früheren Aufgabe; bitte zuerst bearbeiten",
+  "detail": "In der pendingbox von Benutzer 'alice' (KUNDENDATEN) liegen noch Dateien einer früheren Aufgabe; bitte zuerst bearbeiten",
   "code": "PENDINGBOX_NOT_EMPTY"
 }
 ```
@@ -563,7 +566,7 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 
 ##### `rejected` → `409`
 
-- **何时**：启动被拒绝，`code` 是 `USER_TASK_RUNNING`（已经有一项任务在运行）或 `PENDINGBOX_NOT_EMPTY`（还有遗留文件）。
+- **何时**：启动被拒绝，`code` 是 `USER_TASK_RUNNING`（该用户该类型已经有一项任务在运行）或 `PENDINGBOX_NOT_EMPTY`（该类型的 pendingbox 里还有遗留文件）。
 - **为什么是 409 Conflict**：请求本身没错，但和服务器的当前状态冲突。用户需要先等任务结束，或者先处理遗留文件，然后才能重试。
 
 ##### `cloudUnavailable` → `502 CLOUD_UNAVAILABLE`
@@ -601,39 +604,41 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 | `cloud` | 云端客户端 |
 | `properties` | 配置 |
 | `clock` | 时间来源（测试可以替换） |
-| `users` | 每个用户一个"号牌"（`UserSlot`），保证一人同时只有一项任务 |
+| `users` | 每个用户每种类型一个"号牌"（`UserSlot`），保证同一用户同一类型同时只有一项任务 |
 
 常量：`RESULT_GRACE` = 5 秒，等云端结果时在客户端超时之外再多等的余量；`STOP_WAIT` = 10 秒，等一项正在收尾的任务结束的上限。
 
-内部类 `UserSlot`：一个用户的号牌，记着这个用户当前的 Sandbox 和 Supervisor 线程。两个字段是 `volatile`，因为写入它们的线程（启动请求的线程）和读取它们的线程（另一个启动请求、应用关闭）可能不同，`volatile` 保证读的线程能看到最新的值。
+内部 record `SlotKey(userId, jobType)`：号牌的键。内部类 `UserSlot`：一个用户某种类型的号牌，记着自己的 `key`，以及当前的 Sandbox 和 Supervisor 线程。后两个字段是 `volatile`，因为写入它们的线程（启动请求的线程）和读取它们的线程（另一个启动请求、应用关闭）可能不同，`volatile` 保证读的线程能看到最新的值。
 
 ##### `start(userId, jobType, jobName)`
 
 - **做什么**：为用户启动一项任务，返回本地快照。
 - **怎么做**：
-  1. `folderResolver.resolve(userId)`：校验用户名并找到（必要时创建）目录。用户名不合法会直接抛异常，这时还没占号牌。
-  2. `JobDefinition.of(jobType, jobName)`：校验类型和名称，名称没填时用类型名代替。不合法直接返回 `400 INVALID_JOB_TYPE` 或 `400 INVALID_JOB_NAME`，这时同样还没占号牌。
-  3. `claimUser(userId)`：占用户号牌，被占就拒绝（`409 USER_TASK_RUNNING`）。
-  4. `hasPendingFiles`：pendingbox 里还有文件就拒绝（`409 PENDINGBOX_NOT_EMPTY`）。
-  5. `createBatchJob`：在云端带类型和名称新建 BatchgenAuftrag，拿到任务号。
-  6. `launch`：构建 Sandbox（类型和名称放进 `TaskContext`）并启动三个线程。
-  7. 返回快照；日志里记下任务号、类型和名称。
-  8. 第 3 步之后，无论哪一步失败，`finally` 都会把号牌还回去（`users.remove(userId, slot)`，只还自己拿到的这一块）。
+  1. `InvalidUserIdException.requireValid(userId)`：校验用户名，不合法直接返回 `400 INVALID_USER_ID`，这时既没建目录也没占号牌。
+  2. `JobDefinition.of(jobType, jobName)`：校验类型和名称，名称没填时用类型名代替。不合法直接返回 `400 INVALID_JOB_TYPE` 或 `400 INVALID_JOB_NAME`，这时同样什么都还没建、没占。
+  3. `folderResolver.resolve(userId, jobType)`：找到（必要时创建）该类型的目录 `<base>/<userId>/<jobType>/…`。
+  4. `claimUser(userId, jobType)`：占该用户该类型的号牌，被占就拒绝（`409 USER_TASK_RUNNING`）。其他类型正在运行的任务不受影响。
+  5. `hasPendingFiles`：该类型的 pendingbox 里还有文件就拒绝（`409 PENDINGBOX_NOT_EMPTY`）。
+  6. `createBatchJob`：在云端带类型和名称新建 BatchgenAuftrag，拿到任务号。
+  7. `launch`：构建 Sandbox（类型和名称放进 `TaskContext`，Producer 和 Consumer 拿到该类型的目录）并启动三个线程。
+  8. 返回快照；日志里记下任务号、类型和名称。
+  9. 第 4 步之后，无论哪一步失败，`finally` 都会把号牌还回去（`users.remove(slot.key, slot)`，只还自己拿到的这一块）。
 - **为什么是这个顺序**：
-  - **最先校验输入**：类型错误或名称过长是请求本身的错误，和服务器状态无关。它们既不应该占号牌，也不应该去读 pendingbox 或调用云端。
-  - **先占号牌，再做检查**：假设同一用户几乎同时发出两个启动请求。如果先检查 pendingbox 再占号牌，两个请求都会看到"pendingbox 为空"，然后各自在云端新建一个 BatchgenAuftrag。先占号牌，第二个请求在第 3 步就被拒绝了。
+  - **最先校验输入**：用户名不合法、类型错误或名称过长都是请求本身的错误，和服务器状态无关。它们既不应该建目录、占号牌，也不应该去读 pendingbox 或调用云端。用户名在类型之前校验，因为它在路径里，类型在请求体里；两者都错时，应答报的是路径里的错误。
+  - **先占号牌，再做检查**：假设同一用户几乎同时发出两个同类型的启动请求。如果先检查 pendingbox 再占号牌，两个请求都会看到"pendingbox 为空"，然后各自在云端新建一个 BatchgenAuftrag。先占号牌，第二个请求在第 4 步就被拒绝了。
   - **先检查 pendingbox，再调用云端**：被拒绝时云端不会多出一个空的 BatchgenAuftrag。
   - **新建 BatchgenAuftrag 是同步的**：任务号是 Sandbox 在登记簿里的键，也要放进 `Location` 头，必须先拿到；而且云端失败时本地还什么都没创建，不需要清理。
-- **如果不还号牌**：一次失败的启动（例如云端不可达）会让这个用户永远无法再启动任务。
+- **如果不还号牌**：一次失败的启动（例如云端不可达）会让这个用户永远无法再启动这种类型的任务。
 
-##### `claimUser(userId)`
+##### `claimUser(userId, jobType)`
 
-- **做什么**：为用户占号牌。
+- **做什么**：为用户的这种类型占号牌。
 - **怎么做**：
-  1. `users.putIfAbsent(userId, 新号牌)`：没人占就成功，返回新号牌。
+  1. `users.putIfAbsent(SlotKey(userId, jobType), 新号牌)`：该用户该类型没人占就成功，返回新号牌。
   2. 已经被占：调用 `awaitDeregistered(旧号牌)`，看看是不是"任务已经结束、正在收尾"，如果是就等它收尾完。
   3. 再试一次 `putIfAbsent`，成功就返回。
-  4. 仍然被占，抛出 `TaskRejectedException(USER_TASK_RUNNING)`。
+  4. 仍然被占，抛出 `TaskRejectedException(USER_TASK_RUNNING)`，信息例如"Für Benutzer 'alice' läuft bereits eine Aufgabe mit jobType KUNDENDATEN"。
+- **两种类型的例子**：`alice` 有一项 `KUNDENDATEN` 任务在运行。用 `VERTRAGSDATEN` 启动时键不同，立即开始；再用 `KUNDENDATEN` 启动则被拒绝。
 - **为什么要等收尾**：任务结束后，Supervisor 还要通过 Cloud-API 3 写结束状态，这一步可能要几百毫秒到几秒，写完才会还号牌。
 - **例子**：任务在 12:00:00.000 以 `COMPLETED` 结束，Supervisor 写 Cloud-API 3 花了 300 毫秒。用户在 12:00:00.100 再次点"启动"。如果不等，会收到"已有任务在运行"，而界面上明明显示任务已完成。现在会等到 12:00:00.300，然后正常启动。
 
@@ -680,7 +685,7 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 - **怎么做**：
   1. 新建 `TaskContext`（控制面板，带 `job` 里的类型和名称）和 `InMemoryStatusPool`（追踪板）。
   2. 新建三个虚拟线程，此时**还没启动**（`unstarted`）：`producer-<任务号>` 运行 `InboxProducer`，`consumer-<任务号>` 运行 `StatusConsumer`，`sandbox-<任务号>` 运行 `supervise`。
-  3. 把 Sandbox 和 Supervisor 记到用户号牌上。
+  3. 把 Sandbox 和 Supervisor 记到该用户该类型的号牌上。
   4. `registry.register(sandbox)`：登记。
   5. 启动 Producer 和 Consumer，再启动 Supervisor。
   6. 第 5 步失败时（极少见）：以 `ABORTED` 结束任务，从登记簿移除，然后把异常抛出去。
@@ -759,7 +764,7 @@ record 的访问器方法（例如 `taskId()`）不单独说明。
 
 - **做什么**：计算等待 Cloud-API 2 或 3 结果的上限：`status-timeout` × (`retries` + 1) + 5 秒。
 - **为什么是这个公式**：每次尝试最多 `status-timeout`，一共最多 `retries` + 1 次尝试，再加上 5 秒余量（覆盖重试之间的短暂等待）。
-- **例子**：默认值是 30 s × 3 + 5 s = 95 s；当前 `application.yml`（10 s、2 次重试）下是 10 s × 3 + 5 s = 35 s。
+- **例子**：按默认值（10 s、2 次重试）是 10 s × 3 + 5 s = 35 s。
 
 ##### `await(call, wait, operation)`
 
@@ -1348,7 +1353,7 @@ flowchart TD
 ##### `submit(jobId, items)`
 
 - **做什么**：提交一批文件，返回应答里每个文件的结果：转换成功的带 TaskId，没转换的带 `fehlermeldung`。
-- **步骤**：和 `createBatchJob` 类似，请求是 `POST /tasks`，请求体为 `{"jobId", "items":[{"fileName","content"}]}`。`content` 是文件内容转换成的 JSON 值，Jackson 原样写进请求，例如 `{"fileName":"a.json","content":{"name":"Beispiel"}}`，而不是一个转义过的字符串。拿到应答后，把每个有文件名的条目转换成 `SubmittedFile(文件名, TaskId, fehlermeldung)`；TaskId 为空或缺失时记为 `null`（由 `taskIdOrNull` 处理），表示未转换。应答里根本没有 `tasks` 字段时返回空列表，相当于"全部未转换"。错误同样包装成带分类的 `SubmitFailedException`。
+- **步骤**：和 `createBatchJob` 类似，请求是 `POST /tasks`，请求体为 `{"jobId", "items":[{"identifikator","content"}]}`。`identifikator` 就是文件名；Java 里字段仍叫 `fileName`，由 `TestdataItem` 和 `SubmitEntry` 上的 `@JsonProperty("identifikator")` 决定 JSON 里的名字。`content` 是文件内容转换成的 JSON 值，Jackson 原样写进请求，例如 `{"identifikator":"a.json","content":{"name":"Beispiel"}}`，而不是一个转义过的字符串。拿到应答后，把每个有文件名的条目转换成 `SubmittedFile(文件名, TaskId, fehlermeldung)`；TaskId 为空或缺失时记为 `null`（由 `taskIdOrNull` 处理），表示未转换。应答里根本没有 `tasks` 字段时返回空列表，相当于"全部未转换"。错误同样包装成带分类的 `SubmitFailedException`。
 - **为什么不再丢掉没有 TaskId 的条目**：这些条目正是"未转换"的文件，`fehlermeldung` 里有云端给出的原因。保留下来，Producer 才能把原因写进 errorbox。只有连文件名都没有的条目会被丢掉，因为没法对应到文件。
 
 ##### `queryStatus(taskIds)`
@@ -1419,7 +1424,7 @@ flowchart TD
 | 类型 | 含义 | 补充 |
 |---|---|---|
 | `TaskId` | 子表记录的编号（运单号） | 构造时拒绝空值，不会出现"空运单号"；`toString()` 返回编号本身，日志里显示 `t-123` 而不是 `TaskId[value=t-123]` |
-| `TestdataItem(fileName, content)` | 要提交的一个文件 | `content` 是 `JsonNode`：文件内容转换成的 JSON。用 `JsonNode` 而不是 `String`，Jackson 才会把它作为 JSON 值写进请求，而不是转义成字符串 |
+| `TestdataItem(fileName, content)` | 要提交的一个文件 | `fileName` 在 JSON 里叫 `identifikator`；`content` 是 `JsonNode`：文件内容转换成的 JSON。用 `JsonNode` 而不是 `String`，Jackson 才会把它作为 JSON 值写进请求，而不是转义成字符串 |
 | `SubmittedFile(fileName, taskId, fehlermeldung)` | Cloud-API 1 对一个文件的应答 | `taskId` 为 `null` 表示未转换，这时 `fehlermeldung` 是云端给的原因；`converted()` 判断是否转换成功 |
 | `RecordStatus` | `SUCCESS`、`ERROR`、`PENDING` | 记录的状态，由云端自己更新 |
 | `RecordStatusResult(taskId, status, fehlermeldung)` | Cloud-API 2 对一个 TaskId 的应答 | `fehlermeldung` 是 `ERROR` 的原因，其他状态下为空 |
@@ -1480,30 +1485,32 @@ flowchart TD
 - **做什么**：把配置里的 `base-directory` 转成绝对路径并规范化（去掉 `./`、`..`）。
 - **为什么**：相对路径会随应用的启动目录变化，转成绝对路径后行为确定，日志里显示的路径也清楚。
 
-##### `resolve(userId)`
+##### `resolve(userId, jobType)`
 
-- **做什么**：校验用户名，返回 `UserFolders`，并确保四个目录都存在。
+- **做什么**：校验用户名，返回该类型的 `UserFolders`，并确保四个目录都存在。每种类型有自己的目录，任务只看得到自己类型的文件。
 - **怎么做**：
-  1. 用户名必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`：以字母或数字开头，最长 64 个字符，只能包含字母、数字、`.`、`_`、`-`。不符合就抛 `InvalidUserIdException`（`400`）。
-  2. 拼出 `<base>/<userId>/inbox`、`pendingbox`、`donebox`、`errorbox`。
+  1. `InvalidUserIdException.requireValid(userId)`：用户名必须匹配 `[A-Za-z0-9][A-Za-z0-9._-]{0,63}`：以字母或数字开头，最长 64 个字符，只能包含字母、数字、`.`、`_`、`-`。不符合就抛 `InvalidUserIdException`（`400`）。
+  2. 拼出 `<base>/<userId>/<jobType>/inbox`、`pendingbox`、`donebox`、`errorbox`。类型目录名就是常量名（`KUNDENDATEN`、`VERTRAGSDATEN`）；`JobType` 只有固定的值，所以不需要校验。
   3. `Files.createDirectories` 逐个创建，已存在的不受影响。创建失败抛 `UncheckedIOException`。
 - **为什么校验用户名**：用户名会直接成为目录名。如果允许 `../bob`，`alice` 就能操作 `bob` 的目录（路径穿越）；以 `.` 开头的名字可能变成隐藏目录，或者被解释为 `..`。
-- **例子**：`base-directory` 为 `./data/users`，用户名 `alice`，得到 `…/data/users/alice/inbox` 等四个目录。
+- **例子**：`base-directory` 为 `./data/users`，用户名 `alice`，类型 `KUNDENDATEN`，得到 `…/data/users/alice/KUNDENDATEN/inbox` 等四个目录。`VERTRAGSDATEN` 的目录要到第一次启动这种类型时才创建。
 
 #### `UserFolders`（record）
 
-一个用户的四个目录，以及对它们的所有文件操作。全部使用 Java NIO.2。
+一个用户某种类型的四个目录，以及对它们的所有文件操作。全部使用 Java NIO.2。
 
 目录结构：
 
 ```
 <base>/alice/
-├── inbox/        待提交
-├── pendingbox/   已提交，等结果
-│   └── .taskids/ 每个文件一个标记，内容是 TaskId
-├── donebox/      成功
-└── errorbox/     失败
-    └── .fehler/  每个失败文件一个原因文件：<文件名>.txt
+├── KUNDENDATEN/          KUNDENDATEN 类型的目录
+│   ├── inbox/            待提交
+│   ├── pendingbox/       已提交，等结果
+│   │   └── .taskids/     每个文件一个标记，内容是 TaskId
+│   ├── donebox/          成功
+│   └── errorbox/         失败
+│       └── .fehler/      每个失败文件一个原因文件：<文件名>.txt
+└── VERTRAGSDATEN/        VERTRAGSDATEN 类型的同样四个目录
 ```
 
 ##### `listInbox(max, excluded)`
@@ -1569,6 +1576,7 @@ flowchart TD
 #### `InvalidUserIdException`
 
 - **何时**：用户名不合法，对应 `400 INVALID_USER_ID`。消息里写明允许的格式，用户一看就知道该怎么改。
+- **`requireValid(userId)`**：校验用户名，合法时原样返回，和 `InvalidTaskNumberException.requireValid` 一样。`TaskManager.start` 在所有其他校验之前调用它，`UserFolderResolver.resolve` 再调用一次，保证不会用未校验的名字建目录。
 
 ---
 
@@ -1741,8 +1749,8 @@ flowchart TD
 | `submit-retry-max-wait` | `1m` | 明确未处理时，重试前的最长等待时间 |
 | `cloud.base-url` | `http://localhost:8081` | 云端地址 |
 | `cloud.job-path` / `submit-path` / `status-path` | `/jobs`、`/tasks`、`/tasks/status` | 接口路径 |
-| `cloud.submit-timeout` | `30s` | 等待 Cloud-API 1 应答的时间；超时即结果不明：启动以 `504 TIMEOUT` 被拒，或任务以 `TIMEOUT` 结束 |
-| `cloud.status-timeout` | `30s` | 每次调用 Cloud-API 2 和 3 的超时 |
+| `cloud.submit-timeout` | `15s` | 等待 Cloud-API 1 应答的时间；超时即结果不明：启动以 `504 TIMEOUT` 被拒，或任务以 `TIMEOUT` 结束 |
+| `cloud.status-timeout` | `10s` | 每次调用 Cloud-API 2 和 3 的超时 |
 | `cloud.retries` | `2` | Cloud-API 2 和 3 的重试次数 |
 
 注：当前的 `application.yml` 把 `cloud.submit-timeout` 设为 `15s`，`cloud.status-timeout` 设为 `10s`，覆盖了上面的默认值。
@@ -1760,12 +1768,12 @@ flowchart TD
 |---|---|---|
 | `TaskContextTest` | 单元 | 先到先得、中止信号、超时、错误阈值、快照、状态映射 |
 | `InMemoryStatusPoolTest` | 单元 | 到期查询、重新排期、已移除条目不会被加回 |
-| `UserFoldersTest` | 单元 | 目录创建、用户名校验、列表、标记、移动、重名、原因文件 |
+| `UserFoldersTest` | 单元 | 按类型创建目录、用户名校验、列表、标记、移动、重名、原因文件 |
 | `PipelinePropertiesTest` | 单元 | 默认值和校验 |
 | `JobDefinitionTest` | 单元 | 类型和名称的校验：允许的类型、默认名称、空格、最大长度 |
 | `WebClientCloudClientTest` | 组件（对 `FakeCloud`） | 约定、API-1 的错误分类、重试、`fehlermeldung` |
-| `TaskManagerTest` | 组件（桩 Cloud，无 HTTP） | 启动、拒绝（包括在调用云端之前拒绝非法类型）、中止、注销、关闭、各种结束原因 |
-| `PipelineIntegrationTest`、`PipelineTimeoutIntegrationTest` | 集成（完整 Spring 应用对 `FakeCloud`，同一 JVM） | 所有结束状态、API-1 的错误类型、启动被拒的原因、类型和名称在启动应答/云端/状态查询中的传递、非法的启动请求体、隔离性、errorbox 里的原因文件 |
+| `TaskManagerTest` | 组件（桩 Cloud，无 HTTP） | 启动、拒绝（包括在调用云端之前拒绝非法类型）、不同类型的任务并行、中止、注销、关闭、各种结束原因 |
+| `PipelineIntegrationTest`、`PipelineTimeoutIntegrationTest` | 集成（完整 Spring 应用对 `FakeCloud`，同一 JVM） | 所有结束状态、API-1 的错误类型、启动被拒的原因、类型和名称在启动应答/云端/状态查询中的传递、按类型分开的目录和任务、非法的启动请求体、隔离性、errorbox 里的原因文件 |
 | `PipelineBlackBoxIT` | 黑盒（应用 JAR 和 `FakeCloudBackendApplication` 各自独立运行，只通过 HTTP 交互） | 主要流程，作为外部视角的验收 |
 
 测试辅助类：`FakeCloud`（同一 JVM 里的云端替身，行为由文件内容和预设控制，例如 `REJECT`（未转换并带 `fehlermeldung`）、`OMIT`（应答里不出现）、`FAIL`（`ERROR` 并带 `fehlermeldung`）、`SLOW`、延迟应答）、`FakeBackendClient`（`FakeCloudBackendApplication` 管理接口的客户端）、`PipelineApi`（REST 接口和用户目录的客户端；只用 HTTP/1.1，否则 JDK 客户端会在每个新连接上尝试升级到 h2c，带请求体的 POST 会因此卡住）、`ExternalProcess`（启动外部进程）、`MutableClock`、`TestProperties`、`PipelineTestSupport`（集成测试的公共配置：短间隔、随机端口）。
@@ -1779,7 +1787,7 @@ flowchart TD
 | 内容 | 说明 |
 |---|---|
 | 只支持单台服务器 | TaskRegistry、Status-Pool 和用户名额都在内存里。接口抽象（`TaskRegistry`、`StatusPool`）为将来分布式化留了余地 |
-| 不续跑 | 遗留在 pendingbox 的文件必须先人工处理，否则启动被拒（`409 PENDINGBOX_NOT_EMPTY`） |
+| 不续跑 | 遗留在某种类型 pendingbox 里的文件必须先人工处理，否则这种类型的启动被拒（`409 PENDINGBOX_NOT_EMPTY`） |
 | 结果不明时可能留下孤立任务 | 新建 BatchgenAuftrag 时结果不明，云端可能已经建好，但应用不知道它的编号，任务保持 `RUNNING`，需要人工修正 |
 | 结果不明的文件只能人工处理 | 没有 TaskId，就无法通过 Cloud-API 2 查询 |
 | 结束原因不持久 | 只在本地快照（注销前）和日志里 |

@@ -15,6 +15,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import de.wwsstl.asynchrone.TestProperties;
+import de.wwsstl.asynchrone.cloud.JobType;
 import de.wwsstl.asynchrone.cloud.TaskId;
 
 class UserFoldersTest {
@@ -28,26 +29,40 @@ class UserFoldersTest {
     @BeforeEach
     void setUp() {
         resolver = new UserFolderResolver(TestProperties.withBase(base));
-        folders = resolver.resolve("anna");
+        folders = resolver.resolve("anna", JobType.KUNDENDATEN);
     }
 
     @Test
     void resolverCreatesAllFolders() {
-        assertThat(folders.inbox()).isEqualTo(base.resolve("anna").resolve("inbox")).isDirectory();
+        assertThat(folders.inbox()).isEqualTo(base.resolve("anna").resolve("KUNDENDATEN").resolve("inbox"))
+                .isDirectory();
         assertThat(folders.pendingbox()).isDirectory();
         assertThat(folders.donebox()).isDirectory();
         assertThat(folders.errorbox()).isDirectory();
     }
 
+    @Test
+    void eachJobTypeHasItsOwnFolders() throws IOException {
+        UserFolders contracts = resolver.resolve("anna", JobType.VERTRAGSDATEN);
+        folders.moveToPending(inboxFile("a.json"));
+
+        assertThat(contracts.inbox()).isEqualTo(base.resolve("anna").resolve("VERTRAGSDATEN").resolve("inbox"))
+                .isEmptyDirectory();
+        assertThat(contracts.hasPendingFiles()).isFalse();
+        assertThat(folders.hasPendingFiles()).isTrue();
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"", "..", "../anna", "a/b", "a\\b", "-anna", ".anna"})
     void resolverRejectsUnsuitableUserIds(String userId) {
-        assertThatThrownBy(() -> resolver.resolve(userId)).isInstanceOf(InvalidUserIdException.class);
+        assertThatThrownBy(() -> resolver.resolve(userId, JobType.KUNDENDATEN))
+                .isInstanceOf(InvalidUserIdException.class);
     }
 
     @Test
     void resolverRejectsTooLongUserId() {
-        assertThatThrownBy(() -> resolver.resolve("a".repeat(65))).isInstanceOf(InvalidUserIdException.class);
+        assertThatThrownBy(() -> resolver.resolve("a".repeat(65), JobType.KUNDENDATEN))
+                .isInstanceOf(InvalidUserIdException.class);
     }
 
     @Test

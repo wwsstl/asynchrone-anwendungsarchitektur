@@ -6,14 +6,14 @@ flowchart LR
     UserB(["Benutzer B"])
 
     API["REST-API<br/>Start / Abbruch / Status"]
-    TM["TaskManager<br/>je Benutzer eine Sandbox,<br/>Start nur bei leerer pendingbox"]
+    TM["TaskManager<br/>je Benutzer und Art eine Sandbox,<br/>Start nur bei leerer pendingbox der Art"]
     Reg[("TaskRegistry<br/>laufende Tasks, lokaler Stand")]
 
     SA["Sandbox Task A<br/>Producer · Status-Pool · Consumer"]
     SB["Sandbox Task B<br/>Producer · Status-Pool · Consumer"]
 
-    OA[("Ordner A<br/>inbox → pendingbox →<br/>donebox / errorbox")]
-    OB[("Ordner B<br/>inbox → pendingbox →<br/>donebox / errorbox")]
+    OA[("Ordner A je Art<br/>inbox → pendingbox →<br/>donebox / errorbox")]
+    OB[("Ordner B je Art<br/>inbox → pendingbox →<br/>donebox / errorbox")]
 
     Cloud["Cloud-Dienst<br/>API 1: BatchgenAuftrag anlegen (einmal je Task),<br/>Batches übernehmen<br/>API 2: Status der Datensätze<br/>API 3: Endzustand setzen, Status abfragen"]
 

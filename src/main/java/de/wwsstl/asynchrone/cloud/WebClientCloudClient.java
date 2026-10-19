@@ -12,6 +12,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeoutException;
 
+import com.fasterxml.jackson.annotation.JsonProperty;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.reactive.function.client.WebClient;
 import org.springframework.web.reactive.function.client.WebClientRequestException;
@@ -29,10 +30,11 @@ import reactor.util.retry.Retry;
  *   <li>Cloud-API 1, BatchgenAuftrag anlegen: {@code POST job-path} mit {@code {"userId","jobType","jobName"}} →
  *       {@code {"jobId"}}</li>
  *   <li>Cloud-API 1, Batch übermitteln: {@code POST submit-path} mit
- *       {@code {"jobId","items":[{"fileName","content"}]}} → {@code {"tasks":[{"fileName","taskId","fehlermeldung"}]}};
- *       {@code content} ist der Inhalt der Datei als JSON-Wert (keine Zeichenkette). Eine nicht umgewandelte Datei
- *       hat eine leere {@code taskId} und in {@code fehlermeldung} den Grund; fehlt sie ganz in {@code tasks}, gilt
- *       sie ebenfalls als nicht umgewandelt</li>
+ *       {@code {"jobId","items":[{"identifikator","content"}]}} →
+ *       {@code {"tasks":[{"identifikator","taskId","fehlermeldung"}]}}; {@code identifikator} ist der Dateiname,
+ *       innerhalb einer Anfrage eindeutig, und ordnet die Einträge der Antwort zu; {@code content} ist der Inhalt der
+ *       Datei als JSON-Wert (keine Zeichenkette). Eine nicht umgewandelte Datei hat eine leere {@code taskId} und in
+ *       {@code fehlermeldung} den Grund; fehlt sie ganz in {@code tasks}, gilt sie ebenfalls als nicht umgewandelt</li>
  *   <li>Cloud-API 2: {@code POST status-path} mit {@code {"taskIds":[…]}} →
  *       {@code {"results":[{"taskId","status":"SUCCESS|ERROR|PENDING","fehlermeldung"}]}}; {@code fehlermeldung}
  *       begründet ein {@code ERROR}</li>
@@ -198,7 +200,7 @@ public class WebClientCloudClient implements CloudClient {
     record SubmitResponse(List<SubmitEntry> tasks) {
     }
 
-    record SubmitEntry(String fileName, String taskId, String fehlermeldung) {
+    record SubmitEntry(@JsonProperty("identifikator") String fileName, String taskId, String fehlermeldung) {
     }
 
     record StatusRequest(List<String> taskIds) {

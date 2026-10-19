@@ -44,8 +44,11 @@ final class PipelineApi {
 
     // --- REST ------------------------------------------------------------------------------------------------
 
+    /** Art, wenn ein Test nichts anderes angibt: beim Start und für die Ordner. */
+    static final String DEFAULT_JOB_TYPE = "KUNDENDATEN";
+
     /** Rumpf der Startanfrage, wenn ein Test nichts anderes angibt. */
-    static final Map<String, String> DEFAULT_START = Map.of("jobType", "KUNDENDATEN");
+    static final Map<String, String> DEFAULT_START = Map.of("jobType", DEFAULT_JOB_TYPE);
 
     TaskSnapshot start(String user) {
         return client.post().uri("/api/users/{u}/tasks", user).contentType(MediaType.APPLICATION_JSON)
@@ -87,10 +90,14 @@ final class PipelineApi {
         return response.bodyTo(Map.class);
     }
 
-    // --- Benutzerordner --------------------------------------------------------------------------------------
+    // --- Benutzerordner (ohne Angabe der Art die von DEFAULT_JOB_TYPE) -------------------------------------
 
     Path box(String user, String box) {
-        return base.resolve(user).resolve(box);
+        return box(user, DEFAULT_JOB_TYPE, box);
+    }
+
+    Path box(String user, String jobType, String box) {
+        return base.resolve(user).resolve(jobType).resolve(box);
     }
 
     /**
@@ -98,14 +105,23 @@ final class PipelineApi {
      * {@link FakeCloud} ({@code REJECT}, {@code FAIL}, {@code SLOW}).
      */
     void drop(String user, String fileName, String marker) {
-        dropRaw(user, fileName, "{\"data\":\"" + marker + "\"}");
+        drop(user, DEFAULT_JOB_TYPE, fileName, marker);
+    }
+
+    void drop(String user, String jobType, String fileName, String marker) {
+        dropRaw(user, jobType, fileName, "{\"data\":\"" + marker + "\"}");
     }
 
     /** Legt eine Datei mit genau diesem Inhalt in die inbox, z. B. ungültiges JSON. */
     void dropRaw(String user, String fileName, String content) {
+        dropRaw(user, DEFAULT_JOB_TYPE, fileName, content);
+    }
+
+    void dropRaw(String user, String jobType, String fileName, String content) {
+        Path inbox = box(user, jobType, "inbox");
         try {
-            Files.createDirectories(box(user, "inbox"));
-            Files.writeString(box(user, "inbox").resolve(fileName), content);
+            Files.createDirectories(inbox);
+            Files.writeString(inbox.resolve(fileName), content);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -131,6 +147,10 @@ final class PipelineApi {
     /** Die regulären Dateien eines Ordners (ohne den Marker-Ordner der pendingbox). */
     List<String> names(String user, String box) {
         return list(box(user, box));
+    }
+
+    List<String> names(String user, String jobType, String box) {
+        return list(box(user, jobType, box));
     }
 
     /** Die TaskId-Marker in der pendingbox. */

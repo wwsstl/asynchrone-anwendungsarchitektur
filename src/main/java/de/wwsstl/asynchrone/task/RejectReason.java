@@ -2,8 +2,11 @@ package de.wwsstl.asynchrone.task;
 
 /** Ursachencode eines mit {@code 409 Conflict} abgewiesenen Starts. */
 public enum RejectReason {
-    /** Für die Benutzer:in läuft bereits eine Aufgabe. */
+    /** Für die Benutzer:in läuft bereits eine Aufgabe derselben Art. */
     USER_TASK_RUNNING,
-    /** In der {@code pendingbox} liegen noch Restdateien einer früheren Aufgabe (funktionsweise_sequenz.md, Abschnitt 7). */
+    /**
+     * In der {@code pendingbox} dieser Art liegen noch Restdateien einer früheren Aufgabe (funktionsweise_sequenz.md,
+     * Abschnitt 7).
+     */
     PENDINGBOX_NOT_EMPTY
 }

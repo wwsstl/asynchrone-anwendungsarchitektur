@@ -18,7 +18,7 @@ sequenceDiagram
         TM-->>API: abgewiesen
         API-->>B: 400 Bad Request, INVALID_JOB_TYPE / INVALID_JOB_NAME
     end
-    TM->>O: pendingbox leer?
+    TM->>O: pendingbox der Art leer?
     break pendingbox nicht leer
         TM-->>API: abgewiesen
         API-->>B: 409 Conflict, PENDINGBOX_NOT_EMPTY
